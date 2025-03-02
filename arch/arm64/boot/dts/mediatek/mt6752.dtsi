@@ -1766,5 +1766,4 @@
 	};
 
 };
-/include/ "cust_eint.dtsi"
 /include/ "trusty.dtsi"
