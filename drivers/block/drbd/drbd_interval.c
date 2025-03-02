@@ -1,9 +1,8 @@
-// SPDX-License-Identifier: GPL-2.0-only
 #include <asm/bug.h>
 #include <linux/rbtree_augmented.h>
 #include "drbd_interval.h"
 
-/*
+/**
  * interval_end  -  return end of @node
  */
 static inline
@@ -13,12 +12,67 @@ sector_t interval_end(struct rb_node *node)
 	return this->end;
 }
 
-#define NODE_END(node) ((node)->sector + ((node)->size >> 9))
+/**
+ * compute_subtree_last  -  compute end of @node
+ *
+ * The end of an interval is the highest (start + (size >> 9)) value of this
+ * node and of its children.  Called for @node and its parents whenever the end
+ * may have changed.
+ */
+static inline sector_t
+compute_subtree_last(struct drbd_interval *node)
+{
+	sector_t max = node->sector + (node->size >> 9);
 
-RB_DECLARE_CALLBACKS_MAX(static, augment_callbacks,
-			 struct drbd_interval, rb, sector_t, end, NODE_END);
+	if (node->rb.rb_left) {
+		sector_t left = interval_end(node->rb.rb_left);
+		if (left > max)
+			max = left;
+	}
+	if (node->rb.rb_right) {
+		sector_t right = interval_end(node->rb.rb_right);
+		if (right > max)
+			max = right;
+	}
+	return max;
+}
 
-/*
+static void augment_propagate(struct rb_node *rb, struct rb_node *stop)
+{
+	while (rb != stop) {
+		struct drbd_interval *node = rb_entry(rb, struct drbd_interval, rb);
+		sector_t subtree_last = compute_subtree_last(node);
+		if (node->end == subtree_last)
+			break;
+		node->end = subtree_last;
+		rb = rb_parent(&node->rb);
+	}
+}
+
+static void augment_copy(struct rb_node *rb_old, struct rb_node *rb_new)
+{
+	struct drbd_interval *old = rb_entry(rb_old, struct drbd_interval, rb);
+	struct drbd_interval *new = rb_entry(rb_new, struct drbd_interval, rb);
+
+	new->end = old->end;
+}
+
+static void augment_rotate(struct rb_node *rb_old, struct rb_node *rb_new)
+{
+	struct drbd_interval *old = rb_entry(rb_old, struct drbd_interval, rb);
+	struct drbd_interval *new = rb_entry(rb_new, struct drbd_interval, rb);
+
+	new->end = old->end;
+	old->end = compute_subtree_last(old);
+}
+
+static const struct rb_augment_callbacks augment_callbacks = {
+	augment_propagate,
+	augment_copy,
+	augment_rotate,
+};
+
+/**
  * drbd_insert_interval  -  insert a new interval into a tree
  */
 bool
@@ -56,9 +110,8 @@ drbd_insert_interval(struct rb_root *root, struct drbd_interval *this)
 
 /**
  * drbd_contains_interval  -  check if a tree contains a given interval
- * @root:	red black tree root
  * @sector:	start sector of @interval
- * @interval:	may be an invalid pointer
+ * @interval:	may not be a valid pointer
  *
  * Returns if the tree contains the node @interval with start sector @start.
  * Does not dereference @interval until @interval is known to be a valid object
@@ -89,22 +142,17 @@ drbd_contains_interval(struct rb_root *root, sector_t sector,
 	return false;
 }
 
-/*
+/**
  * drbd_remove_interval  -  remove an interval from a tree
  */
 void
 drbd_remove_interval(struct rb_root *root, struct drbd_interval *this)
 {
-	/* avoid endless loop */
-	if (drbd_interval_empty(this))
-		return;
-
 	rb_erase_augmented(&this->rb, root, &augment_callbacks);
 }
 
 /**
  * drbd_find_overlap  - search for an interval overlapping with [sector, sector + size)
- * @root:	red black tree root
  * @sector:	start sector
  * @size:	size, aligned to 512 bytes
  *

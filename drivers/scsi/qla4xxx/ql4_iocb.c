@@ -1,7 +1,8 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * QLogic iSCSI HBA Driver
- * Copyright (c)  2003-2013 QLogic Corporation
+ * Copyright (c)  2003-2012 QLogic Corporation
+ *
+ * See LICENSE.qla4xxx for copyright and licensing details.
  */
 
 #include "ql4_def.h"
@@ -77,12 +78,12 @@ static int qla4xxx_get_req_pkt(struct scsi_qla_host *ha,
  * @ha: Pointer to host adapter structure.
  * @ddb_entry: Pointer to device database entry
  * @lun: SCSI LUN
- * @mrkr_mod: marker identifier
+ * @marker_type: marker identifier
  *
  * This routine issues a marker IOCB.
  **/
 int qla4xxx_send_marker_iocb(struct scsi_qla_host *ha,
-	struct ddb_entry *ddb_entry, uint64_t lun, uint16_t mrkr_mod)
+	struct ddb_entry *ddb_entry, int lun, uint16_t mrkr_mod)
 {
 	struct qla4_marker_entry *marker_entry;
 	unsigned long flags = 0;
@@ -160,7 +161,7 @@ static void qla4xxx_build_scsi_iocbs(struct srb *srb,
 
 	if (!scsi_bufflen(cmd) || cmd->sc_data_direction == DMA_NONE) {
 		/* No data being transferred */
-		cmd_entry->ttlByteCnt = cpu_to_le32(0);
+		cmd_entry->ttlByteCnt = __constant_cpu_to_le32(0);
 		return;
 	}
 
@@ -279,6 +280,7 @@ int qla4xxx_send_command_to_isp(struct scsi_qla_host *ha, struct srb * srb)
 	uint16_t req_cnt;
 	unsigned long flags;
 	uint32_t index;
+	char tag[2];
 
 	/* Get real lun and adapter */
 	ddb_entry = srb->ddb;
@@ -288,7 +290,7 @@ int qla4xxx_send_command_to_isp(struct scsi_qla_host *ha, struct srb * srb)
 	/* Acquire hardware specific lock */
 	spin_lock_irqsave(&ha->hardware_lock, flags);
 
-	index = scsi_cmd_to_rq(cmd)->tag;
+	index = (uint32_t)cmd->request->tag;
 
 	/*
 	 * Check to see if adapter is online before placing request on
@@ -350,6 +352,15 @@ int qla4xxx_send_command_to_isp(struct scsi_qla_host *ha, struct srb * srb)
 
 	/* Set tagged queueing control flags */
 	cmd_entry->control_flags |= CF_SIMPLE_TAG;
+	if (scsi_populate_tag_msg(cmd, tag))
+		switch (tag[0]) {
+		case MSG_HEAD_TAG:
+			cmd_entry->control_flags |= CF_HEAD_TAG;
+			break;
+		case MSG_ORDERED_TAG:
+			cmd_entry->control_flags |= CF_ORDERED_TAG;
+			break;
+		}
 
 	qla4xxx_advance_req_ring_ptr(ha);
 	qla4xxx_build_scsi_iocbs(srb, cmd_entry, tot_dsds);

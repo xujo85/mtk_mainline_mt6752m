@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * SH SPI bus driver
  *
@@ -6,6 +5,20 @@
  *
  * Based on pxa2xx_spi.c:
  * Copyright (C) 2005 Stephen Street / StreetFire Sound Labs
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; version 2 of the License.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+ *
  */
 
 #include <linux/module.h>
@@ -73,8 +86,12 @@ struct spi_sh_data {
 	void __iomem *addr;
 	int irq;
 	struct spi_master *master;
+	struct list_head queue;
+	struct workqueue_struct *workqueue;
+	struct work_struct ws;
 	unsigned long cr1;
 	wait_queue_head_t wait;
+	spinlock_t lock;
 	int width;
 };
 
@@ -154,6 +171,7 @@ static int spi_sh_send(struct spi_sh_data *ss, struct spi_message *mesg,
 	int remain = t->len;
 	int cur_len;
 	unsigned char *data;
+	unsigned long tmp;
 	long ret;
 
 	if (t->len)
@@ -195,7 +213,9 @@ static int spi_sh_send(struct spi_sh_data *ss, struct spi_message *mesg,
 	}
 
 	if (list_is_last(&t->transfer_list, &mesg->transfers)) {
-		spi_sh_clear_bit(ss, SPI_SH_SSD | SPI_SH_SSDB, SPI_SH_CR1);
+		tmp = spi_sh_read(ss, SPI_SH_CR1);
+		tmp = tmp & ~(SPI_SH_SSD | SPI_SH_SSDB);
+		spi_sh_write(ss, tmp, SPI_SH_CR1);
 		spi_sh_set_bit(ss, SPI_SH_SSA, SPI_SH_CR1);
 
 		ss->cr1 &= ~SPI_SH_TBE;
@@ -219,6 +239,7 @@ static int spi_sh_receive(struct spi_sh_data *ss, struct spi_message *mesg,
 	int remain = t->len;
 	int cur_len;
 	unsigned char *data;
+	unsigned long tmp;
 	long ret;
 
 	if (t->len > SPI_SH_MAX_BYTE)
@@ -226,7 +247,9 @@ static int spi_sh_receive(struct spi_sh_data *ss, struct spi_message *mesg,
 	else
 		spi_sh_write(ss, t->len, SPI_SH_CR3);
 
-	spi_sh_clear_bit(ss, SPI_SH_SSD | SPI_SH_SSDB, SPI_SH_CR1);
+	tmp = spi_sh_read(ss, SPI_SH_CR1);
+	tmp = tmp & ~(SPI_SH_SSD | SPI_SH_SSDB);
+	spi_sh_write(ss, tmp, SPI_SH_CR1);
 	spi_sh_set_bit(ss, SPI_SH_SSA, SPI_SH_CR1);
 
 	spi_sh_wait_write_buffer_empty(ss);
@@ -268,38 +291,45 @@ static int spi_sh_receive(struct spi_sh_data *ss, struct spi_message *mesg,
 	return 0;
 }
 
-static int spi_sh_transfer_one_message(struct spi_controller *ctlr,
-					struct spi_message *mesg)
+static void spi_sh_work(struct work_struct *work)
 {
-	struct spi_sh_data *ss = spi_controller_get_devdata(ctlr);
+	struct spi_sh_data *ss = container_of(work, struct spi_sh_data, ws);
+	struct spi_message *mesg;
 	struct spi_transfer *t;
+	unsigned long flags;
 	int ret;
 
 	pr_debug("%s: enter\n", __func__);
 
-	spi_sh_clear_bit(ss, SPI_SH_SSA, SPI_SH_CR1);
+	spin_lock_irqsave(&ss->lock, flags);
+	while (!list_empty(&ss->queue)) {
+		mesg = list_entry(ss->queue.next, struct spi_message, queue);
+		list_del_init(&mesg->queue);
 
-	list_for_each_entry(t, &mesg->transfers, transfer_list) {
-		pr_debug("tx_buf = %p, rx_buf = %p\n",
-			 t->tx_buf, t->rx_buf);
-		pr_debug("len = %d, delay.value = %d\n",
-			 t->len, t->delay.value);
+		spin_unlock_irqrestore(&ss->lock, flags);
+		list_for_each_entry(t, &mesg->transfers, transfer_list) {
+			pr_debug("tx_buf = %p, rx_buf = %p\n",
+					t->tx_buf, t->rx_buf);
+			pr_debug("len = %d, delay_usecs = %d\n",
+					t->len, t->delay_usecs);
 
-		if (t->tx_buf) {
-			ret = spi_sh_send(ss, mesg, t);
-			if (ret < 0)
-				goto error;
+			if (t->tx_buf) {
+				ret = spi_sh_send(ss, mesg, t);
+				if (ret < 0)
+					goto error;
+			}
+			if (t->rx_buf) {
+				ret = spi_sh_receive(ss, mesg, t);
+				if (ret < 0)
+					goto error;
+			}
+			mesg->actual_length += t->len;
 		}
-		if (t->rx_buf) {
-			ret = spi_sh_receive(ss, mesg, t);
-			if (ret < 0)
-				goto error;
-		}
-		mesg->actual_length += t->len;
+		spin_lock_irqsave(&ss->lock, flags);
+
+		mesg->status = 0;
+		mesg->complete(mesg->context);
 	}
-
-	mesg->status = 0;
-	spi_finalize_current_message(ctlr);
 
 	clear_fifo(ss);
 	spi_sh_set_bit(ss, SPI_SH_SSD, SPI_SH_CR1);
@@ -310,24 +340,26 @@ static int spi_sh_transfer_one_message(struct spi_controller *ctlr,
 
 	clear_fifo(ss);
 
-	return 0;
+	spin_unlock_irqrestore(&ss->lock, flags);
+
+	return;
 
  error:
 	mesg->status = ret;
-	spi_finalize_current_message(ctlr);
-	if (mesg->complete)
-		mesg->complete(mesg->context);
+	mesg->complete(mesg->context);
 
 	spi_sh_clear_bit(ss, SPI_SH_SSA | SPI_SH_SSDB | SPI_SH_SSD,
 			 SPI_SH_CR1);
 	clear_fifo(ss);
 
-	return ret;
 }
 
 static int spi_sh_setup(struct spi_device *spi)
 {
 	struct spi_sh_data *ss = spi_master_get_devdata(spi->master);
+
+	if (!spi->bits_per_word)
+		spi->bits_per_word = 8;
 
 	pr_debug("%s: enter\n", __func__);
 
@@ -340,6 +372,29 @@ static int spi_sh_setup(struct spi_device *spi)
 	/* 1/8 clock */
 	spi_sh_write(ss, spi_sh_read(ss, SPI_SH_CR2) | 0x07, SPI_SH_CR2);
 	udelay(10);
+
+	return 0;
+}
+
+static int spi_sh_transfer(struct spi_device *spi, struct spi_message *mesg)
+{
+	struct spi_sh_data *ss = spi_master_get_devdata(spi->master);
+	unsigned long flags;
+
+	pr_debug("%s: enter\n", __func__);
+	pr_debug("\tmode = %02x\n", spi->mode);
+
+	spin_lock_irqsave(&ss->lock, flags);
+
+	mesg->actual_length = 0;
+	mesg->status = -EINPROGRESS;
+
+	spi_sh_clear_bit(ss, SPI_SH_SSA, SPI_SH_CR1);
+
+	list_add_tail(&mesg->queue, &ss->queue);
+	queue_work(ss->workqueue, &ss->ws);
+
+	spin_unlock_irqrestore(&ss->lock, flags);
 
 	return 0;
 }
@@ -377,12 +432,16 @@ static irqreturn_t spi_sh_irq(int irq, void *_ss)
 	return IRQ_HANDLED;
 }
 
-static void spi_sh_remove(struct platform_device *pdev)
+static int spi_sh_remove(struct platform_device *pdev)
 {
-	struct spi_sh_data *ss = platform_get_drvdata(pdev);
+	struct spi_sh_data *ss = dev_get_drvdata(&pdev->dev);
 
 	spi_unregister_master(ss->master);
+	destroy_workqueue(ss->workqueue);
 	free_irq(ss->irq, ss);
+	iounmap(ss->addr);
+
+	return 0;
 }
 
 static int spi_sh_probe(struct platform_device *pdev)
@@ -400,17 +459,19 @@ static int spi_sh_probe(struct platform_device *pdev)
 	}
 
 	irq = platform_get_irq(pdev, 0);
-	if (irq < 0)
-		return irq;
+	if (irq < 0) {
+		dev_err(&pdev->dev, "platform_get_irq error\n");
+		return -ENODEV;
+	}
 
-	master = devm_spi_alloc_master(&pdev->dev, sizeof(struct spi_sh_data));
+	master = spi_alloc_master(&pdev->dev, sizeof(struct spi_sh_data));
 	if (master == NULL) {
 		dev_err(&pdev->dev, "spi_alloc_master error.\n");
 		return -ENOMEM;
 	}
 
 	ss = spi_master_get_devdata(master);
-	platform_set_drvdata(pdev, ss);
+	dev_set_drvdata(&pdev->dev, ss);
 
 	switch (res->flags & IORESOURCE_MEM_TYPE_MASK) {
 	case IORESOURCE_MEM_8BIT:
@@ -421,52 +482,72 @@ static int spi_sh_probe(struct platform_device *pdev)
 		break;
 	default:
 		dev_err(&pdev->dev, "No support width\n");
-		return -ENODEV;
+		ret = -ENODEV;
+		goto error1;
 	}
 	ss->irq = irq;
 	ss->master = master;
-	ss->addr = devm_ioremap(&pdev->dev, res->start, resource_size(res));
+	ss->addr = ioremap(res->start, resource_size(res));
 	if (ss->addr == NULL) {
 		dev_err(&pdev->dev, "ioremap error.\n");
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto error1;
 	}
+	INIT_LIST_HEAD(&ss->queue);
+	spin_lock_init(&ss->lock);
+	INIT_WORK(&ss->ws, spi_sh_work);
 	init_waitqueue_head(&ss->wait);
+	ss->workqueue = create_singlethread_workqueue(
+					dev_name(master->dev.parent));
+	if (ss->workqueue == NULL) {
+		dev_err(&pdev->dev, "create workqueue error\n");
+		ret = -EBUSY;
+		goto error2;
+	}
 
 	ret = request_irq(irq, spi_sh_irq, 0, "spi_sh", ss);
 	if (ret < 0) {
 		dev_err(&pdev->dev, "request_irq error\n");
-		return ret;
+		goto error3;
 	}
 
 	master->num_chipselect = 2;
 	master->bus_num = pdev->id;
 	master->setup = spi_sh_setup;
-	master->transfer_one_message = spi_sh_transfer_one_message;
+	master->transfer = spi_sh_transfer;
 	master->cleanup = spi_sh_cleanup;
 
 	ret = spi_register_master(master);
 	if (ret < 0) {
 		printk(KERN_ERR "spi_register_master error.\n");
-		goto error3;
+		goto error4;
 	}
 
 	return 0;
 
- error3:
+ error4:
 	free_irq(irq, ss);
+ error3:
+	destroy_workqueue(ss->workqueue);
+ error2:
+	iounmap(ss->addr);
+ error1:
+	spi_master_put(master);
+
 	return ret;
 }
 
 static struct platform_driver spi_sh_driver = {
 	.probe = spi_sh_probe,
-	.remove_new = spi_sh_remove,
+	.remove = spi_sh_remove,
 	.driver = {
 		.name = "sh_spi",
+		.owner = THIS_MODULE,
 	},
 };
 module_platform_driver(spi_sh_driver);
 
 MODULE_DESCRIPTION("SH SPI bus driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Yoshihiro Shimoda");
 MODULE_ALIAS("platform:sh_spi");

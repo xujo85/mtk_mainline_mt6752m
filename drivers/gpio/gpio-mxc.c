@@ -1,35 +1,45 @@
-// SPDX-License-Identifier: GPL-2.0+
-//
-// MXC GPIO support. (c) 2008 Daniel Mack <daniel@caiaq.de>
-// Copyright 2008 Juergen Beisert, kernel@pengutronix.de
-//
-// Based on code from Freescale Semiconductor,
-// Authors: Daniel Mack, Juergen Beisert.
-// Copyright (C) 2004-2010 Freescale Semiconductor, Inc. All Rights Reserved.
+/*
+ * MXC GPIO support. (c) 2008 Daniel Mack <daniel@caiaq.de>
+ * Copyright 2008 Juergen Beisert, kernel@pengutronix.de
+ *
+ * Based on code from Freescale,
+ * Copyright (C) 2004-2010 Freescale Semiconductor, Inc. All Rights Reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+ */
 
-#include <linux/clk.h>
-#include <linux/err.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/irq.h>
 #include <linux/irqdomain.h>
 #include <linux/irqchip/chained_irq.h>
-#include <linux/module.h>
+#include <linux/gpio.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
-#include <linux/spinlock.h>
-#include <linux/syscore_ops.h>
-#include <linux/gpio/driver.h>
+#include <linux/basic_mmio_gpio.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
-#include <linux/bug.h>
+#include <linux/module.h>
+#include <asm-generic/bug.h>
 
-#define IMX_SCU_WAKEUP_OFF		0
-#define IMX_SCU_WAKEUP_LOW_LVL		4
-#define IMX_SCU_WAKEUP_FALL_EDGE	5
-#define IMX_SCU_WAKEUP_RISE_EDGE	6
-#define IMX_SCU_WAKEUP_HIGH_LVL		7
+enum mxc_gpio_hwtype {
+	IMX1_GPIO,	/* runs on i.mx1 */
+	IMX21_GPIO,	/* runs on i.mx21 and i.mx27 */
+	IMX31_GPIO,	/* runs on i.mx31 */
+	IMX35_GPIO,	/* runs on all other i.mx */
+};
 
 /* device type dependent stuff */
 struct mxc_gpio_hwdata {
@@ -47,31 +57,14 @@ struct mxc_gpio_hwdata {
 	unsigned fall_edge;
 };
 
-struct mxc_gpio_reg_saved {
-	u32 icr1;
-	u32 icr2;
-	u32 imr;
-	u32 gdir;
-	u32 edge_sel;
-	u32 dr;
-};
-
 struct mxc_gpio_port {
 	struct list_head node;
 	void __iomem *base;
-	struct clk *clk;
 	int irq;
 	int irq_high;
 	struct irq_domain *domain;
-	struct gpio_chip gc;
-	struct device *dev;
+	struct bgpio_chip bgc;
 	u32 both_edges;
-	struct mxc_gpio_reg_saved gpio_saved_reg;
-	bool power_off;
-	u32 wakeup_pads;
-	bool is_pad_wakeup;
-	u32 pad_type[32];
-	const struct mxc_gpio_hwdata *hwdata;
 };
 
 static struct mxc_gpio_hwdata imx1_imx21_gpio_hwdata = {
@@ -119,33 +112,49 @@ static struct mxc_gpio_hwdata imx35_gpio_hwdata = {
 	.fall_edge	= 0x03,
 };
 
-#define GPIO_DR			(port->hwdata->dr_reg)
-#define GPIO_GDIR		(port->hwdata->gdir_reg)
-#define GPIO_PSR		(port->hwdata->psr_reg)
-#define GPIO_ICR1		(port->hwdata->icr1_reg)
-#define GPIO_ICR2		(port->hwdata->icr2_reg)
-#define GPIO_IMR		(port->hwdata->imr_reg)
-#define GPIO_ISR		(port->hwdata->isr_reg)
-#define GPIO_EDGE_SEL		(port->hwdata->edge_sel_reg)
+static enum mxc_gpio_hwtype mxc_gpio_hwtype;
+static struct mxc_gpio_hwdata *mxc_gpio_hwdata;
 
-#define GPIO_INT_LOW_LEV	(port->hwdata->low_level)
-#define GPIO_INT_HIGH_LEV	(port->hwdata->high_level)
-#define GPIO_INT_RISE_EDGE	(port->hwdata->rise_edge)
-#define GPIO_INT_FALL_EDGE	(port->hwdata->fall_edge)
+#define GPIO_DR			(mxc_gpio_hwdata->dr_reg)
+#define GPIO_GDIR		(mxc_gpio_hwdata->gdir_reg)
+#define GPIO_PSR		(mxc_gpio_hwdata->psr_reg)
+#define GPIO_ICR1		(mxc_gpio_hwdata->icr1_reg)
+#define GPIO_ICR2		(mxc_gpio_hwdata->icr2_reg)
+#define GPIO_IMR		(mxc_gpio_hwdata->imr_reg)
+#define GPIO_ISR		(mxc_gpio_hwdata->isr_reg)
+#define GPIO_EDGE_SEL		(mxc_gpio_hwdata->edge_sel_reg)
+
+#define GPIO_INT_LOW_LEV	(mxc_gpio_hwdata->low_level)
+#define GPIO_INT_HIGH_LEV	(mxc_gpio_hwdata->high_level)
+#define GPIO_INT_RISE_EDGE	(mxc_gpio_hwdata->rise_edge)
+#define GPIO_INT_FALL_EDGE	(mxc_gpio_hwdata->fall_edge)
 #define GPIO_INT_BOTH_EDGES	0x4
 
+static struct platform_device_id mxc_gpio_devtype[] = {
+	{
+		.name = "imx1-gpio",
+		.driver_data = IMX1_GPIO,
+	}, {
+		.name = "imx21-gpio",
+		.driver_data = IMX21_GPIO,
+	}, {
+		.name = "imx31-gpio",
+		.driver_data = IMX31_GPIO,
+	}, {
+		.name = "imx35-gpio",
+		.driver_data = IMX35_GPIO,
+	}, {
+		/* sentinel */
+	}
+};
+
 static const struct of_device_id mxc_gpio_dt_ids[] = {
-	{ .compatible = "fsl,imx1-gpio", .data =  &imx1_imx21_gpio_hwdata },
-	{ .compatible = "fsl,imx21-gpio", .data = &imx1_imx21_gpio_hwdata },
-	{ .compatible = "fsl,imx31-gpio", .data = &imx31_gpio_hwdata },
-	{ .compatible = "fsl,imx35-gpio", .data = &imx35_gpio_hwdata },
-	{ .compatible = "fsl,imx7d-gpio", .data = &imx35_gpio_hwdata },
-	{ .compatible = "fsl,imx8dxl-gpio", .data = &imx35_gpio_hwdata },
-	{ .compatible = "fsl,imx8qm-gpio", .data = &imx35_gpio_hwdata },
-	{ .compatible = "fsl,imx8qxp-gpio", .data = &imx35_gpio_hwdata },
+	{ .compatible = "fsl,imx1-gpio", .data = &mxc_gpio_devtype[IMX1_GPIO], },
+	{ .compatible = "fsl,imx21-gpio", .data = &mxc_gpio_devtype[IMX21_GPIO], },
+	{ .compatible = "fsl,imx31-gpio", .data = &mxc_gpio_devtype[IMX31_GPIO], },
+	{ .compatible = "fsl,imx35-gpio", .data = &mxc_gpio_devtype[IMX35_GPIO], },
 	{ /* sentinel */ }
 };
-MODULE_DEVICE_TABLE(of, mxc_gpio_dt_ids);
 
 /*
  * MX2 has one interrupt *for all* gpio ports. The list is used
@@ -160,9 +169,9 @@ static int gpio_set_irq_type(struct irq_data *d, u32 type)
 {
 	struct irq_chip_generic *gc = irq_data_get_irq_chip_data(d);
 	struct mxc_gpio_port *port = gc->private;
-	unsigned long flags;
 	u32 bit, val;
 	u32 gpio_idx = d->hwirq;
+	u32 gpio = port->bgc.gc.base + gpio_idx;
 	int edge;
 	void __iomem *reg = port->base;
 
@@ -178,13 +187,13 @@ static int gpio_set_irq_type(struct irq_data *d, u32 type)
 		if (GPIO_EDGE_SEL >= 0) {
 			edge = GPIO_INT_BOTH_EDGES;
 		} else {
-			val = port->gc.get(&port->gc, gpio_idx);
+			val = gpio_get_value(gpio);
 			if (val) {
 				edge = GPIO_INT_LOW_LEV;
-				pr_debug("mxc: set GPIO %d to low trigger\n", gpio_idx);
+				pr_debug("mxc: set GPIO %d to low trigger\n", gpio);
 			} else {
 				edge = GPIO_INT_HIGH_LEV;
-				pr_debug("mxc: set GPIO %d to high trigger\n", gpio_idx);
+				pr_debug("mxc: set GPIO %d to high trigger\n", gpio);
 			}
 			port->both_edges |= 1 << gpio_idx;
 		}
@@ -198,8 +207,6 @@ static int gpio_set_irq_type(struct irq_data *d, u32 type)
 	default:
 		return -EINVAL;
 	}
-
-	raw_spin_lock_irqsave(&port->gc.bgpio_lock, flags);
 
 	if (GPIO_EDGE_SEL >= 0) {
 		val = readl(port->base + GPIO_EDGE_SEL);
@@ -219,21 +226,15 @@ static int gpio_set_irq_type(struct irq_data *d, u32 type)
 	}
 
 	writel(1 << gpio_idx, port->base + GPIO_ISR);
-	port->pad_type[gpio_idx] = type;
 
-	raw_spin_unlock_irqrestore(&port->gc.bgpio_lock, flags);
-
-	return port->gc.direction_input(&port->gc, gpio_idx);
+	return 0;
 }
 
 static void mxc_flip_edge(struct mxc_gpio_port *port, u32 gpio)
 {
 	void __iomem *reg = port->base;
-	unsigned long flags;
 	u32 bit, val;
 	int edge;
-
-	raw_spin_lock_irqsave(&port->gc.bgpio_lock, flags);
 
 	reg += GPIO_ICR1 + ((gpio & 0x10) >> 2); /* lower or upper register */
 	bit = gpio & 0xf;
@@ -249,12 +250,9 @@ static void mxc_flip_edge(struct mxc_gpio_port *port, u32 gpio)
 	} else {
 		pr_err("mxc: invalid configuration for GPIO %d: %x\n",
 		       gpio, edge);
-		goto unlock;
+		return;
 	}
 	writel(val | (edge << (bit << 1)), reg);
-
-unlock:
-	raw_spin_unlock_irqrestore(&port->gc.bgpio_lock, flags);
 }
 
 /* handle 32 interrupts in one status register */
@@ -266,21 +264,18 @@ static void mxc_gpio_irq_handler(struct mxc_gpio_port *port, u32 irq_stat)
 		if (port->both_edges & (1 << irqoffset))
 			mxc_flip_edge(port, irqoffset);
 
-		generic_handle_domain_irq(port->domain, irqoffset);
+		generic_handle_irq(irq_find_mapping(port->domain, irqoffset));
 
 		irq_stat &= ~(1 << irqoffset);
 	}
 }
 
 /* MX1 and MX3 has one interrupt *per* gpio port */
-static void mx3_gpio_irq_handler(struct irq_desc *desc)
+static void mx3_gpio_irq_handler(u32 irq, struct irq_desc *desc)
 {
 	u32 irq_stat;
-	struct mxc_gpio_port *port = irq_desc_get_handler_data(desc);
-	struct irq_chip *chip = irq_desc_get_chip(desc);
-
-	if (port->is_pad_wakeup)
-		return;
+	struct mxc_gpio_port *port = irq_get_handler_data(irq);
+	struct irq_chip *chip = irq_get_chip(irq);
 
 	chained_irq_enter(chip, desc);
 
@@ -292,13 +287,10 @@ static void mx3_gpio_irq_handler(struct irq_desc *desc)
 }
 
 /* MX2 has one interrupt *for all* gpio ports */
-static void mx2_gpio_irq_handler(struct irq_desc *desc)
+static void mx2_gpio_irq_handler(u32 irq, struct irq_desc *desc)
 {
 	u32 irq_msk, irq_stat;
 	struct mxc_gpio_port *port;
-	struct irq_chip *chip = irq_desc_get_chip(desc);
-
-	chained_irq_enter(chip, desc);
 
 	/* walk through all interrupt status registers */
 	list_for_each_entry(port, &mxc_gpio_ports, node) {
@@ -310,7 +302,6 @@ static void mx2_gpio_irq_handler(struct irq_desc *desc)
 		if (irq_stat)
 			mxc_gpio_irq_handler(port, irq_stat);
 	}
-	chained_irq_exit(chip, desc);
 }
 
 /*
@@ -327,35 +318,29 @@ static int gpio_set_wake_irq(struct irq_data *d, u32 enable)
 	struct irq_chip_generic *gc = irq_data_get_irq_chip_data(d);
 	struct mxc_gpio_port *port = gc->private;
 	u32 gpio_idx = d->hwirq;
-	int ret;
 
 	if (enable) {
 		if (port->irq_high && (gpio_idx >= 16))
-			ret = enable_irq_wake(port->irq_high);
+			enable_irq_wake(port->irq_high);
 		else
-			ret = enable_irq_wake(port->irq);
-		port->wakeup_pads |= (1 << gpio_idx);
+			enable_irq_wake(port->irq);
 	} else {
 		if (port->irq_high && (gpio_idx >= 16))
-			ret = disable_irq_wake(port->irq_high);
+			disable_irq_wake(port->irq_high);
 		else
-			ret = disable_irq_wake(port->irq);
-		port->wakeup_pads &= ~(1 << gpio_idx);
+			disable_irq_wake(port->irq);
 	}
 
-	return ret;
+	return 0;
 }
 
-static int mxc_gpio_init_gc(struct mxc_gpio_port *port, int irq_base)
+static void __init mxc_gpio_init_gc(struct mxc_gpio_port *port, int irq_base)
 {
 	struct irq_chip_generic *gc;
 	struct irq_chip_type *ct;
-	int rv;
 
-	gc = devm_irq_alloc_generic_chip(port->dev, "gpio-mxc", 1, irq_base,
-					 port->base, handle_level_irq);
-	if (!gc)
-		return -ENOMEM;
+	gc = irq_alloc_generic_chip("gpio-mxc", 1, irq_base,
+				    port->base, handle_level_irq);
 	gc->private = port;
 
 	ct = gc->chip_types;
@@ -364,20 +349,48 @@ static int mxc_gpio_init_gc(struct mxc_gpio_port *port, int irq_base)
 	ct->chip.irq_unmask = irq_gc_mask_set_bit;
 	ct->chip.irq_set_type = gpio_set_irq_type;
 	ct->chip.irq_set_wake = gpio_set_wake_irq;
-	ct->chip.flags = IRQCHIP_MASK_ON_SUSPEND | IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND;
 	ct->regs.ack = GPIO_ISR;
 	ct->regs.mask = GPIO_IMR;
 
-	rv = devm_irq_setup_generic_chip(port->dev, gc, IRQ_MSK(32),
-					 IRQ_GC_INIT_NESTED_LOCK,
-					 IRQ_NOREQUEST, 0);
+	irq_setup_generic_chip(gc, IRQ_MSK(32), IRQ_GC_INIT_NESTED_LOCK,
+			       IRQ_NOREQUEST, 0);
+}
 
-	return rv;
+static void mxc_gpio_get_hw(struct platform_device *pdev)
+{
+	const struct of_device_id *of_id =
+			of_match_device(mxc_gpio_dt_ids, &pdev->dev);
+	enum mxc_gpio_hwtype hwtype;
+
+	if (of_id)
+		pdev->id_entry = of_id->data;
+	hwtype = pdev->id_entry->driver_data;
+
+	if (mxc_gpio_hwtype) {
+		/*
+		 * The driver works with a reasonable presupposition,
+		 * that is all gpio ports must be the same type when
+		 * running on one soc.
+		 */
+		BUG_ON(mxc_gpio_hwtype != hwtype);
+		return;
+	}
+
+	if (hwtype == IMX35_GPIO)
+		mxc_gpio_hwdata = &imx35_gpio_hwdata;
+	else if (hwtype == IMX31_GPIO)
+		mxc_gpio_hwdata = &imx31_gpio_hwdata;
+	else
+		mxc_gpio_hwdata = &imx1_imx21_gpio_hwdata;
+
+	mxc_gpio_hwtype = hwtype;
 }
 
 static int mxc_gpio_to_irq(struct gpio_chip *gc, unsigned offset)
 {
-	struct mxc_gpio_port *port = gpiochip_get_data(gc);
+	struct bgpio_chip *bgc = to_bgpio_chip(gc);
+	struct mxc_gpio_port *port =
+		container_of(bgc, struct mxc_gpio_port, bgc);
 
 	return irq_find_mapping(port->domain, offset);
 }
@@ -386,54 +399,46 @@ static int mxc_gpio_probe(struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
 	struct mxc_gpio_port *port;
-	int irq_count;
+	struct resource *iores;
 	int irq_base;
 	int err;
 
-	port = devm_kzalloc(&pdev->dev, sizeof(*port), GFP_KERNEL);
+	mxc_gpio_get_hw(pdev);
+
+	port = kzalloc(sizeof(struct mxc_gpio_port), GFP_KERNEL);
 	if (!port)
 		return -ENOMEM;
 
-	port->dev = &pdev->dev;
-	port->hwdata = device_get_match_data(&pdev->dev);
-
-	port->base = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(port->base))
-		return PTR_ERR(port->base);
-
-	irq_count = platform_irq_count(pdev);
-	if (irq_count < 0)
-		return irq_count;
-
-	if (irq_count > 1) {
-		port->irq_high = platform_get_irq(pdev, 1);
-		if (port->irq_high < 0)
-			port->irq_high = 0;
+	iores = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!iores) {
+		err = -ENODEV;
+		goto out_kfree;
 	}
 
+	if (!request_mem_region(iores->start, resource_size(iores),
+				pdev->name)) {
+		err = -EBUSY;
+		goto out_kfree;
+	}
+
+	port->base = ioremap(iores->start, resource_size(iores));
+	if (!port->base) {
+		err = -ENOMEM;
+		goto out_release_mem;
+	}
+
+	port->irq_high = platform_get_irq(pdev, 1);
 	port->irq = platform_get_irq(pdev, 0);
-	if (port->irq < 0)
-		return port->irq;
-
-	/* the controller clock is optional */
-	port->clk = devm_clk_get_optional(&pdev->dev, NULL);
-	if (IS_ERR(port->clk))
-		return PTR_ERR(port->clk);
-
-	err = clk_prepare_enable(port->clk);
-	if (err) {
-		dev_err(&pdev->dev, "Unable to enable clock.\n");
-		return err;
+	if (port->irq < 0) {
+		err = -EINVAL;
+		goto out_iounmap;
 	}
-
-	if (of_device_is_compatible(np, "fsl,imx7d-gpio"))
-		port->power_off = true;
 
 	/* disable the interrupt and clear the status */
 	writel(0, port->base + GPIO_IMR);
 	writel(~0, port->base + GPIO_ISR);
 
-	if (of_device_is_compatible(np, "fsl,imx21-gpio")) {
+	if (mxc_gpio_hwtype == IMX21_GPIO) {
 		/*
 		 * Setup one handler for all GPIO interrupts. Actually setting
 		 * the handler is needed only once, but doing it for every port
@@ -442,215 +447,85 @@ static int mxc_gpio_probe(struct platform_device *pdev)
 		irq_set_chained_handler(port->irq, mx2_gpio_irq_handler);
 	} else {
 		/* setup one handler for each entry */
-		irq_set_chained_handler_and_data(port->irq,
-						 mx3_gpio_irq_handler, port);
-		if (port->irq_high > 0)
+		irq_set_chained_handler(port->irq, mx3_gpio_irq_handler);
+		irq_set_handler_data(port->irq, port);
+		if (port->irq_high > 0) {
 			/* setup handler for GPIO 16 to 31 */
-			irq_set_chained_handler_and_data(port->irq_high,
-							 mx3_gpio_irq_handler,
-							 port);
+			irq_set_chained_handler(port->irq_high,
+						mx3_gpio_irq_handler);
+			irq_set_handler_data(port->irq_high, port);
+		}
 	}
 
-	err = bgpio_init(&port->gc, &pdev->dev, 4,
+	err = bgpio_init(&port->bgc, &pdev->dev, 4,
 			 port->base + GPIO_PSR,
 			 port->base + GPIO_DR, NULL,
-			 port->base + GPIO_GDIR, NULL,
-			 BGPIOF_READ_OUTPUT_REG_SET);
+			 port->base + GPIO_GDIR, NULL, 0);
 	if (err)
-		goto out_bgio;
+		goto out_iounmap;
 
-	port->gc.request = gpiochip_generic_request;
-	port->gc.free = gpiochip_generic_free;
-	port->gc.to_irq = mxc_gpio_to_irq;
-	port->gc.base = (pdev->id < 0) ? of_alias_get_id(np, "gpio") * 32 :
+	port->bgc.gc.to_irq = mxc_gpio_to_irq;
+	port->bgc.gc.base = (pdev->id < 0) ? of_alias_get_id(np, "gpio") * 32 :
 					     pdev->id * 32;
 
-	err = devm_gpiochip_add_data(&pdev->dev, &port->gc, port);
+	err = gpiochip_add(&port->bgc.gc);
 	if (err)
-		goto out_bgio;
+		goto out_bgpio_remove;
 
-	irq_base = devm_irq_alloc_descs(&pdev->dev, -1, 0, 32, numa_node_id());
+	irq_base = irq_alloc_descs(-1, 0, 32, numa_node_id());
 	if (irq_base < 0) {
 		err = irq_base;
-		goto out_bgio;
+		goto out_gpiochip_remove;
 	}
 
 	port->domain = irq_domain_add_legacy(np, 32, irq_base, 0,
 					     &irq_domain_simple_ops, NULL);
 	if (!port->domain) {
 		err = -ENODEV;
-		goto out_bgio;
+		goto out_irqdesc_free;
 	}
 
 	/* gpio-mxc can be a generic irq chip */
-	err = mxc_gpio_init_gc(port, irq_base);
-	if (err < 0)
-		goto out_irqdomain_remove;
+	mxc_gpio_init_gc(port, irq_base);
 
 	list_add_tail(&port->node, &mxc_gpio_ports);
 
-	platform_set_drvdata(pdev, port);
-
 	return 0;
 
-out_irqdomain_remove:
-	irq_domain_remove(port->domain);
-out_bgio:
-	clk_disable_unprepare(port->clk);
+out_irqdesc_free:
+	irq_free_descs(irq_base, 32);
+out_gpiochip_remove:
+	WARN_ON(gpiochip_remove(&port->bgc.gc) < 0);
+out_bgpio_remove:
+	bgpio_remove(&port->bgc);
+out_iounmap:
+	iounmap(port->base);
+out_release_mem:
+	release_mem_region(iores->start, resource_size(iores));
+out_kfree:
+	kfree(port);
 	dev_info(&pdev->dev, "%s failed with errno %d\n", __func__, err);
 	return err;
 }
 
-static void mxc_gpio_save_regs(struct mxc_gpio_port *port)
-{
-	if (!port->power_off)
-		return;
-
-	port->gpio_saved_reg.icr1 = readl(port->base + GPIO_ICR1);
-	port->gpio_saved_reg.icr2 = readl(port->base + GPIO_ICR2);
-	port->gpio_saved_reg.imr = readl(port->base + GPIO_IMR);
-	port->gpio_saved_reg.gdir = readl(port->base + GPIO_GDIR);
-	port->gpio_saved_reg.edge_sel = readl(port->base + GPIO_EDGE_SEL);
-	port->gpio_saved_reg.dr = readl(port->base + GPIO_DR);
-}
-
-static void mxc_gpio_restore_regs(struct mxc_gpio_port *port)
-{
-	if (!port->power_off)
-		return;
-
-	writel(port->gpio_saved_reg.icr1, port->base + GPIO_ICR1);
-	writel(port->gpio_saved_reg.icr2, port->base + GPIO_ICR2);
-	writel(port->gpio_saved_reg.imr, port->base + GPIO_IMR);
-	writel(port->gpio_saved_reg.gdir, port->base + GPIO_GDIR);
-	writel(port->gpio_saved_reg.edge_sel, port->base + GPIO_EDGE_SEL);
-	writel(port->gpio_saved_reg.dr, port->base + GPIO_DR);
-}
-
-static bool mxc_gpio_generic_config(struct mxc_gpio_port *port,
-		unsigned int offset, unsigned long conf)
-{
-	struct device_node *np = port->dev->of_node;
-
-	if (of_device_is_compatible(np, "fsl,imx8dxl-gpio") ||
-	    of_device_is_compatible(np, "fsl,imx8qxp-gpio") ||
-	    of_device_is_compatible(np, "fsl,imx8qm-gpio"))
-		return (gpiochip_generic_config(&port->gc, offset, conf) == 0);
-
-	return false;
-}
-
-static bool mxc_gpio_set_pad_wakeup(struct mxc_gpio_port *port, bool enable)
-{
-	unsigned long config;
-	bool ret = false;
-	int i, type;
-
-	static const u32 pad_type_map[] = {
-		IMX_SCU_WAKEUP_OFF,		/* 0 */
-		IMX_SCU_WAKEUP_RISE_EDGE,	/* IRQ_TYPE_EDGE_RISING */
-		IMX_SCU_WAKEUP_FALL_EDGE,	/* IRQ_TYPE_EDGE_FALLING */
-		IMX_SCU_WAKEUP_FALL_EDGE,	/* IRQ_TYPE_EDGE_BOTH */
-		IMX_SCU_WAKEUP_HIGH_LVL,	/* IRQ_TYPE_LEVEL_HIGH */
-		IMX_SCU_WAKEUP_OFF,		/* 5 */
-		IMX_SCU_WAKEUP_OFF,		/* 6 */
-		IMX_SCU_WAKEUP_OFF,		/* 7 */
-		IMX_SCU_WAKEUP_LOW_LVL,		/* IRQ_TYPE_LEVEL_LOW */
-	};
-
-	for (i = 0; i < 32; i++) {
-		if ((port->wakeup_pads & (1 << i))) {
-			type = port->pad_type[i];
-			if (enable)
-				config = pad_type_map[type];
-			else
-				config = IMX_SCU_WAKEUP_OFF;
-			ret |= mxc_gpio_generic_config(port, i, config);
-		}
-	}
-
-	return ret;
-}
-
-static int __maybe_unused mxc_gpio_noirq_suspend(struct device *dev)
-{
-	struct platform_device *pdev = to_platform_device(dev);
-	struct mxc_gpio_port *port = platform_get_drvdata(pdev);
-
-	if (port->wakeup_pads > 0)
-		port->is_pad_wakeup = mxc_gpio_set_pad_wakeup(port, true);
-
-	return 0;
-}
-
-static int __maybe_unused mxc_gpio_noirq_resume(struct device *dev)
-{
-	struct platform_device *pdev = to_platform_device(dev);
-	struct mxc_gpio_port *port = platform_get_drvdata(pdev);
-
-	if (port->wakeup_pads > 0)
-		mxc_gpio_set_pad_wakeup(port, false);
-	port->is_pad_wakeup = false;
-
-	return 0;
-}
-
-static const struct dev_pm_ops mxc_gpio_dev_pm_ops = {
-	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(mxc_gpio_noirq_suspend, mxc_gpio_noirq_resume)
-};
-
-static int mxc_gpio_syscore_suspend(void)
-{
-	struct mxc_gpio_port *port;
-
-	/* walk through all ports */
-	list_for_each_entry(port, &mxc_gpio_ports, node) {
-		mxc_gpio_save_regs(port);
-		clk_disable_unprepare(port->clk);
-	}
-
-	return 0;
-}
-
-static void mxc_gpio_syscore_resume(void)
-{
-	struct mxc_gpio_port *port;
-	int ret;
-
-	/* walk through all ports */
-	list_for_each_entry(port, &mxc_gpio_ports, node) {
-		ret = clk_prepare_enable(port->clk);
-		if (ret) {
-			pr_err("mxc: failed to enable gpio clock %d\n", ret);
-			return;
-		}
-		mxc_gpio_restore_regs(port);
-	}
-}
-
-static struct syscore_ops mxc_gpio_syscore_ops = {
-	.suspend = mxc_gpio_syscore_suspend,
-	.resume = mxc_gpio_syscore_resume,
-};
-
 static struct platform_driver mxc_gpio_driver = {
 	.driver		= {
 		.name	= "gpio-mxc",
+		.owner	= THIS_MODULE,
 		.of_match_table = mxc_gpio_dt_ids,
-		.suppress_bind_attrs = true,
-		.pm = &mxc_gpio_dev_pm_ops,
 	},
 	.probe		= mxc_gpio_probe,
+	.id_table	= mxc_gpio_devtype,
 };
 
 static int __init gpio_mxc_init(void)
 {
-	register_syscore_ops(&mxc_gpio_syscore_ops);
-
 	return platform_driver_register(&mxc_gpio_driver);
 }
-subsys_initcall(gpio_mxc_init);
+postcore_initcall(gpio_mxc_init);
 
-MODULE_AUTHOR("Shawn Guo <shawn.guo@linaro.org>");
-MODULE_DESCRIPTION("i.MX GPIO Driver");
+MODULE_AUTHOR("Freescale Semiconductor, "
+	      "Daniel Mack <danielncaiaq.de>, "
+	      "Juergen Beisert <kernel@pengutronix.de>");
+MODULE_DESCRIPTION("Freescale MXC GPIO");
 MODULE_LICENSE("GPL");

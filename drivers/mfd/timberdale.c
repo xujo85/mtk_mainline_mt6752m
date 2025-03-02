@@ -1,7 +1,19 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * timberdale.c timberdale FPGA MFD driver
  * Copyright (c) 2009 Intel Corporation
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
 /* Supports:
@@ -11,23 +23,24 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/msi.h>
 #include <linux/mfd/core.h>
 #include <linux/slab.h>
 
 #include <linux/timb_gpio.h>
 
 #include <linux/i2c.h>
-#include <linux/platform_data/i2c-ocores.h>
-#include <linux/platform_data/i2c-xiic.h>
+#include <linux/i2c-ocores.h>
+#include <linux/i2c-xiic.h>
+#include <linux/i2c/tsc2007.h>
 
 #include <linux/spi/spi.h>
 #include <linux/spi/xilinx_spi.h>
 #include <linux/spi/max7301.h>
 #include <linux/spi/mc33880.h>
 
-#include <linux/platform_data/tsc2007.h>
-#include <linux/platform_data/media/timb_radio.h>
-#include <linux/platform_data/media/timb_video.h>
+#include <media/timb_radio.h>
+#include <media/timb_video.h>
 
 #include <linux/timb_dma.h>
 
@@ -102,11 +115,11 @@ static const struct resource timberdale_ocores_resources[] = {
 	},
 };
 
-static const struct max7301_platform_data timberdale_max7301_platform_data = {
+const struct max7301_platform_data timberdale_max7301_platform_data = {
 	.base = 200
 };
 
-static const struct mc33880_platform_data timberdale_mc33880_platform_data = {
+const struct mc33880_platform_data timberdale_mc33880_platform_data = {
 	.base = 100
 };
 
@@ -132,6 +145,7 @@ static struct spi_board_info timberdale_spi_8bit_board_info[] = {
 
 static struct xspi_platform_data timberdale_xspi_platform_data = {
 	.num_chipselect = 3,
+	.little_endian = true,
 	/* bits per word and devices will be filled in runtime depending
 	 * on the HW config
 	 */
@@ -361,7 +375,7 @@ static const struct resource timberdale_dma_resources[] = {
 	},
 };
 
-static const struct mfd_cell timberdale_cells_bar0_cfg0[] = {
+static struct mfd_cell timberdale_cells_bar0_cfg0[] = {
 	{
 		.name = "timb-dma",
 		.num_resources = ARRAY_SIZE(timberdale_dma_resources),
@@ -418,7 +432,7 @@ static const struct mfd_cell timberdale_cells_bar0_cfg0[] = {
 	},
 };
 
-static const struct mfd_cell timberdale_cells_bar0_cfg1[] = {
+static struct mfd_cell timberdale_cells_bar0_cfg1[] = {
 	{
 		.name = "timb-dma",
 		.num_resources = ARRAY_SIZE(timberdale_dma_resources),
@@ -485,7 +499,7 @@ static const struct mfd_cell timberdale_cells_bar0_cfg1[] = {
 	},
 };
 
-static const struct mfd_cell timberdale_cells_bar0_cfg2[] = {
+static struct mfd_cell timberdale_cells_bar0_cfg2[] = {
 	{
 		.name = "timb-dma",
 		.num_resources = ARRAY_SIZE(timberdale_dma_resources),
@@ -535,7 +549,7 @@ static const struct mfd_cell timberdale_cells_bar0_cfg2[] = {
 	},
 };
 
-static const struct mfd_cell timberdale_cells_bar0_cfg3[] = {
+static struct mfd_cell timberdale_cells_bar0_cfg3[] = {
 	{
 		.name = "timb-dma",
 		.num_resources = ARRAY_SIZE(timberdale_dma_resources),
@@ -606,7 +620,7 @@ static const struct resource timberdale_sdhc_resources[] = {
 	},
 };
 
-static const struct mfd_cell timberdale_cells_bar1[] = {
+static struct mfd_cell timberdale_cells_bar1[] = {
 	{
 		.name = "sdhci",
 		.num_resources = ARRAY_SIZE(timberdale_sdhc_resources),
@@ -614,7 +628,7 @@ static const struct mfd_cell timberdale_cells_bar1[] = {
 	},
 };
 
-static const struct mfd_cell timberdale_cells_bar2[] = {
+static struct mfd_cell timberdale_cells_bar2[] = {
 	{
 		.name = "sdhci",
 		.num_resources = ARRAY_SIZE(timberdale_sdhc_resources),
@@ -622,16 +636,17 @@ static const struct mfd_cell timberdale_cells_bar2[] = {
 	},
 };
 
-static ssize_t fw_ver_show(struct device *dev,
-			   struct device_attribute *attr, char *buf)
+static ssize_t show_fw_ver(struct device *dev, struct device_attribute *attr,
+	char *buf)
 {
-	struct timberdale_device *priv = dev_get_drvdata(dev);
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct timberdale_device *priv = pci_get_drvdata(pdev);
 
 	return sprintf(buf, "%d.%d.%d\n", priv->fw.major, priv->fw.minor,
 		priv->fw.config);
 }
 
-static DEVICE_ATTR_RO(fw_ver);
+static DEVICE_ATTR(fw_ver, S_IRUGO, show_fw_ver, NULL);
 
 /*--------------------------------------------------------------------------*/
 
@@ -664,7 +679,7 @@ static int timb_probe(struct pci_dev *dev,
 	priv->ctl_mapbase = mapbase + CHIPCTLOFFSET;
 	if (!request_mem_region(priv->ctl_mapbase, CHIPCTLSIZE, "timb-ctl")) {
 		dev_err(&dev->dev, "Failed to request ctl mem\n");
-		goto err_start;
+		goto err_request;
 	}
 
 	priv->ctl_membase = ioremap(priv->ctl_mapbase, CHIPCTLSIZE);
@@ -693,15 +708,15 @@ static int timb_probe(struct pci_dev *dev,
 		goto err_config;
 	}
 
-	msix_entries = kcalloc(TIMBERDALE_NR_IRQS, sizeof(*msix_entries),
-			       GFP_KERNEL);
+	msix_entries = kzalloc(TIMBERDALE_NR_IRQS * sizeof(*msix_entries),
+		GFP_KERNEL);
 	if (!msix_entries)
 		goto err_config;
 
 	for (i = 0; i < TIMBERDALE_NR_IRQS; i++)
 		msix_entries[i].entry = i;
 
-	err = pci_enable_msix_exact(dev, msix_entries, TIMBERDALE_NR_IRQS);
+	err = pci_enable_msix(dev, msix_entries, TIMBERDALE_NR_IRQS);
 	if (err) {
 		dev_err(&dev->dev,
 			"MSI-X init failed: %d, expected entries: %d\n",
@@ -763,10 +778,11 @@ static int timb_probe(struct pci_dev *dev,
 			&dev->resource[0], msix_entries[0].vector, NULL);
 		break;
 	default:
-		dev_err(&dev->dev, "Unknown IP setup: %d.%d.%d\n",
+		dev_err(&dev->dev, "Uknown IP setup: %d.%d.%d\n",
 			priv->fw.major, priv->fw.minor, ip_setup);
 		err = -ENODEV;
 		goto err_mfd;
+		break;
 	}
 
 	if (err) {
@@ -814,10 +830,13 @@ err_config:
 	iounmap(priv->ctl_membase);
 err_ioremap:
 	release_mem_region(priv->ctl_mapbase, CHIPCTLSIZE);
+err_request:
+	pci_set_drvdata(dev, NULL);
 err_start:
 	pci_disable_device(dev);
 err_enable:
 	kfree(priv);
+	pci_set_drvdata(dev, NULL);
 	return -ENODEV;
 }
 
@@ -834,10 +853,11 @@ static void timb_remove(struct pci_dev *dev)
 
 	pci_disable_msix(dev);
 	pci_disable_device(dev);
+	pci_set_drvdata(dev, NULL);
 	kfree(priv);
 }
 
-static const struct pci_device_id timberdale_pci_tbl[] = {
+static DEFINE_PCI_DEVICE_TABLE(timberdale_pci_tbl) = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_TIMB, PCI_DEVICE_ID_TIMB) },
 	{ 0 }
 };
@@ -850,7 +870,34 @@ static struct pci_driver timberdale_pci_driver = {
 	.remove = timb_remove,
 };
 
-module_pci_driver(timberdale_pci_driver);
+static int __init timberdale_init(void)
+{
+	int err;
+
+	err = pci_register_driver(&timberdale_pci_driver);
+	if (err < 0) {
+		printk(KERN_ERR
+			"Failed to register PCI driver for %s device.\n",
+			timberdale_pci_driver.name);
+		return -ENODEV;
+	}
+
+	printk(KERN_INFO "Driver for %s has been successfully registered.\n",
+		timberdale_pci_driver.name);
+
+	return 0;
+}
+
+static void __exit timberdale_exit(void)
+{
+	pci_unregister_driver(&timberdale_pci_driver);
+
+	printk(KERN_INFO "Driver for %s has been successfully unregistered.\n",
+		timberdale_pci_driver.name);
+}
+
+module_init(timberdale_init);
+module_exit(timberdale_exit);
 
 MODULE_AUTHOR("Mocean Laboratories <info@mocean-labs.com>");
 MODULE_VERSION(DRV_VERSION);

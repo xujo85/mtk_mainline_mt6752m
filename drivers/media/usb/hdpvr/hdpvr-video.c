@@ -1,11 +1,16 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Hauppauge HD PVR USB driver - video 4 linux 2 interface
  *
  * Copyright (C) 2008      Janne Grunau (j@jannau.net)
+ *
+ *	This program is free software; you can redistribute it and/or
+ *	modify it under the terms of the GNU General Public License as
+ *	published by the Free Software Foundation, version 2.
+ *
  */
 
 #include <linux/kernel.h>
+#include <linux/kconfig.h>
 #include <linux/errno.h>
 #include <linux/init.h>
 #include <linux/slab.h>
@@ -19,7 +24,6 @@
 #include <linux/v4l2-dv-timings.h>
 #include <media/v4l2-dev.h>
 #include <media/v4l2-common.h>
-#include <media/v4l2-dv-timings.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-event.h>
 #include "hdpvr.h"
@@ -150,8 +154,10 @@ int hdpvr_alloc_buffers(struct hdpvr_device *dev, uint count)
 		buf->dev = dev;
 
 		urb = usb_alloc_urb(0, GFP_KERNEL);
-		if (!urb)
+		if (!urb) {
+			v4l2_err(&dev->v4l2_dev, "cannot allocate urb\n");
 			goto exit_urb;
+		}
 		buf->urb = urb;
 
 		mem = usb_alloc_coherent(dev->udev, dev->bulk_in_size, GFP_KERNEL,
@@ -271,49 +277,44 @@ error:
 static int hdpvr_start_streaming(struct hdpvr_device *dev)
 {
 	int ret;
-	struct hdpvr_video_info vidinf;
+	struct hdpvr_video_info *vidinf;
 
 	if (dev->status == STATUS_STREAMING)
 		return 0;
-	if (dev->status != STATUS_IDLE)
+	else if (dev->status != STATUS_IDLE)
 		return -EAGAIN;
 
-	ret = get_video_info(dev, &vidinf);
-	if (ret < 0)
-		return ret;
+	vidinf = get_video_info(dev);
 
-	if (!vidinf.valid) {
-		msleep(250);
-		v4l2_dbg(MSG_INFO, hdpvr_debug, &dev->v4l2_dev,
-				"no video signal at input %d\n", dev->options.video_input);
-		return -EAGAIN;
+	if (vidinf) {
+		v4l2_dbg(MSG_BUFFER, hdpvr_debug, &dev->v4l2_dev,
+			 "video signal: %dx%d@%dhz\n", vidinf->width,
+			 vidinf->height, vidinf->fps);
+		kfree(vidinf);
+
+		/* start streaming 2 request */
+		ret = usb_control_msg(dev->udev,
+				      usb_sndctrlpipe(dev->udev, 0),
+				      0xb8, 0x38, 0x1, 0, NULL, 0, 8000);
+		v4l2_dbg(MSG_BUFFER, hdpvr_debug, &dev->v4l2_dev,
+			 "encoder start control request returned %d\n", ret);
+
+		hdpvr_config_call(dev, CTRL_START_STREAMING_VALUE, 0x00);
+
+		dev->status = STATUS_STREAMING;
+
+		INIT_WORK(&dev->worker, hdpvr_transmit_buffers);
+		queue_work(dev->workqueue, &dev->worker);
+
+		v4l2_dbg(MSG_BUFFER, hdpvr_debug, &dev->v4l2_dev,
+			 "streaming started\n");
+
+		return 0;
 	}
-
-	v4l2_dbg(MSG_BUFFER, hdpvr_debug, &dev->v4l2_dev,
-			"video signal: %dx%d@%dhz\n", vidinf.width,
-			vidinf.height, vidinf.fps);
-
-	/* start streaming 2 request */
-	ret = usb_control_msg(dev->udev,
-			usb_sndctrlpipe(dev->udev, 0),
-			0xb8, 0x38, 0x1, 0, NULL, 0, 8000);
-	v4l2_dbg(MSG_BUFFER, hdpvr_debug, &dev->v4l2_dev,
-			"encoder start control request returned %d\n", ret);
-	if (ret < 0)
-		return ret;
-
-	ret = hdpvr_config_call(dev, CTRL_START_STREAMING_VALUE, 0x00);
-	if (ret)
-		return ret;
-
-	dev->status = STATUS_STREAMING;
-
-	schedule_work(&dev->worker);
-
-	v4l2_dbg(MSG_BUFFER, hdpvr_debug, &dev->v4l2_dev,
-			"streaming started\n");
-
-	return 0;
+	msleep(250);
+	v4l2_dbg(MSG_INFO, hdpvr_debug, &dev->v4l2_dev,
+		 "no video signal at input %d\n", dev->options.video_input);
+	return -EAGAIN;
 }
 
 
@@ -331,7 +332,9 @@ static int hdpvr_stop_streaming(struct hdpvr_device *dev)
 
 	buf = kmalloc(dev->bulk_in_size, GFP_KERNEL);
 	if (!buf)
-		v4l2_err(&dev->v4l2_dev, "failed to allocate temporary buffer for emptying the internal device buffer. Next capture start will be slow\n");
+		v4l2_err(&dev->v4l2_dev, "failed to allocate temporary buffer "
+			 "for emptying the internal device buffer. "
+			 "Next capture start will be slow\n");
 
 	dev->status = STATUS_SHUTTING_DOWN;
 	hdpvr_config_call(dev, CTRL_STOP_STREAMING_VALUE, 0x00);
@@ -340,7 +343,7 @@ static int hdpvr_stop_streaming(struct hdpvr_device *dev)
 	wake_up_interruptible(&dev->wait_buffer);
 	msleep(50);
 
-	flush_work(&dev->worker);
+	flush_workqueue(dev->workqueue);
 
 	mutex_lock(&dev->io_mutex);
 	/* kill the still outstanding urbs */
@@ -409,7 +412,7 @@ static ssize_t hdpvr_read(struct file *file, char __user *buffer, size_t count,
 	struct hdpvr_device *dev = video_drvdata(file);
 	struct hdpvr_buffer *buf = NULL;
 	struct urb *urb;
-	int ret = 0;
+	unsigned int ret = 0;
 	int rem, cnt;
 
 	if (*pos)
@@ -434,7 +437,7 @@ static ssize_t hdpvr_read(struct file *file, char __user *buffer, size_t count,
 	/* wait for the first buffer */
 	if (!(file->f_flags & O_NONBLOCK)) {
 		if (wait_event_interruptible(dev->wait_data,
-					     !list_empty_careful(&dev->rec_buff_list)))
+					     hdpvr_get_next_buffer(dev)))
 			return -ERESTARTSYS;
 	}
 
@@ -444,7 +447,6 @@ static ssize_t hdpvr_read(struct file *file, char __user *buffer, size_t count,
 
 		if (buf->status != BUFSTAT_READY &&
 		    dev->status != STATUS_DISCONNECTED) {
-			int err;
 			/* return nonblocking */
 			if (file->f_flags & O_NONBLOCK) {
 				if (!ret)
@@ -452,30 +454,10 @@ static ssize_t hdpvr_read(struct file *file, char __user *buffer, size_t count,
 				goto err;
 			}
 
-			err = wait_event_interruptible_timeout(dev->wait_data,
-				buf->status == BUFSTAT_READY,
-				msecs_to_jiffies(1000));
-			if (err < 0) {
-				ret = err;
+			if (wait_event_interruptible(dev->wait_data,
+					      buf->status == BUFSTAT_READY)) {
+				ret = -ERESTARTSYS;
 				goto err;
-			}
-			if (!err) {
-				v4l2_info(&dev->v4l2_dev,
-					  "timeout: restart streaming\n");
-				mutex_lock(&dev->io_mutex);
-				hdpvr_stop_streaming(dev);
-				mutex_unlock(&dev->io_mutex);
-				/*
-				 * The FW needs about 4 seconds after streaming
-				 * stopped before it is ready to restart
-				 * streaming.
-				 */
-				msleep(4000);
-				err = hdpvr_start_streaming(dev);
-				if (err) {
-					ret = err;
-					goto err;
-				}
 			}
 		}
 
@@ -523,14 +505,14 @@ err:
 	return ret;
 }
 
-static __poll_t hdpvr_poll(struct file *filp, poll_table *wait)
+static unsigned int hdpvr_poll(struct file *filp, poll_table *wait)
 {
-	__poll_t req_events = poll_requested_events(wait);
+	unsigned long req_events = poll_requested_events(wait);
 	struct hdpvr_buffer *buf = NULL;
 	struct hdpvr_device *dev = video_drvdata(filp);
-	__poll_t mask = v4l2_ctrl_poll(filp, wait);
+	unsigned int mask = v4l2_ctrl_poll(filp, wait);
 
-	if (!(req_events & (EPOLLIN | EPOLLRDNORM)))
+	if (!(req_events & (POLLIN | POLLRDNORM)))
 		return mask;
 
 	mutex_lock(&dev->io_mutex);
@@ -555,7 +537,7 @@ static __poll_t hdpvr_poll(struct file *filp, poll_table *wait)
 		buf = hdpvr_get_next_buffer(dev);
 	}
 	if (buf && buf->status == BUFSTAT_READY)
-		mask |= EPOLLIN | EPOLLRDNORM;
+		mask |= POLLIN | POLLRDNORM;
 
 	return mask;
 }
@@ -580,9 +562,12 @@ static int vidioc_querycap(struct file *file, void  *priv,
 {
 	struct hdpvr_device *dev = video_drvdata(file);
 
-	strscpy(cap->driver, "hdpvr", sizeof(cap->driver));
-	strscpy(cap->card, "Hauppauge HD PVR", sizeof(cap->card));
+	strcpy(cap->driver, "hdpvr");
+	strcpy(cap->card, "Hauppauge HD PVR");
 	usb_make_path(dev->udev, cap->bus_info, sizeof(cap->bus_info));
+	cap->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_AUDIO |
+			    V4L2_CAP_READWRITE;
+	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
 	return 0;
 }
 
@@ -621,20 +606,22 @@ static int vidioc_g_std(struct file *file, void *_fh,
 static int vidioc_querystd(struct file *file, void *_fh, v4l2_std_id *a)
 {
 	struct hdpvr_device *dev = video_drvdata(file);
-	struct hdpvr_video_info vid_info;
+	struct hdpvr_video_info *vid_info;
 	struct hdpvr_fh *fh = _fh;
-	int ret;
 
-	*a = V4L2_STD_UNKNOWN;
+	*a = V4L2_STD_ALL;
 	if (dev->options.video_input == HDPVR_COMPONENT)
 		return fh->legacy_mode ? 0 : -ENODATA;
-	ret = get_video_info(dev, &vid_info);
-	if (vid_info.valid && vid_info.width == 720 &&
-	    (vid_info.height == 480 || vid_info.height == 576)) {
-		*a = (vid_info.height == 480) ?
+	vid_info = get_video_info(dev);
+	if (vid_info == NULL)
+		return 0;
+	if (vid_info->width == 720 &&
+	    (vid_info->height == 480 || vid_info->height == 576)) {
+		*a = (vid_info->height == 480) ?
 			V4L2_STD_525_60 : V4L2_STD_625_50;
 	}
-	return ret;
+	kfree(vid_info);
+	return 0;
 }
 
 static int vidioc_s_dv_timings(struct file *file, void *_fh,
@@ -650,7 +637,7 @@ static int vidioc_s_dv_timings(struct file *file, void *_fh,
 	if (dev->status != STATUS_IDLE)
 		return -EBUSY;
 	for (i = 0; i < ARRAY_SIZE(hdpvr_dv_timings); i++)
-		if (v4l2_match_dv_timings(timings, hdpvr_dv_timings + i, 0, false))
+		if (v4l_match_dv_timings(timings, hdpvr_dv_timings + i, 0))
 			break;
 	if (i == ARRAY_SIZE(hdpvr_dv_timings))
 		return -EINVAL;
@@ -678,7 +665,7 @@ static int vidioc_query_dv_timings(struct file *file, void *_fh,
 {
 	struct hdpvr_device *dev = video_drvdata(file);
 	struct hdpvr_fh *fh = _fh;
-	struct hdpvr_video_info vid_info;
+	struct hdpvr_video_info *vid_info;
 	bool interlaced;
 	int ret = 0;
 	int i;
@@ -686,32 +673,32 @@ static int vidioc_query_dv_timings(struct file *file, void *_fh,
 	fh->legacy_mode = false;
 	if (dev->options.video_input)
 		return -ENODATA;
-	ret = get_video_info(dev, &vid_info);
-	if (ret)
-		return ret;
-	if (!vid_info.valid)
+	vid_info = get_video_info(dev);
+	if (vid_info == NULL)
 		return -ENOLCK;
-	interlaced = vid_info.fps <= 30;
+	interlaced = vid_info->fps <= 30;
 	for (i = 0; i < ARRAY_SIZE(hdpvr_dv_timings); i++) {
 		const struct v4l2_bt_timings *bt = &hdpvr_dv_timings[i].bt;
 		unsigned hsize;
 		unsigned vsize;
 		unsigned fps;
 
-		hsize = V4L2_DV_BT_FRAME_WIDTH(bt);
-		vsize = V4L2_DV_BT_FRAME_HEIGHT(bt);
+		hsize = bt->hfrontporch + bt->hsync + bt->hbackporch + bt->width;
+		vsize = bt->vfrontporch + bt->vsync + bt->vbackporch +
+			bt->il_vfrontporch + bt->il_vsync + bt->il_vbackporch +
+			bt->height;
 		fps = (unsigned)bt->pixelclock / (hsize * vsize);
-		if (bt->width != vid_info.width ||
-		    bt->height != vid_info.height ||
+		if (bt->width != vid_info->width ||
+		    bt->height != vid_info->height ||
 		    bt->interlaced != interlaced ||
-		    (fps != vid_info.fps && fps + 1 != vid_info.fps))
+		    (fps != vid_info->fps && fps + 1 != vid_info->fps))
 			continue;
 		*timings = hdpvr_dv_timings[i];
 		break;
 	}
 	if (i == ARRAY_SIZE(hdpvr_dv_timings))
 		ret = -ERANGE;
-
+	kfree(vid_info);
 	return ret;
 }
 
@@ -768,7 +755,8 @@ static int vidioc_enum_input(struct file *file, void *_fh, struct v4l2_input *i)
 
 	i->type = V4L2_INPUT_TYPE_CAMERA;
 
-	strscpy(i->name, iname[n], sizeof(i->name));
+	strncpy(i->name, iname[n], sizeof(i->name) - 1);
+	i->name[sizeof(i->name) - 1] = '\0';
 
 	i->audioset = 1<<HDPVR_RCA_FRONT | 1<<HDPVR_RCA_BACK | 1<<HDPVR_SPDIF;
 
@@ -804,7 +792,7 @@ static int vidioc_s_input(struct file *file, void *_fh,
 		 * Comment this out for now, but if the legacy mode can be
 		 * removed in the future, then this code should be enabled
 		 * again.
-		dev->video_dev.tvnorms =
+		dev->video_dev->tvnorms =
 			(index != HDPVR_COMPONENT) ? V4L2_STD_ALL : 0;
 		 */
 	}
@@ -839,7 +827,8 @@ static int vidioc_enumaudio(struct file *file, void *priv,
 
 	audio->capability = V4L2_AUDCAP_STEREO;
 
-	strscpy(audio->name, audio_iname[n], sizeof(audio->name));
+	strncpy(audio->name, audio_iname[n], sizeof(audio->name) - 1);
+	audio->name[sizeof(audio->name) - 1] = '\0';
 
 	return 0;
 }
@@ -870,7 +859,8 @@ static int vidioc_g_audio(struct file *file, void *private_data,
 
 	audio->index = dev->options.audio_input;
 	audio->capability = V4L2_AUDCAP_STEREO;
-	strscpy(audio->name, audio_iname[audio->index], sizeof(audio->name));
+	strncpy(audio->name, audio_iname[audio->index], sizeof(audio->name));
+	audio->name[sizeof(audio->name) - 1] = '\0';
 	return 0;
 }
 
@@ -937,18 +927,18 @@ static int hdpvr_s_ctrl(struct v4l2_ctrl *ctrl)
 		return 0;
 	case V4L2_CID_MPEG_VIDEO_ENCODING:
 		return 0;
-/*	case V4L2_CID_MPEG_VIDEO_B_FRAMES: */
-/*		if (ctrl->value == 0 && !(opt->gop_mode & 0x2)) { */
-/*			opt->gop_mode |= 0x2; */
-/*			hdpvr_config_call(dev, CTRL_GOP_MODE_VALUE, */
-/*					  opt->gop_mode); */
-/*		} */
-/*		if (ctrl->value == 128 && opt->gop_mode & 0x2) { */
-/*			opt->gop_mode &= ~0x2; */
-/*			hdpvr_config_call(dev, CTRL_GOP_MODE_VALUE, */
-/*					  opt->gop_mode); */
-/*		} */
-/*		break; */
+/* 	case V4L2_CID_MPEG_VIDEO_B_FRAMES: */
+/* 		if (ctrl->value == 0 && !(opt->gop_mode & 0x2)) { */
+/* 			opt->gop_mode |= 0x2; */
+/* 			hdpvr_config_call(dev, CTRL_GOP_MODE_VALUE, */
+/* 					  opt->gop_mode); */
+/* 		} */
+/* 		if (ctrl->value == 128 && opt->gop_mode & 0x2) { */
+/* 			opt->gop_mode &= ~0x2; */
+/* 			hdpvr_config_call(dev, CTRL_GOP_MODE_VALUE, */
+/* 					  opt->gop_mode); */
+/* 		} */
+/* 		break; */
 	case V4L2_CID_MPEG_VIDEO_BITRATE_MODE: {
 		uint peak_bitrate = dev->video_bitrate_peak->val / 100000;
 		uint bitrate = dev->video_bitrate->val / 100000;
@@ -986,6 +976,8 @@ static int vidioc_enum_fmt_vid_cap(struct file *file, void *private_data,
 	if (f->index != 0)
 		return -EINVAL;
 
+	f->flags = V4L2_FMT_FLAG_COMPRESSED;
+	strncpy(f->description, "MPEG2-TS with AVC/AAC streams", 32);
 	f->pixelformat = V4L2_PIX_FMT_MPEG;
 
 	return 0;
@@ -996,7 +988,6 @@ static int vidioc_g_fmt_vid_cap(struct file *file, void *_fh,
 {
 	struct hdpvr_device *dev = video_drvdata(file);
 	struct hdpvr_fh *fh = _fh;
-	int ret;
 
 	/*
 	 * The original driver would always returns the current detected
@@ -1009,15 +1000,14 @@ static int vidioc_g_fmt_vid_cap(struct file *file, void *_fh,
 	 * last set format.
 	 */
 	if (fh->legacy_mode) {
-		struct hdpvr_video_info vid_info;
+		struct hdpvr_video_info *vid_info;
 
-		ret = get_video_info(dev, &vid_info);
-		if (ret < 0)
-			return ret;
-		if (!vid_info.valid)
+		vid_info = get_video_info(dev);
+		if (!vid_info)
 			return -EFAULT;
-		f->fmt.pix.width = vid_info.width;
-		f->fmt.pix.height = vid_info.height;
+		f->fmt.pix.width = vid_info->width;
+		f->fmt.pix.height = vid_info->height;
+		kfree(vid_info);
 	} else {
 		f->fmt.pix.width = dev->width;
 		f->fmt.pix.height = dev->height;
@@ -1025,13 +1015,14 @@ static int vidioc_g_fmt_vid_cap(struct file *file, void *_fh,
 	f->fmt.pix.pixelformat	= V4L2_PIX_FMT_MPEG;
 	f->fmt.pix.sizeimage	= dev->bulk_in_size;
 	f->fmt.pix.bytesperline	= 0;
+	f->fmt.pix.priv		= 0;
 	if (f->fmt.pix.width == 720) {
 		/* SDTV formats */
 		f->fmt.pix.colorspace = V4L2_COLORSPACE_SMPTE170M;
 		f->fmt.pix.field = V4L2_FIELD_INTERLACED;
 	} else {
 		/* HDTV formats */
-		f->fmt.pix.colorspace = V4L2_COLORSPACE_REC709;
+		f->fmt.pix.colorspace = V4L2_COLORSPACE_SMPTE240M;
 		f->fmt.pix.field = V4L2_FIELD_NONE;
 	}
 	return 0;
@@ -1127,7 +1118,9 @@ static void hdpvr_device_release(struct video_device *vdev)
 	struct hdpvr_device *dev = video_get_drvdata(vdev);
 
 	hdpvr_delete(dev);
-	flush_work(&dev->worker);
+	mutex_lock(&dev->io_mutex);
+	destroy_workqueue(dev->workqueue);
+	mutex_unlock(&dev->io_mutex);
 
 	v4l2_device_unregister(&dev->v4l2_dev);
 	v4l2_ctrl_handler_free(&dev->hdl);
@@ -1146,10 +1139,8 @@ static void hdpvr_device_release(struct video_device *vdev)
 static const struct video_device hdpvr_video_template = {
 	.fops			= &hdpvr_fops,
 	.release		= hdpvr_device_release,
-	.ioctl_ops		= &hdpvr_ioctl_ops,
+	.ioctl_ops 		= &hdpvr_ioctl_ops,
 	.tvnorms		= V4L2_STD_ALL,
-	.device_caps		= V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_AUDIO |
-				  V4L2_CAP_READWRITE,
 };
 
 static const struct v4l2_ctrl_ops hdpvr_ctrl_ops = {
@@ -1163,9 +1154,6 @@ int hdpvr_register_videodev(struct hdpvr_device *dev, struct device *parent,
 	struct v4l2_ctrl_handler *hdl = &dev->hdl;
 	bool ac3 = dev->flags & HDPVR_FLAG_AC3_CAP;
 	int res;
-
-	// initialize dev->worker
-	INIT_WORK(&dev->worker, hdpvr_transmit_buffers);
 
 	dev->cur_std = V4L2_STD_525_60;
 	dev->width = 720;
@@ -1234,13 +1222,20 @@ int hdpvr_register_videodev(struct hdpvr_device *dev, struct device *parent,
 	}
 
 	/* setup and register video device */
-	dev->video_dev = hdpvr_video_template;
-	strscpy(dev->video_dev.name, "Hauppauge HD PVR",
-		sizeof(dev->video_dev.name));
-	dev->video_dev.v4l2_dev = &dev->v4l2_dev;
-	video_set_drvdata(&dev->video_dev, dev);
+	dev->video_dev = video_device_alloc();
+	if (!dev->video_dev) {
+		v4l2_err(&dev->v4l2_dev, "video_device_alloc() failed\n");
+		res = -ENOMEM;
+		goto error;
+	}
 
-	res = video_register_device(&dev->video_dev, VFL_TYPE_VIDEO, devnum);
+	*dev->video_dev = hdpvr_video_template;
+	strcpy(dev->video_dev->name, "Hauppauge HD PVR");
+	dev->video_dev->v4l2_dev = &dev->v4l2_dev;
+	video_set_drvdata(dev->video_dev, dev);
+	set_bit(V4L2_FL_USE_FH_PRIO, &dev->video_dev->flags);
+
+	res = video_register_device(dev->video_dev, VFL_TYPE_GRABBER, devnum);
 	if (res < 0) {
 		v4l2_err(&dev->v4l2_dev, "video_device registration failed\n");
 		goto error;

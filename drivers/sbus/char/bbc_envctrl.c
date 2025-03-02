@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /* bbc_envctrl.c: UltraSPARC-III environment control driver.
  *
  * Copyright (C) 2001, 2008 David S. Miller (davem@davemloft.net)
@@ -161,7 +160,8 @@ static void do_envctrl_shutdown(struct bbc_cpu_temperature *tp)
 	printk(KERN_CRIT "kenvctrld: Shutting down the system now.\n");
 
 	shutting_down = 1;
-	orderly_poweroff(true);
+	if (orderly_poweroff(true) < 0)
+		printk(KERN_CRIT "envctrl: shutdown execution failed\n");
 }
 
 #define WARN_INTERVAL	(30 * HZ)
@@ -571,9 +571,9 @@ int bbc_envctrl_init(struct bbc_i2c_bus *bp)
 	int devidx = 0;
 
 	while ((op = bbc_i2c_getdev(bp, devidx++)) != NULL) {
-		if (of_node_name_eq(op->dev.of_node, "temperature"))
+		if (!strcmp(op->dev.of_node->name, "temperature"))
 			attach_one_temp(bp, op, temp_index++);
-		if (of_node_name_eq(op->dev.of_node, "fan-control"))
+		if (!strcmp(op->dev.of_node->name, "fan-control"))
 			attach_one_fan(bp, op, fan_index++);
 	}
 	if (temp_index != 0 && fan_index != 0) {

@@ -1,9 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * TSC-40 serial touchscreen driver. It should be compatible with
  * TSC-10 and 25.
  *
  * Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+ * License: GPLv2 as published by the FSF.
  */
 
 #include <linux/kernel.h>
@@ -11,6 +11,7 @@
 #include <linux/slab.h>
 #include <linux/input.h>
 #include <linux/serio.h>
+#include <linux/init.h>
 
 #define PACKET_LENGTH  5
 struct tsc_ser {
@@ -141,7 +142,7 @@ static void tsc_disconnect(struct serio *serio)
 	serio_set_drvdata(serio, NULL);
 }
 
-static const struct serio_device_id tsc_serio_ids[] = {
+static struct serio_device_id tsc_serio_ids[] = {
 	{
 		.type   = SERIO_RS232,
 		.proto  = SERIO_TSC40,

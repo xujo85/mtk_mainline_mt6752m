@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Generic UHCI HCD (Host Controller Driver) for Platform Devices
  *
@@ -9,16 +8,13 @@
  */
 
 #include <linux/of.h>
-#include <linux/device.h>
 #include <linux/platform_device.h>
 
 static int uhci_platform_init(struct usb_hcd *hcd)
 {
 	struct uhci_hcd *uhci = hcd_to_uhci(hcd);
 
-	/* Probe number of ports if not already provided by DT */
-	if (!uhci->rh_numports)
-		uhci->rh_numports = uhci_count_ports(hcd);
+	uhci->rh_numports = uhci_count_ports(hcd);
 
 	/* Set up pointers to to generic functions */
 	uhci->reset_hc = uhci_generic_reset_hc;
@@ -41,7 +37,7 @@ static const struct hc_driver uhci_platform_hc_driver = {
 
 	/* Generic hardware linkage */
 	.irq =			uhci_irq,
-	.flags =		HCD_MEMORY | HCD_DMA | HCD_USB11,
+	.flags =		HCD_MEMORY | HCD_USB11,
 
 	/* Basic lifecycle operations */
 	.reset =		uhci_platform_init,
@@ -66,7 +62,6 @@ static const struct hc_driver uhci_platform_hc_driver = {
 
 static int uhci_hcd_platform_probe(struct platform_device *pdev)
 {
-	struct device_node *np = pdev->dev.of_node;
 	struct usb_hcd *hcd;
 	struct uhci_hcd	*uhci;
 	struct resource *res;
@@ -80,86 +75,64 @@ static int uhci_hcd_platform_probe(struct platform_device *pdev)
 	 * Since shared usb code relies on it, set it here for now.
 	 * Once we have dma capability bindings this can go away.
 	 */
-	ret = dma_coerce_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-	if (ret)
-		return ret;
+	if (!pdev->dev.dma_mask)
+		pdev->dev.dma_mask = &pdev->dev.coherent_dma_mask;
+	if (!pdev->dev.coherent_dma_mask)
+		pdev->dev.coherent_dma_mask = DMA_BIT_MASK(32);
 
 	hcd = usb_create_hcd(&uhci_platform_hc_driver, &pdev->dev,
 			pdev->name);
 	if (!hcd)
 		return -ENOMEM;
 
-	uhci = hcd_to_uhci(hcd);
-
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	hcd->regs = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(hcd->regs)) {
-		ret = PTR_ERR(hcd->regs);
-		goto err_rmr;
-	}
 	hcd->rsrc_start = res->start;
 	hcd->rsrc_len = resource_size(res);
 
+	if (!request_mem_region(hcd->rsrc_start, hcd->rsrc_len, hcd_name)) {
+		pr_err("%s: request_mem_region failed\n", __func__);
+		ret = -EBUSY;
+		goto err_rmr;
+	}
+
+	hcd->regs = ioremap(hcd->rsrc_start, hcd->rsrc_len);
+	if (!hcd->regs) {
+		pr_err("%s: ioremap failed\n", __func__);
+		ret = -ENOMEM;
+		goto err_irq;
+	}
+	uhci = hcd_to_uhci(hcd);
+
 	uhci->regs = hcd->regs;
 
-	/* Grab some things from the device-tree */
-	if (np) {
-		u32 num_ports;
-
-		if (of_property_read_u32(np, "#ports", &num_ports) == 0) {
-			uhci->rh_numports = num_ports;
-			dev_info(&pdev->dev,
-				"Detected %d ports from device-tree\n",
-				num_ports);
-		}
-		if (of_device_is_compatible(np, "aspeed,ast2400-uhci") ||
-		    of_device_is_compatible(np, "aspeed,ast2500-uhci") ||
-		    of_device_is_compatible(np, "aspeed,ast2600-uhci")) {
-			uhci->is_aspeed = 1;
-			dev_info(&pdev->dev,
-				 "Enabled Aspeed implementation workarounds\n");
-		}
-	}
-
-	/* Get and enable clock if any specified */
-	uhci->clk = devm_clk_get(&pdev->dev, NULL);
-	if (IS_ERR(uhci->clk)) {
-		ret = PTR_ERR(uhci->clk);
-		goto err_rmr;
-	}
-	ret = clk_prepare_enable(uhci->clk);
-	if (ret) {
-		dev_err(&pdev->dev, "Error couldn't enable clock (%d)\n", ret);
-		goto err_rmr;
-	}
-
-	ret = platform_get_irq(pdev, 0);
-	if (ret < 0)
-		goto err_clk;
-
-	ret = usb_add_hcd(hcd, ret, IRQF_SHARED);
+	ret = usb_add_hcd(hcd, pdev->resource[1].start, IRQF_DISABLED |
+								IRQF_SHARED);
 	if (ret)
-		goto err_clk;
+		goto err_uhci;
 
-	device_wakeup_enable(hcd->self.controller);
 	return 0;
 
-err_clk:
-	clk_disable_unprepare(uhci->clk);
+err_uhci:
+	iounmap(hcd->regs);
+err_irq:
+	release_mem_region(hcd->rsrc_start, hcd->rsrc_len);
 err_rmr:
 	usb_put_hcd(hcd);
 
 	return ret;
 }
 
-static void uhci_hcd_platform_remove(struct platform_device *pdev)
+static int uhci_hcd_platform_remove(struct platform_device *pdev)
 {
 	struct usb_hcd *hcd = platform_get_drvdata(pdev);
-	struct uhci_hcd *uhci = hcd_to_uhci(hcd);
 
-	clk_disable_unprepare(uhci->clk);
 	usb_remove_hcd(hcd);
+	iounmap(hcd->regs);
+	release_mem_region(hcd->rsrc_start, hcd->rsrc_len);
 	usb_put_hcd(hcd);
+	platform_set_drvdata(pdev, NULL);
+
+	return 0;
 }
 
 /* Make sure the controller is quiescent and that we're not using it
@@ -171,24 +144,23 @@ static void uhci_hcd_platform_remove(struct platform_device *pdev)
  */
 static void uhci_hcd_platform_shutdown(struct platform_device *op)
 {
-	struct usb_hcd *hcd = platform_get_drvdata(op);
+	struct usb_hcd *hcd = dev_get_drvdata(&op->dev);
 
 	uhci_hc_died(hcd_to_uhci(hcd));
 }
 
 static const struct of_device_id platform_uhci_ids[] = {
-	{ .compatible = "generic-uhci", },
 	{ .compatible = "platform-uhci", },
 	{}
 };
-MODULE_DEVICE_TABLE(of, platform_uhci_ids);
 
 static struct platform_driver uhci_platform_driver = {
 	.probe		= uhci_hcd_platform_probe,
-	.remove_new	= uhci_hcd_platform_remove,
+	.remove		= uhci_hcd_platform_remove,
 	.shutdown	= uhci_hcd_platform_shutdown,
 	.driver = {
 		.name = "platform-uhci",
-		.of_match_table = platform_uhci_ids,
+		.owner = THIS_MODULE,
+		.of_match_table = of_match_ptr(platform_uhci_ids),
 	},
 };

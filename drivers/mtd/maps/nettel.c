@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /****************************************************************************/
 
 /*
@@ -108,7 +107,7 @@ static struct map_info nettel_amd_map = {
 	.bankwidth = AMD_BUSWIDTH,
 };
 
-static const struct mtd_partition nettel_amd_partitions[] = {
+static struct mtd_partition nettel_amd_partitions[] = {
 	{
 		.name = "SnapGear BIOS config",
 		.offset = 0x000e0000,
@@ -176,7 +175,7 @@ static int __init nettel_init(void)
 #endif
 	int rc = 0;
 
-	nettel_mmcrp = (void *) ioremap(0xfffef000, 4096);
+	nettel_mmcrp = (void *) ioremap_nocache(0xfffef000, 4096);
 	if (nettel_mmcrp == NULL) {
 		printk("SNAPGEAR: failed to disable MMCR cache??\n");
 		return(-EIO);
@@ -217,7 +216,7 @@ static int __init nettel_init(void)
 	__asm__ ("wbinvd");
 
 	nettel_amd_map.phys = amdaddr;
-	nettel_amd_map.virt = ioremap(amdaddr, maxsize);
+	nettel_amd_map.virt = ioremap_nocache(amdaddr, maxsize);
 	if (!nettel_amd_map.virt) {
 		printk("SNAPGEAR: failed to ioremap() BOOTCS\n");
 		iounmap(nettel_mmcrp);
@@ -303,7 +302,7 @@ static int __init nettel_init(void)
 	/* Probe for the size of the first Intel flash */
 	nettel_intel_map.size = maxsize;
 	nettel_intel_map.phys = intel0addr;
-	nettel_intel_map.virt = ioremap(intel0addr, maxsize);
+	nettel_intel_map.virt = ioremap_nocache(intel0addr, maxsize);
 	if (!nettel_intel_map.virt) {
 		printk("SNAPGEAR: failed to ioremap() ROMCS1\n");
 		rc = -EIO;
@@ -337,7 +336,7 @@ static int __init nettel_init(void)
 	iounmap(nettel_intel_map.virt);
 
 	nettel_intel_map.size = maxsize;
-	nettel_intel_map.virt = ioremap(intel0addr, maxsize);
+	nettel_intel_map.virt = ioremap_nocache(intel0addr, maxsize);
 	if (!nettel_intel_map.virt) {
 		printk("SNAPGEAR: failed to ioremap() ROMCS1/2\n");
 		rc = -EIO;
@@ -386,28 +385,20 @@ static int __init nettel_init(void)
 	}
 	rc = mtd_device_register(intel_mtd, nettel_intel_partitions,
 				 num_intel_partitions);
-	if (rc)
-		goto out_map_destroy;
 #endif
 
 	if (amd_mtd) {
 		rc = mtd_device_register(amd_mtd, nettel_amd_partitions,
 					 num_amd_partitions);
-		if (rc)
-			goto out_mtd_unreg;
 	}
 
 #ifdef CONFIG_MTD_CFI_INTELEXT
 	register_reboot_notifier(&nettel_notifier_block);
 #endif
 
-	return rc;
+	return(rc);
 
-out_mtd_unreg:
 #ifdef CONFIG_MTD_CFI_INTELEXT
-	mtd_device_unregister(intel_mtd);
-out_map_destroy:
-	map_destroy(intel_mtd);
 out_unmap1:
 	iounmap(nettel_intel_map.virt);
 #endif
@@ -416,7 +407,8 @@ out_unmap2:
 	iounmap(nettel_mmcrp);
 	iounmap(nettel_amd_map.virt);
 
-	return rc;
+	return(rc);
+
 }
 
 /****************************************************************************/

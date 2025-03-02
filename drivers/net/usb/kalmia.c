@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * USB network interface driver for Samsung Kalmia based LTE USB modem like the
  * Samsung GT-B3730 and GT-B3710.
@@ -8,9 +7,15 @@
  * Sponsored by Quicklink Video Distribution Services Ltd.
  *
  * Based on the cdc_eem module.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  */
 
 #include <linux/module.h>
+#include <linux/init.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/ctype.h>
@@ -65,8 +70,8 @@ kalmia_send_init_packet(struct usbnet *dev, u8 *init_msg, u8 init_msg_len,
 		init_msg, init_msg_len, &act_len, KALMIA_USB_TIMEOUT);
 	if (status != 0) {
 		netdev_err(dev->net,
-			"Error sending init packet. Status %i\n",
-			status);
+			"Error sending init packet. Status %i, length %i\n",
+			status, act_len);
 		return status;
 	}
 	else if (act_len != init_msg_len) {
@@ -83,8 +88,8 @@ kalmia_send_init_packet(struct usbnet *dev, u8 *init_msg, u8 init_msg_len,
 
 	if (status != 0)
 		netdev_err(dev->net,
-			"Error receiving init result. Status %i\n",
-			status);
+			"Error receiving init result. Status %i, length %i\n",
+			status, act_len);
 	else if (act_len != expected_len)
 		netdev_err(dev->net, "Unexpected init result length: %i\n",
 			act_len);
@@ -110,19 +115,19 @@ kalmia_init_and_get_ethernet_addr(struct usbnet *dev, u8 *ethernet_addr)
 		return -ENOMEM;
 
 	memcpy(usb_buf, init_msg_1, 12);
-	status = kalmia_send_init_packet(dev, usb_buf, ARRAY_SIZE(init_msg_1),
-					 usb_buf, 24);
+	status = kalmia_send_init_packet(dev, usb_buf, sizeof(init_msg_1)
+		/ sizeof(init_msg_1[0]), usb_buf, 24);
 	if (status != 0)
-		goto out;
+		return status;
 
 	memcpy(usb_buf, init_msg_2, 12);
-	status = kalmia_send_init_packet(dev, usb_buf, ARRAY_SIZE(init_msg_2),
-					 usb_buf, 28);
+	status = kalmia_send_init_packet(dev, usb_buf, sizeof(init_msg_2)
+		/ sizeof(init_msg_2[0]), usb_buf, 28);
 	if (status != 0)
-		goto out;
+		return status;
 
 	memcpy(ethernet_addr, usb_buf + 10, ETH_ALEN);
-out:
+
 	kfree(usb_buf);
 	return status;
 }
@@ -146,10 +151,14 @@ kalmia_bind(struct usbnet *dev, struct usb_interface *intf)
 	dev->rx_urb_size = dev->hard_mtu * 10; // Found as optimal after testing
 
 	status = kalmia_init_and_get_ethernet_addr(dev, ethernet_addr);
-	if (status)
-		return status;
 
-	eth_hw_addr_set(dev->net, ethernet_addr);
+	if (status < 0) {
+		usb_set_intfdata(intf, NULL);
+		usb_driver_release_interface(driver_of(intf), intf);
+		return status;
+	}
+
+	memcpy(dev->net->dev_addr, ethernet_addr, ETH_ALEN);
 
 	return status;
 }
@@ -209,12 +218,15 @@ done:
 	remainder = skb->len % KALMIA_ALIGN_SIZE;
 	if (remainder > 0) {
 		padlen = KALMIA_ALIGN_SIZE - remainder;
-		skb_put_zero(skb, padlen);
+		memset(skb_put(skb, padlen), 0, padlen);
 	}
 
-	netdev_dbg(dev->net,
-		"Sending package with length %i and padding %i. Header: %6phC.",
-		content_len, padlen, header_start);
+	netdev_dbg(
+		dev->net,
+		"Sending package with length %i and padding %i. Header: %02x:%02x:%02x:%02x:%02x:%02x.",
+		content_len, padlen, header_start[0], header_start[1],
+		header_start[2], header_start[3], header_start[4],
+		header_start[5]);
 
 	return skb;
 }
@@ -251,23 +263,32 @@ kalmia_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 				sizeof(EXPECTED_UNKNOWN_HEADER_1)) || !memcmp(
 				header_start, EXPECTED_UNKNOWN_HEADER_2,
 				sizeof(EXPECTED_UNKNOWN_HEADER_2))) {
-				netdev_dbg(dev->net,
-					"Received expected unknown frame header: %6phC. Package length: %i\n",
-					header_start,
+				netdev_dbg(
+					dev->net,
+					"Received expected unknown frame header: %02x:%02x:%02x:%02x:%02x:%02x. Package length: %i\n",
+					header_start[0], header_start[1],
+					header_start[2], header_start[3],
+					header_start[4], header_start[5],
 					skb->len - KALMIA_HEADER_LENGTH);
 			}
 			else {
-				netdev_err(dev->net,
-					"Received unknown frame header: %6phC. Package length: %i\n",
-					header_start,
+				netdev_err(
+					dev->net,
+					"Received unknown frame header: %02x:%02x:%02x:%02x:%02x:%02x. Package length: %i\n",
+					header_start[0], header_start[1],
+					header_start[2], header_start[3],
+					header_start[4], header_start[5],
 					skb->len - KALMIA_HEADER_LENGTH);
 				return 0;
 			}
 		}
 		else
-			netdev_dbg(dev->net,
-				"Received header: %6phC. Package length: %i\n",
-				header_start, skb->len - KALMIA_HEADER_LENGTH);
+			netdev_dbg(
+				dev->net,
+				"Received header: %02x:%02x:%02x:%02x:%02x:%02x. Package length: %i\n",
+				header_start[0], header_start[1], header_start[2],
+				header_start[3], header_start[4], header_start[5],
+				skb->len - KALMIA_HEADER_LENGTH);
 
 		/* subtract start header and end header */
 		usb_packet_length = skb->len - (2 * KALMIA_HEADER_LENGTH);
@@ -289,9 +310,12 @@ kalmia_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 				sizeof(HEADER_END_OF_USB_PACKET)) == 0);
 			if (!is_last) {
 				header_start = skb->data + ether_packet_length;
-				netdev_dbg(dev->net,
-					"End header: %6phC. Package length: %i\n",
-					header_start,
+				netdev_dbg(
+					dev->net,
+					"End header: %02x:%02x:%02x:%02x:%02x:%02x. Package length: %i\n",
+					header_start[0], header_start[1],
+					header_start[2], header_start[3],
+					header_start[4], header_start[5],
 					skb->len - KALMIA_HEADER_LENGTH);
 			}
 		}
@@ -335,7 +359,7 @@ static const struct driver_info kalmia_info = {
 static const struct usb_device_id products[] = {
 	/* The unswitched USB ID, to get the module auto loaded: */
 	{ USB_DEVICE(0x04e8, 0x689a) },
-	/* The stick switched into modem (by e.g. usb_modeswitch): */
+	/* The stick swithed into modem (by e.g. usb_modeswitch): */
 	{ USB_DEVICE(0x04e8, 0x6889),
 		.driver_info = (unsigned long) &kalmia_info, },
 	{ /* EMPTY == end of list */} };

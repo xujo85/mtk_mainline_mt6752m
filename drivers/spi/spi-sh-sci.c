@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * SH SCI SPI interface
  *
@@ -7,11 +6,18 @@
  * Based on S3C24XX GPIO based SPI driver, which is:
  *   Copyright (c) 2006 Ben Dooks
  *   Copyright (c) 2006 Simtec Electronics
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
  */
 
 #include <linux/kernel.h>
+#include <linux/init.h>
 #include <linux/delay.h>
 #include <linux/spinlock.h>
+#include <linux/workqueue.h>
 #include <linux/platform_device.h>
 
 #include <linux/spi/spi.h>
@@ -76,39 +82,35 @@ static inline u32 getmiso(struct spi_device *dev)
 #include "spi-bitbang-txrx.h"
 
 static u32 sh_sci_spi_txrx_mode0(struct spi_device *spi,
-				 unsigned nsecs, u32 word, u8 bits,
-				 unsigned flags)
+				      unsigned nsecs, u32 word, u8 bits)
 {
-	return bitbang_txrx_be_cpha0(spi, nsecs, 0, flags, word, bits);
+	return bitbang_txrx_be_cpha0(spi, nsecs, 0, 0, word, bits);
 }
 
 static u32 sh_sci_spi_txrx_mode1(struct spi_device *spi,
-				 unsigned nsecs, u32 word, u8 bits,
-				 unsigned flags)
+				      unsigned nsecs, u32 word, u8 bits)
 {
-	return bitbang_txrx_be_cpha1(spi, nsecs, 0, flags, word, bits);
+	return bitbang_txrx_be_cpha1(spi, nsecs, 0, 0, word, bits);
 }
 
 static u32 sh_sci_spi_txrx_mode2(struct spi_device *spi,
-				 unsigned nsecs, u32 word, u8 bits,
-				 unsigned flags)
+				      unsigned nsecs, u32 word, u8 bits)
 {
-	return bitbang_txrx_be_cpha0(spi, nsecs, 1, flags, word, bits);
+	return bitbang_txrx_be_cpha0(spi, nsecs, 1, 0, word, bits);
 }
 
 static u32 sh_sci_spi_txrx_mode3(struct spi_device *spi,
-				 unsigned nsecs, u32 word, u8 bits,
-				 unsigned flags)
+				      unsigned nsecs, u32 word, u8 bits)
 {
-	return bitbang_txrx_be_cpha1(spi, nsecs, 1, flags, word, bits);
+	return bitbang_txrx_be_cpha1(spi, nsecs, 1, 0, word, bits);
 }
 
 static void sh_sci_spi_chipselect(struct spi_device *dev, int value)
 {
 	struct sh_sci_spi *sp = spi_master_get_devdata(dev->master);
 
-	if (sp->info->chip_select)
-		(sp->info->chip_select)(sp->info, spi_get_chipselect(dev, 0), value);
+	if (sp->info && sp->info->chip_select)
+		(sp->info->chip_select)(sp->info, dev->chip_select, value);
 }
 
 static int sh_sci_spi_probe(struct platform_device *dev)
@@ -128,15 +130,10 @@ static int sh_sci_spi_probe(struct platform_device *dev)
 	sp = spi_master_get_devdata(master);
 
 	platform_set_drvdata(dev, sp);
-	sp->info = dev_get_platdata(&dev->dev);
-	if (!sp->info) {
-		dev_err(&dev->dev, "platform data is missing\n");
-		ret = -ENOENT;
-		goto err1;
-	}
+	sp->info = dev->dev.platform_data;
 
 	/* setup spi bitbang adaptor */
-	sp->bitbang.master = master;
+	sp->bitbang.master = spi_master_get(master);
 	sp->bitbang.master->bus_num = sp->info->bus_num;
 	sp->bitbang.master->num_chipselect = sp->info->num_chipselect;
 	sp->bitbang.chipselect = sh_sci_spi_chipselect;
@@ -171,21 +168,23 @@ static int sh_sci_spi_probe(struct platform_device *dev)
 	return ret;
 }
 
-static void sh_sci_spi_remove(struct platform_device *dev)
+static int sh_sci_spi_remove(struct platform_device *dev)
 {
 	struct sh_sci_spi *sp = platform_get_drvdata(dev);
 
-	spi_bitbang_stop(&sp->bitbang);
-	setbits(sp, PIN_INIT, 0);
 	iounmap(sp->membase);
+	setbits(sp, PIN_INIT, 0);
+	spi_bitbang_stop(&sp->bitbang);
 	spi_master_put(sp->bitbang.master);
+	return 0;
 }
 
 static struct platform_driver sh_sci_spi_drv = {
 	.probe		= sh_sci_spi_probe,
-	.remove_new	= sh_sci_spi_remove,
+	.remove		= sh_sci_spi_remove,
 	.driver		= {
 		.name	= "spi_sh_sci",
+		.owner	= THIS_MODULE,
 	},
 };
 module_platform_driver(sh_sci_spi_drv);

@@ -1,10 +1,11 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * AD5415, AD5426, AD5429, AD5432, AD5439, AD5443, AD5449 Digital to Analog
  * Converter driver.
  *
  * Copyright 2012 Analog Devices Inc.
  *  Author: Lars-Peter Clausen <lars@metafoo.de>
+ *
+ * Licensed under the GPL-2.
  */
 
 #include <linux/device.h>
@@ -56,22 +57,20 @@ struct ad5449_chip_info {
  * @has_sdo:		whether the SDO line is connected
  * @dac_cache:		Cache for the DAC values
  * @data:		spi transfer buffers
- * @lock:		lock to protect the data buffer during SPI ops
  */
 struct ad5449 {
 	struct spi_device		*spi;
 	const struct ad5449_chip_info	*chip_info;
 	struct regulator_bulk_data	vref_reg[AD5449_MAX_VREFS];
-	struct mutex			lock;
 
 	bool has_sdo;
 	uint16_t dac_cache[AD5449_MAX_CHANNELS];
 
 	/*
-	 * DMA (thus cache coherency maintenance) may require the
+	 * DMA (thus cache coherency maintenance) requires the
 	 * transfer buffers to live in their own cache lines.
 	 */
-	__be16 data[2] __aligned(IIO_DMA_MINALIGN);
+	__be16 data[2] ____cacheline_aligned;
 };
 
 enum ad5449_type {
@@ -89,10 +88,10 @@ static int ad5449_write(struct iio_dev *indio_dev, unsigned int addr,
 	struct ad5449 *st = iio_priv(indio_dev);
 	int ret;
 
-	mutex_lock(&st->lock);
+	mutex_lock(&indio_dev->mlock);
 	st->data[0] = cpu_to_be16((addr << 12) | val);
 	ret = spi_write(st->spi, st->data, 2);
-	mutex_unlock(&st->lock);
+	mutex_unlock(&indio_dev->mlock);
 
 	return ret;
 }
@@ -102,6 +101,7 @@ static int ad5449_read(struct iio_dev *indio_dev, unsigned int addr,
 {
 	struct ad5449 *st = iio_priv(indio_dev);
 	int ret;
+	struct spi_message msg;
 	struct spi_transfer t[] = {
 		{
 			.tx_buf = &st->data[0],
@@ -114,18 +114,22 @@ static int ad5449_read(struct iio_dev *indio_dev, unsigned int addr,
 		},
 	};
 
-	mutex_lock(&st->lock);
+	spi_message_init(&msg);
+	spi_message_add_tail(&t[0], &msg);
+	spi_message_add_tail(&t[1], &msg);
+
+	mutex_lock(&indio_dev->mlock);
 	st->data[0] = cpu_to_be16(addr << 12);
 	st->data[1] = cpu_to_be16(AD5449_CMD_NOOP);
 
-	ret = spi_sync_transfer(st->spi, t, ARRAY_SIZE(t));
+	ret = spi_sync(st->spi, &msg);
 	if (ret < 0)
 		goto out_unlock;
 
 	*val = be16_to_cpu(st->data[1]);
 
 out_unlock:
-	mutex_unlock(&st->lock);
+	mutex_unlock(&indio_dev->mlock);
 	return ret;
 }
 
@@ -194,6 +198,7 @@ static int ad5449_write_raw(struct iio_dev *indio_dev,
 static const struct iio_info ad5449_info = {
 	.read_raw = ad5449_read_raw,
 	.write_raw = ad5449_write_raw,
+	.driver_module = THIS_MODULE,
 };
 
 #define AD5449_CHANNEL(chan, bits) {				\
@@ -204,12 +209,7 @@ static const struct iio_info ad5449_info = {
 	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |		\
 		BIT(IIO_CHAN_INFO_SCALE),			\
 	.address = (chan),					\
-	.scan_type = {						\
-		.sign = 'u',					\
-		.realbits = (bits),				\
-		.storagebits = 16,				\
-		.shift = 12 - (bits),				\
-	},							\
+	.scan_type = IIO_ST('u', (bits), 16, 12 - (bits)),	\
 }
 
 #define DECLARE_AD5449_CHANNELS(name, bits) \
@@ -275,7 +275,7 @@ static int ad5449_spi_probe(struct spi_device *spi)
 	unsigned int i;
 	int ret;
 
-	indio_dev = devm_iio_device_alloc(&spi->dev, sizeof(*st));
+	indio_dev = iio_device_alloc(sizeof(*st));
 	if (indio_dev == NULL)
 		return -ENOMEM;
 
@@ -288,22 +288,21 @@ static int ad5449_spi_probe(struct spi_device *spi)
 	for (i = 0; i < st->chip_info->num_channels; ++i)
 		st->vref_reg[i].supply = ad5449_vref_name(st, i);
 
-	ret = devm_regulator_bulk_get(&spi->dev, st->chip_info->num_channels,
+	ret = regulator_bulk_get(&spi->dev, st->chip_info->num_channels,
 				st->vref_reg);
 	if (ret)
-		return ret;
+		goto error_free;
 
 	ret = regulator_bulk_enable(st->chip_info->num_channels, st->vref_reg);
 	if (ret)
-		return ret;
+		goto error_free_reg;
 
+	indio_dev->dev.parent = &spi->dev;
 	indio_dev->name = id->name;
 	indio_dev->info = &ad5449_info;
 	indio_dev->modes = INDIO_DIRECT_MODE;
 	indio_dev->channels = st->chip_info->channels;
 	indio_dev->num_channels = st->chip_info->num_channels;
-
-	mutex_init(&st->lock);
 
 	if (st->chip_info->has_ctrl) {
 		unsigned int ctrl = 0x00;
@@ -326,11 +325,15 @@ static int ad5449_spi_probe(struct spi_device *spi)
 
 error_disable_reg:
 	regulator_bulk_disable(st->chip_info->num_channels, st->vref_reg);
+error_free_reg:
+	regulator_bulk_free(st->chip_info->num_channels, st->vref_reg);
+error_free:
+	iio_device_free(indio_dev);
 
 	return ret;
 }
 
-static void ad5449_spi_remove(struct spi_device *spi)
+static int ad5449_spi_remove(struct spi_device *spi)
 {
 	struct iio_dev *indio_dev = spi_get_drvdata(spi);
 	struct ad5449 *st = iio_priv(indio_dev);
@@ -338,6 +341,11 @@ static void ad5449_spi_remove(struct spi_device *spi)
 	iio_device_unregister(indio_dev);
 
 	regulator_bulk_disable(st->chip_info->num_channels, st->vref_reg);
+	regulator_bulk_free(st->chip_info->num_channels, st->vref_reg);
+
+	iio_device_free(indio_dev);
+
+	return 0;
 }
 
 static const struct spi_device_id ad5449_spi_ids[] = {
@@ -355,6 +363,7 @@ MODULE_DEVICE_TABLE(spi, ad5449_spi_ids);
 static struct spi_driver ad5449_spi_driver = {
 	.driver = {
 		.name = "ad5449",
+		.owner = THIS_MODULE,
 	},
 	.probe = ad5449_spi_probe,
 	.remove = ad5449_spi_remove,

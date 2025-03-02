@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * drivers/mmc/host/sdhci-of-hlwd.c
  *
@@ -13,6 +12,11 @@
  *
  * Authors: Xiaobo Xie <X.Xie@freescale.com>
  *	    Anton Vorontsov <avorontsov@ru.mvista.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or (at
+ * your option) any later version.
  */
 
 #include <linux/delay.h>
@@ -54,10 +58,6 @@ static const struct sdhci_ops sdhci_hlwd_ops = {
 	.write_l = sdhci_hlwd_writel,
 	.write_w = sdhci_hlwd_writew,
 	.write_b = sdhci_hlwd_writeb,
-	.set_clock = sdhci_set_clock,
-	.set_bus_width = sdhci_set_bus_width,
-	.reset = sdhci_reset,
-	.set_uhs_signaling = sdhci_set_uhs_signaling,
 };
 
 static const struct sdhci_pltfm_data sdhci_hlwd_pdata = {
@@ -68,7 +68,12 @@ static const struct sdhci_pltfm_data sdhci_hlwd_pdata = {
 
 static int sdhci_hlwd_probe(struct platform_device *pdev)
 {
-	return sdhci_pltfm_register(pdev, &sdhci_hlwd_pdata, 0);
+	return sdhci_pltfm_register(pdev, &sdhci_hlwd_pdata);
+}
+
+static int sdhci_hlwd_remove(struct platform_device *pdev)
+{
+	return sdhci_pltfm_unregister(pdev);
 }
 
 static const struct of_device_id sdhci_hlwd_of_match[] = {
@@ -80,12 +85,12 @@ MODULE_DEVICE_TABLE(of, sdhci_hlwd_of_match);
 static struct platform_driver sdhci_hlwd_driver = {
 	.driver = {
 		.name = "sdhci-hlwd",
-		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
+		.owner = THIS_MODULE,
 		.of_match_table = sdhci_hlwd_of_match,
-		.pm = &sdhci_pltfm_pmops,
+		.pm = SDHCI_PLTFM_PMOPS,
 	},
 	.probe = sdhci_hlwd_probe,
-	.remove = sdhci_pltfm_unregister,
+	.remove = sdhci_hlwd_remove,
 };
 
 module_platform_driver(sdhci_hlwd_driver);

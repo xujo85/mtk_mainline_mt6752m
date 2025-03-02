@@ -1,80 +1,54 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * MUSB OTG driver - support for Mentor's DMA controller
  *
  * Copyright 2005 Mentor Graphics Corporation
  * Copyright (C) 2005-2007 by Texas Instruments
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
+ * 02110-1301 USA
+ *
+ * THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
+ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN
+ * NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
+ * USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
  */
 #include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include "musb_core.h"
-#include "musb_dma.h"
+#include "musbhsdma.h"
 
-#define MUSB_HSDMA_CHANNEL_OFFSET(_bchannel, _offset)		\
-		(MUSB_HSDMA_BASE + (_bchannel << 4) + _offset)
-
-#define musb_read_hsdma_addr(mbase, bchannel)	\
-	musb_readl(mbase,	\
-		   MUSB_HSDMA_CHANNEL_OFFSET(bchannel, MUSB_HSDMA_ADDRESS))
-
-#define musb_write_hsdma_addr(mbase, bchannel, addr) \
-	musb_writel(mbase, \
-		    MUSB_HSDMA_CHANNEL_OFFSET(bchannel, MUSB_HSDMA_ADDRESS), \
-		    addr)
-
-#define musb_read_hsdma_count(mbase, bchannel)	\
-	musb_readl(mbase,	\
-		   MUSB_HSDMA_CHANNEL_OFFSET(bchannel, MUSB_HSDMA_COUNT))
-
-#define musb_write_hsdma_count(mbase, bchannel, len) \
-	musb_writel(mbase, \
-		    MUSB_HSDMA_CHANNEL_OFFSET(bchannel, MUSB_HSDMA_COUNT), \
-		    len)
-/* control register (16-bit): */
-#define MUSB_HSDMA_ENABLE_SHIFT		0
-#define MUSB_HSDMA_TRANSMIT_SHIFT	1
-#define MUSB_HSDMA_MODE1_SHIFT		2
-#define MUSB_HSDMA_IRQENABLE_SHIFT	3
-#define MUSB_HSDMA_ENDPOINT_SHIFT	4
-#define MUSB_HSDMA_BUSERROR_SHIFT	8
-#define MUSB_HSDMA_BURSTMODE_SHIFT	9
-#define MUSB_HSDMA_BURSTMODE		(3 << MUSB_HSDMA_BURSTMODE_SHIFT)
-#define MUSB_HSDMA_BURSTMODE_UNSPEC	0
-#define MUSB_HSDMA_BURSTMODE_INCR4	1
-#define MUSB_HSDMA_BURSTMODE_INCR8	2
-#define MUSB_HSDMA_BURSTMODE_INCR16	3
-
-#define MUSB_HSDMA_CHANNELS		8
-
-struct musb_dma_controller;
-
-struct musb_dma_channel {
-	struct dma_channel		channel;
-	struct musb_dma_controller	*controller;
-	u32				start_addr;
-	u32				len;
-	u16				max_packet_sz;
-	u8				idx;
-	u8				epnum;
-	u8				transmit;
-};
-
-struct musb_dma_controller {
-	struct dma_controller		controller;
-	struct musb_dma_channel		channel[MUSB_HSDMA_CHANNELS];
-	void				*private_data;
-	void __iomem			*base;
-	u8				channel_count;
-	u8				used_channels;
-	int				irq;
-};
+static int dma_controller_start(struct dma_controller *c)
+{
+	/* nothing to do */
+	return 0;
+}
 
 static void dma_channel_release(struct dma_channel *channel);
 
-static void dma_controller_stop(struct musb_dma_controller *controller)
+static int dma_controller_stop(struct dma_controller *c)
 {
+	struct musb_dma_controller *controller = container_of(c,
+			struct musb_dma_controller, controller);
 	struct musb *musb = controller->private_data;
 	struct dma_channel *channel;
 	u8 bit;
@@ -93,6 +67,8 @@ static void dma_controller_stop(struct musb_dma_controller *controller)
 			}
 		}
 	}
+
+	return 0;
 }
 
 static struct dma_channel *dma_channel_allocate(struct dma_controller *c,
@@ -151,8 +127,8 @@ static void configure_channel(struct dma_channel *channel,
 	u8 bchannel = musb_channel->idx;
 	u16 csr = 0;
 
-	musb_dbg(musb, "%p, pkt_sz %d, addr %pad, len %d, mode %d",
-			channel, packet_sz, &dma_addr, len, mode);
+	dev_dbg(musb->controller, "%p, pkt_sz %d, addr 0x%x, len %d, mode %d\n",
+			channel, packet_sz, dma_addr, len, mode);
 
 	if (mode) {
 		csr |= 1 << MUSB_HSDMA_MODE1_SHIFT;
@@ -186,13 +162,21 @@ static int dma_channel_program(struct dma_channel *channel,
 	struct musb_dma_controller *controller = musb_channel->controller;
 	struct musb *musb = controller->private_data;
 
-	musb_dbg(musb, "ep%d-%s pkt_sz %d, dma_addr %pad length %d, mode %d",
+	dev_dbg(musb->controller, "ep%d-%s pkt_sz %d, dma_addr 0x%x length %d, mode %d\n",
 		musb_channel->epnum,
 		musb_channel->transmit ? "Tx" : "Rx",
-		packet_sz, &dma_addr, len, mode);
+		packet_sz, dma_addr, len, mode);
 
 	BUG_ON(channel->status == MUSB_DMA_STATUS_UNKNOWN ||
 		channel->status == MUSB_DMA_STATUS_BUSY);
+
+	/* Let targets check/tweak the arguments */
+	if (musb->ops->adjust_channel_params) {
+		int ret = musb->ops->adjust_channel_params(channel,
+			packet_sz, &mode, &dma_addr, &len);
+		if (ret)
+			return ret;
+	}
 
 	/*
 	 * The DMA engine in RTL1.8 and above cannot handle
@@ -221,7 +205,6 @@ static int dma_channel_abort(struct dma_channel *channel)
 {
 	struct musb_dma_channel *musb_channel = channel->private_data;
 	void __iomem *mbase = musb_channel->controller->base;
-	struct musb *musb = musb_channel->controller->private_data;
 
 	u8 bchannel = musb_channel->idx;
 	int offset;
@@ -229,7 +212,7 @@ static int dma_channel_abort(struct dma_channel *channel)
 
 	if (channel->status == MUSB_DMA_STATUS_BUSY) {
 		if (musb_channel->transmit) {
-			offset = musb->io.ep_offset(musb_channel->epnum,
+			offset = MUSB_EP_OFFSET(musb_channel->epnum,
 						MUSB_TXCSR);
 
 			/*
@@ -242,7 +225,7 @@ static int dma_channel_abort(struct dma_channel *channel)
 			csr &= ~MUSB_TXCSR_DMAMODE;
 			musb_writew(mbase, offset, csr);
 		} else {
-			offset = musb->io.ep_offset(musb_channel->epnum,
+			offset = MUSB_EP_OFFSET(musb_channel->epnum,
 						MUSB_RXCSR);
 
 			csr = musb_readw(mbase, offset);
@@ -263,7 +246,7 @@ static int dma_channel_abort(struct dma_channel *channel)
 	return 0;
 }
 
-irqreturn_t dma_controller_irq(int irq, void *private_data)
+static irqreturn_t dma_controller_irq(int irq, void *private_data)
 {
 	struct musb_dma_controller *controller = private_data;
 	struct musb *musb = controller->private_data;
@@ -284,10 +267,15 @@ irqreturn_t dma_controller_irq(int irq, void *private_data)
 
 	spin_lock_irqsave(&musb->lock, flags);
 
-	int_hsdma = musb_clearb(mbase, MUSB_HSDMA_INTR);
+	int_hsdma = musb_readb(mbase, MUSB_HSDMA_INTR);
+
+#ifdef CONFIG_BLACKFIN
+	/* Clear DMA interrupt flags */
+	musb_writeb(mbase, MUSB_HSDMA_INTR, int_hsdma);
+#endif
 
 	if (!int_hsdma) {
-		musb_dbg(musb, "spurious DMA irq");
+		dev_dbg(musb->controller, "spurious DMA irq\n");
 
 		for (bchannel = 0; bchannel < MUSB_HSDMA_CHANNELS; bchannel++) {
 			musb_channel = (struct musb_dma_channel *)
@@ -301,7 +289,7 @@ irqreturn_t dma_controller_irq(int irq, void *private_data)
 			}
 		}
 
-		musb_dbg(musb, "int_hsdma = 0x%x", int_hsdma);
+		dev_dbg(musb->controller, "int_hsdma = 0x%x\n", int_hsdma);
 
 		if (!int_hsdma)
 			goto done;
@@ -321,12 +309,14 @@ irqreturn_t dma_controller_irq(int irq, void *private_data)
 				musb_channel->channel.status =
 					MUSB_DMA_STATUS_BUS_ABORT;
 			} else {
+				u8 devctl;
+
 				addr = musb_read_hsdma_addr(mbase,
 						bchannel);
 				channel->actual_len = addr
 					- musb_channel->start_addr;
 
-				musb_dbg(musb, "ch %p, 0x%x -> 0x%x (%zu / %d) %s",
+				dev_dbg(musb->controller, "ch %p, 0x%x -> 0x%x (%zu / %d) %s\n",
 					channel, musb_channel->start_addr,
 					addr, channel->actual_len,
 					musb_channel->len,
@@ -334,15 +324,19 @@ irqreturn_t dma_controller_irq(int irq, void *private_data)
 						< musb_channel->len) ?
 					"=> reconfig 0" : "=> complete");
 
+				devctl = musb_readb(mbase, MUSB_DEVCTL);
+
 				channel->status = MUSB_DMA_STATUS_FREE;
 
 				/* completed */
-				if (musb_channel->transmit &&
-					(!channel->desired_mode ||
-					(channel->actual_len %
-					    musb_channel->max_packet_sz))) {
+				if ((devctl & MUSB_DEVCTL_HM)
+					&& (musb_channel->transmit)
+					&& ((channel->desired_mode == 0)
+					    || (channel->actual_len &
+					    (musb_channel->max_packet_sz - 1)))
+				    ) {
 					u8  epnum  = musb_channel->epnum;
-					int offset = musb->io.ep_offset(epnum,
+					int offset = MUSB_EP_OFFSET(epnum,
 								    MUSB_TXCSR);
 					u16 txcsr;
 
@@ -352,14 +346,11 @@ irqreturn_t dma_controller_irq(int irq, void *private_data)
 					 */
 					musb_ep_select(mbase, epnum);
 					txcsr = musb_readw(mbase, offset);
-					if (channel->desired_mode == 1) {
-						txcsr &= ~(MUSB_TXCSR_DMAENAB
+					txcsr &= ~(MUSB_TXCSR_DMAENAB
 							| MUSB_TXCSR_AUTOSET);
-						musb_writew(mbase, offset, txcsr);
-						/* Send out the packet */
-						txcsr &= ~MUSB_TXCSR_DMAMODE;
-						txcsr |= MUSB_TXCSR_DMAENAB;
-					}
+					musb_writew(mbase, offset, txcsr);
+					/* Send out the packet */
+					txcsr &= ~MUSB_TXCSR_DMAMODE;
 					txcsr |=  MUSB_TXCSR_TXPKTRDY;
 					musb_writew(mbase, offset, txcsr);
 				}
@@ -374,44 +365,22 @@ done:
 	spin_unlock_irqrestore(&musb->lock, flags);
 	return retval;
 }
-EXPORT_SYMBOL_GPL(dma_controller_irq);
 
-void musbhs_dma_controller_destroy(struct dma_controller *c)
+void dma_controller_destroy(struct dma_controller *c)
 {
 	struct musb_dma_controller *controller = container_of(c,
 			struct musb_dma_controller, controller);
 
-	dma_controller_stop(controller);
+	if (!controller)
+		return;
 
 	if (controller->irq)
 		free_irq(controller->irq, c);
 
 	kfree(controller);
 }
-EXPORT_SYMBOL_GPL(musbhs_dma_controller_destroy);
 
-static struct musb_dma_controller *
-dma_controller_alloc(struct musb *musb, void __iomem *base)
-{
-	struct musb_dma_controller *controller;
-
-	controller = kzalloc(sizeof(*controller), GFP_KERNEL);
-	if (!controller)
-		return NULL;
-
-	controller->channel_count = MUSB_HSDMA_CHANNELS;
-	controller->private_data = musb;
-	controller->base = base;
-
-	controller->controller.channel_alloc = dma_channel_allocate;
-	controller->controller.channel_release = dma_channel_release;
-	controller->controller.channel_program = dma_channel_program;
-	controller->controller.channel_abort = dma_channel_abort;
-	return controller;
-}
-
-struct dma_controller *
-musbhs_dma_controller_create(struct musb *musb, void __iomem *base)
+struct dma_controller *dma_controller_create(struct musb *musb, void __iomem *base)
 {
 	struct musb_dma_controller *controller;
 	struct device *dev = musb->controller;
@@ -423,14 +392,25 @@ musbhs_dma_controller_create(struct musb *musb, void __iomem *base)
 		return NULL;
 	}
 
-	controller = dma_controller_alloc(musb, base);
+	controller = kzalloc(sizeof(*controller), GFP_KERNEL);
 	if (!controller)
 		return NULL;
 
+	controller->channel_count = MUSB_HSDMA_CHANNELS;
+	controller->private_data = musb;
+	controller->base = base;
+
+	controller->controller.start = dma_controller_start;
+	controller->controller.stop = dma_controller_stop;
+	controller->controller.channel_alloc = dma_channel_allocate;
+	controller->controller.channel_release = dma_channel_release;
+	controller->controller.channel_program = dma_channel_program;
+	controller->controller.channel_abort = dma_channel_abort;
+
 	if (request_irq(irq, dma_controller_irq, 0,
-			dev_name(musb->controller), controller)) {
+			dev_name(musb->controller), &controller->controller)) {
 		dev_err(dev, "request_irq %d failed!\n", irq);
-		musb_dma_controller_destroy(&controller->controller);
+		dma_controller_destroy(&controller->controller);
 
 		return NULL;
 	}
@@ -439,17 +419,3 @@ musbhs_dma_controller_create(struct musb *musb, void __iomem *base)
 
 	return &controller->controller;
 }
-EXPORT_SYMBOL_GPL(musbhs_dma_controller_create);
-
-struct dma_controller *
-musbhs_dma_controller_create_noirq(struct musb *musb, void __iomem *base)
-{
-	struct musb_dma_controller *controller;
-
-	controller = dma_controller_alloc(musb, base);
-	if (!controller)
-		return NULL;
-
-	return &controller->controller;
-}
-EXPORT_SYMBOL_GPL(musbhs_dma_controller_create_noirq);

@@ -1,13 +1,14 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * ADXL345/346 Three-Axis Digital Accelerometers
  *
  * Enter bugs at http://blackfin.uclinux.org/
  *
  * Copyright (C) 2009 Michael Hennerich, Analog Devices Inc.
+ * Licensed under the GPL-2 or later.
  */
 
 #include <linux/device.h>
+#include <linux/init.h>
 #include <linux/delay.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
@@ -157,7 +158,7 @@
 
 /* ORIENT ADXL346 only */
 #define ADXL346_2D_VALID		(1 << 6)
-#define ADXL346_2D_ORIENT(x)		(((x) & 0x30) >> 4)
+#define ADXL346_2D_ORIENT(x)		(((x) & 0x3) >> 4)
 #define ADXL346_3D_VALID		(1 << 3)
 #define ADXL346_3D_ORIENT(x)		((x) & 0x7)
 #define ADXL346_2D_PORTRAIT_POS		0	/* +X */
@@ -237,7 +238,7 @@ static const struct adxl34x_platform_data adxl34x_default_init = {
 
 static void adxl34x_get_triple(struct adxl34x *ac, struct axis_triple *axis)
 {
-	__le16 buf[3];
+	short buf[3];
 
 	ac->bops->read_block(ac->dev, DATAX0, DATAZ1 - DATAX0 + 1, buf);
 
@@ -412,10 +413,8 @@ static void __adxl34x_enable(struct adxl34x *ac)
 	AC_WRITE(ac, POWER_CTL, ac->pdata.power_mode | PCTL_MEASURE);
 }
 
-static int adxl34x_suspend(struct device *dev)
+void adxl34x_suspend(struct adxl34x *ac)
 {
-	struct adxl34x *ac = dev_get_drvdata(dev);
-
 	mutex_lock(&ac->mutex);
 
 	if (!ac->suspended && !ac->disabled && ac->opened)
@@ -424,14 +423,11 @@ static int adxl34x_suspend(struct device *dev)
 	ac->suspended = true;
 
 	mutex_unlock(&ac->mutex);
-
-	return 0;
 }
+EXPORT_SYMBOL_GPL(adxl34x_suspend);
 
-static int adxl34x_resume(struct device *dev)
+void adxl34x_resume(struct adxl34x *ac)
 {
-	struct adxl34x *ac = dev_get_drvdata(dev);
-
 	mutex_lock(&ac->mutex);
 
 	if (ac->suspended && !ac->disabled && ac->opened)
@@ -440,9 +436,8 @@ static int adxl34x_resume(struct device *dev)
 	ac->suspended = false;
 
 	mutex_unlock(&ac->mutex);
-
-	return 0;
 }
+EXPORT_SYMBOL_GPL(adxl34x_resume);
 
 static ssize_t adxl34x_disable_show(struct device *dev,
 				    struct device_attribute *attr, char *buf)
@@ -702,7 +697,7 @@ struct adxl34x *adxl34x_probe(struct device *dev, int irq,
 	struct input_dev *input_dev;
 	const struct adxl34x_platform_data *pdata;
 	int err, range, i;
-	int revid;
+	unsigned char revid;
 
 	if (!irq) {
 		dev_err(dev, "no IRQ?\n");
@@ -719,7 +714,7 @@ struct adxl34x *adxl34x_probe(struct device *dev, int irq,
 
 	ac->fifo_delay = fifo_delay_default;
 
-	pdata = dev_get_platdata(dev);
+	pdata = dev->platform_data;
 	if (!pdata) {
 		dev_dbg(dev,
 			"No platform data: Using default initialization\n");
@@ -802,7 +797,7 @@ struct adxl34x *adxl34x_probe(struct device *dev, int irq,
 
 	if (pdata->watermark) {
 		ac->int_mask |= WATERMARK;
-		if (FIFO_MODE(pdata->fifo_mode) == FIFO_BYPASS)
+		if (!FIFO_MODE(pdata->fifo_mode))
 			ac->pdata.fifo_mode |= FIFO_STREAM;
 	} else {
 		ac->int_mask |= DATA_READY;
@@ -817,7 +812,8 @@ struct adxl34x *adxl34x_probe(struct device *dev, int irq,
 	AC_WRITE(ac, POWER_CTL, 0);
 
 	err = request_threaded_irq(ac->irq, NULL, adxl34x_irq,
-				   IRQF_ONESHOT, dev_name(dev), ac);
+				   IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
+				   dev_name(dev), ac);
 	if (err) {
 		dev_err(dev, "irq %d busy?\n", ac->irq);
 		goto err_free_mem;
@@ -901,17 +897,17 @@ struct adxl34x *adxl34x_probe(struct device *dev, int irq,
 }
 EXPORT_SYMBOL_GPL(adxl34x_probe);
 
-void adxl34x_remove(struct adxl34x *ac)
+int adxl34x_remove(struct adxl34x *ac)
 {
 	sysfs_remove_group(&ac->dev->kobj, &adxl34x_attr_group);
 	free_irq(ac->irq, ac);
 	input_unregister_device(ac->input);
 	dev_dbg(ac->dev, "unregistered accelerometer\n");
 	kfree(ac);
+
+	return 0;
 }
 EXPORT_SYMBOL_GPL(adxl34x_remove);
-
-EXPORT_GPL_SIMPLE_DEV_PM_OPS(adxl34x_pm, adxl34x_suspend, adxl34x_resume);
 
 MODULE_AUTHOR("Michael Hennerich <hennerich@blackfin.uclinux.org>");
 MODULE_DESCRIPTION("ADXL345/346 Three-Axis Digital Accelerometer Driver");

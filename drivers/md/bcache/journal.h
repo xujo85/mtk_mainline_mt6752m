@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _BCACHE_JOURNAL_H
 #define _BCACHE_JOURNAL_H
 
@@ -76,6 +75,43 @@
  * nodes that are pinning the oldest journal entries first.
  */
 
+#define BCACHE_JSET_VERSION_UUIDv1	1
+/* Always latest UUID format */
+#define BCACHE_JSET_VERSION_UUID	1
+#define BCACHE_JSET_VERSION		1
+
+/*
+ * On disk format for a journal entry:
+ * seq is monotonically increasing; every journal entry has its own unique
+ * sequence number.
+ *
+ * last_seq is the oldest journal entry that still has keys the btree hasn't
+ * flushed to disk yet.
+ *
+ * version is for on disk format changes.
+ */
+struct jset {
+	uint64_t		csum;
+	uint64_t		magic;
+	uint64_t		seq;
+	uint32_t		version;
+	uint32_t		keys;
+
+	uint64_t		last_seq;
+
+	BKEY_PADDED(uuid_bucket);
+	BKEY_PADDED(btree_root);
+	uint16_t		btree_level;
+	uint16_t		pad[3];
+
+	uint64_t		prio_bucket[MAX_CACHES_PER_SET];
+
+	union {
+		struct bkey	start[0];
+		uint64_t	d[0];
+	};
+};
+
 /*
  * Only used for holding the journal entries we read in btree_journal_read()
  * during cache_registration
@@ -96,24 +132,18 @@ struct journal_write {
 
 	struct cache_set	*c;
 	struct closure_waitlist	wait;
-	bool			dirty;
 	bool			need_write;
 };
 
 /* Embedded in struct cache_set */
 struct journal {
 	spinlock_t		lock;
-	spinlock_t		flush_write_lock;
-	bool			btree_flushing;
-	bool			do_reserve;
 	/* used when waiting because the journal was full */
 	struct closure_waitlist	wait;
-	struct closure		io;
-	int			io_in_flight;
-	struct delayed_work	work;
+	struct closure_with_timer io;
 
 	/* Number of blocks free in the bucket(s) we're currently writing to */
-	unsigned int		blocks_free;
+	unsigned		blocks_free;
 	uint64_t		seq;
 	DECLARE_FIFO(atomic_t, pin);
 
@@ -134,13 +164,13 @@ struct journal_device {
 	uint64_t		seq[SB_JOURNAL_BUCKETS];
 
 	/* Journal bucket we're currently writing to */
-	unsigned int		cur_idx;
+	unsigned		cur_idx;
 
 	/* Last journal bucket that still contains an open journal entry */
-	unsigned int		last_idx;
+	unsigned		last_idx;
 
 	/* Next journal bucket to be discarded */
-	unsigned int		discard_idx;
+	unsigned		discard_idx;
 
 #define DISCARD_READY		0
 #define DISCARD_IN_FLIGHT	1
@@ -157,10 +187,9 @@ struct journal_device {
 	struct bio_vec		bv[8];
 };
 
-#define BTREE_FLUSH_NR	8
-
 #define journal_pin_cmp(c, l, r)				\
-	(fifo_idx(&(c)->journal.pin, (l)) > fifo_idx(&(c)->journal.pin, (r)))
+	(fifo_idx(&(c)->journal.pin, (l)->journal) >		\
+	 fifo_idx(&(c)->journal.pin, (r)->journal))
 
 #define JOURNAL_PIN	20000
 
@@ -170,19 +199,17 @@ struct journal_device {
 struct closure;
 struct cache_set;
 struct btree_op;
-struct keylist;
 
-atomic_t *bch_journal(struct cache_set *c,
-		      struct keylist *keys,
-		      struct closure *parent);
-void bch_journal_next(struct journal *j);
-void bch_journal_mark(struct cache_set *c, struct list_head *list);
-void bch_journal_meta(struct cache_set *c, struct closure *cl);
-int bch_journal_read(struct cache_set *c, struct list_head *list);
-int bch_journal_replay(struct cache_set *c, struct list_head *list);
+void bch_journal(struct closure *);
+void bch_journal_next(struct journal *);
+void bch_journal_mark(struct cache_set *, struct list_head *);
+void bch_journal_meta(struct cache_set *, struct closure *);
+int bch_journal_read(struct cache_set *, struct list_head *,
+			struct btree_op *);
+int bch_journal_replay(struct cache_set *, struct list_head *,
+			  struct btree_op *);
 
-void bch_journal_free(struct cache_set *c);
-int bch_journal_alloc(struct cache_set *c);
-void bch_journal_space_reserve(struct journal *j);
+void bch_journal_free(struct cache_set *);
+int bch_journal_alloc(struct cache_set *);
 
 #endif /* _BCACHE_JOURNAL_H */

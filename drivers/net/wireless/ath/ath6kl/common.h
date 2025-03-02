@@ -22,7 +22,8 @@
 
 #define ATH6KL_MAX_IE			256
 
-__printf(2, 3) void ath6kl_printk(const char *level, const char *fmt, ...);
+extern __printf(2, 3)
+int ath6kl_printk(const char *level, const char *fmt, ...);
 
 /*
  * Reflects the version of binary interface exposed by ATH6KL target
@@ -67,7 +68,7 @@ struct ath6kl_llc_snap_hdr {
 	__be16 eth_type;
 } __packed;
 
-enum ath6kl_crypto_type {
+enum crypto_type {
 	NONE_CRYPT          = 0x01,
 	WEP_CRYPT           = 0x02,
 	TKIP_CRYPT          = 0x04,

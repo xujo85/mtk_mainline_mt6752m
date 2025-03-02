@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /* drivers/mtd/maps/plat-ram.c
  *
  * (c) 2004-2005 Simtec Electronics
@@ -6,10 +5,25 @@
  *	Ben Dooks <ben@simtec.co.uk>
  *
  * Generic platform device based RAM map
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
 
 #include <linux/module.h>
 #include <linux/types.h>
+#include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/ioport.h>
@@ -30,6 +44,7 @@ struct platram_info {
 	struct device		*dev;
 	struct mtd_info		*mtd;
 	struct map_info		 map;
+	struct resource		*area;
 	struct platdata_mtd_ram	*pdata;
 };
 
@@ -40,7 +55,7 @@ struct platram_info {
 
 static inline struct platram_info *to_platram_info(struct platform_device *dev)
 {
-	return platform_get_drvdata(dev);
+	return (struct platram_info *)platform_get_drvdata(dev);
 }
 
 /* platram_setrw
@@ -69,6 +84,8 @@ static int platram_remove(struct platform_device *pdev)
 {
 	struct platram_info *info = to_platram_info(pdev);
 
+	platform_set_drvdata(pdev, NULL);
+
 	dev_dbg(&pdev->dev, "removing device\n");
 
 	if (info == NULL)
@@ -82,6 +99,16 @@ static int platram_remove(struct platform_device *pdev)
 	/* ensure ram is left read-only */
 
 	platram_setrw(info, PLATRAM_RO);
+
+	/* release resources */
+
+	if (info->area) {
+		release_resource(info->area);
+		kfree(info->area);
+	}
+
+	if (info->map.virt != NULL)
+		iounmap(info->map.virt);
 
 	kfree(info);
 
@@ -103,16 +130,17 @@ static int platram_probe(struct platform_device *pdev)
 
 	dev_dbg(&pdev->dev, "probe entered\n");
 
-	if (dev_get_platdata(&pdev->dev) == NULL) {
+	if (pdev->dev.platform_data == NULL) {
 		dev_err(&pdev->dev, "no platform data supplied\n");
 		err = -ENOENT;
 		goto exit_error;
 	}
 
-	pdata = dev_get_platdata(&pdev->dev);
+	pdata = pdev->dev.platform_data;
 
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
 	if (info == NULL) {
+		dev_err(&pdev->dev, "no memory for flash info\n");
 		err = -ENOMEM;
 		goto exit_error;
 	}
@@ -123,10 +151,12 @@ static int platram_probe(struct platform_device *pdev)
 	info->pdata = pdata;
 
 	/* get the resource for the memory mapping */
+
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	info->map.virt = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(info->map.virt)) {
-		err = PTR_ERR(info->map.virt);
+
+	if (res == NULL) {
+		dev_err(&pdev->dev, "no memory resource specified\n");
+		err = -ENOENT;
 		goto exit_free;
 	}
 
@@ -141,7 +171,25 @@ static int platram_probe(struct platform_device *pdev)
 			(char *)pdata->mapname : (char *)pdev->name;
 	info->map.bankwidth = pdata->bankwidth;
 
+	/* register our usage of the memory area */
+
+	info->area = request_mem_region(res->start, info->map.size, pdev->name);
+	if (info->area == NULL) {
+		dev_err(&pdev->dev, "failed to request memory region\n");
+		err = -EIO;
+		goto exit_free;
+	}
+
+	/* remap the memory area */
+
+	info->map.virt = ioremap(res->start, info->map.size);
 	dev_dbg(&pdev->dev, "virt %p, %lu bytes\n", info->map.virt, info->map.size);
+
+	if (info->map.virt == NULL) {
+		dev_err(&pdev->dev, "failed to ioremap() region\n");
+		err = -EIO;
+		goto exit_free;
+	}
 
 	simple_map_init(&info->map);
 
@@ -166,6 +214,7 @@ static int platram_probe(struct platform_device *pdev)
 		goto exit_free;
 	}
 
+	info->mtd->owner = THIS_MODULE;
 	info->mtd->dev.parent = &pdev->dev;
 
 	platram_setrw(info, PLATRAM_RW);
@@ -176,12 +225,8 @@ static int platram_probe(struct platform_device *pdev)
 	err = mtd_device_parse_register(info->mtd, pdata->probes, NULL,
 					pdata->partitions,
 					pdata->nr_partitions);
-	if (err) {
-		dev_err(&pdev->dev, "failed to register mtd device\n");
-		goto exit_free;
-	}
-
-	dev_info(&pdev->dev, "registered mtd device\n");
+	if (!err)
+		dev_info(&pdev->dev, "registered mtd device\n");
 
 	if (pdata->nr_partitions) {
 		/* add the whole device. */
@@ -189,11 +234,10 @@ static int platram_probe(struct platform_device *pdev)
 		if (err) {
 			dev_err(&pdev->dev,
 				"failed to register the entire device\n");
-			goto exit_free;
 		}
 	}
 
-	return 0;
+	return err;
 
  exit_free:
 	platram_remove(pdev);
@@ -211,10 +255,25 @@ static struct platform_driver platram_driver = {
 	.remove		= platram_remove,
 	.driver		= {
 		.name	= "mtd-ram",
+		.owner	= THIS_MODULE,
 	},
 };
 
-module_platform_driver(platram_driver);
+/* module init/exit */
+
+static int __init platram_init(void)
+{
+	printk("Generic platform RAM MTD, (c) 2004 Simtec Electronics\n");
+	return platform_driver_register(&platram_driver);
+}
+
+static void __exit platram_exit(void)
+{
+	platform_driver_unregister(&platram_driver);
+}
+
+module_init(platram_init);
+module_exit(platram_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Ben Dooks <ben@simtec.co.uk>");

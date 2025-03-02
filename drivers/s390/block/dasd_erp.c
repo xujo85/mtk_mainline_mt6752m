@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Author(s)......: Holger Smolinski <Holger.Smolinski@de.ibm.com>
  *		    Horst Hummel <Horst.Hummel@de.ibm.com>
@@ -16,7 +15,7 @@
 
 #include <asm/debug.h>
 #include <asm/ebcdic.h>
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 
 /* This is ugly... */
 #define PRINTK_HEADER "dasd_erp:"
@@ -24,7 +23,7 @@
 #include "dasd_int.h"
 
 struct dasd_ccw_req *
-dasd_alloc_erp_request(unsigned int magic, int cplength, int datasize,
+dasd_alloc_erp_request(char *magic, int cplength, int datasize,
 		       struct dasd_device * device)
 {
 	unsigned long flags;
@@ -33,8 +32,8 @@ dasd_alloc_erp_request(unsigned int magic, int cplength, int datasize,
 	int size;
 
 	/* Sanity checks */
-	BUG_ON(datasize > PAGE_SIZE ||
-	       (cplength*sizeof(struct ccw1)) > PAGE_SIZE);
+	BUG_ON( magic == NULL || datasize > PAGE_SIZE ||
+	     (cplength*sizeof(struct ccw1)) > PAGE_SIZE);
 
 	size = (sizeof(struct dasd_ccw_req) + 7L) & -8L;
 	if (cplength > 0)
@@ -62,7 +61,7 @@ dasd_alloc_erp_request(unsigned int magic, int cplength, int datasize,
 		cqr->data = data;
  		memset(cqr->data, 0, datasize);
 	}
-	cqr->magic = magic;
+	strncpy((char *) &cqr->magic, magic, 4);
 	ASCEBC((char *) &cqr->magic, 4);
 	set_bit(DASD_CQR_FLAGS_USE_ERP, &cqr->flags);
 	dasd_get_device(device);
@@ -97,7 +96,7 @@ dasd_default_erp_action(struct dasd_ccw_req *cqr)
                              "default ERP called (%i retries left)",
                              cqr->retries);
 		if (!test_bit(DASD_CQR_VERIFY_PATH, &cqr->flags))
-			cqr->lpm = dasd_path_get_opm(device);
+			cqr->lpm = device->path_data.opm;
 		cqr->status = DASD_CQR_FILLED;
         } else {
 		pr_err("%s: default ERP has run out of retries and failed\n",
@@ -125,15 +124,10 @@ dasd_default_erp_action(struct dasd_ccw_req *cqr)
 struct dasd_ccw_req *dasd_default_erp_postaction(struct dasd_ccw_req *cqr)
 {
 	int success;
-	unsigned long startclk, stopclk;
-	struct dasd_device *startdev;
 
 	BUG_ON(cqr->refers == NULL || cqr->function == NULL);
 
 	success = cqr->status == DASD_CQR_DONE;
-	startclk = cqr->startclk;
-	stopclk = cqr->stopclk;
-	startdev = cqr->startdev;
 
 	/* free all ERPs - but NOT the original cqr */
 	while (cqr->refers != NULL) {
@@ -148,9 +142,6 @@ struct dasd_ccw_req *dasd_default_erp_postaction(struct dasd_ccw_req *cqr)
 	}
 
 	/* set corresponding status to original cqr */
-	cqr->startclk = startclk;
-	cqr->stopclk = stopclk;
-	cqr->startdev = startdev;
 	if (success)
 		cqr->status = DASD_CQR_DONE;
 	else {
@@ -168,16 +159,6 @@ dasd_log_sense(struct dasd_ccw_req *cqr, struct irb *irb)
 	struct dasd_device *device;
 
 	device = cqr->startdev;
-	if (cqr->intrc == -ETIMEDOUT) {
-		dev_err(&device->cdev->dev,
-			"A timeout error occurred for cqr %p\n", cqr);
-		return;
-	}
-	if (cqr->intrc == -ENOLINK) {
-		dev_err(&device->cdev->dev,
-			"A transport error occurred for cqr %p\n", cqr);
-		return;
-	}
 	/* dump sense data */
 	if (device->discipline && device->discipline->dump_sense)
 		device->discipline->dump_sense(device, cqr, irb);

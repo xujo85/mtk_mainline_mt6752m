@@ -1,7 +1,6 @@
 /*
  * Copyright (c) 2005 Intel Inc. All rights reserved.
  * Copyright (c) 2005-2006 Voltaire, Inc. All rights reserved.
- * Copyright (c) 2014 Intel Corporation.  All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -40,7 +39,8 @@
 enum rmpp_state {
 	RMPP_STATE_ACTIVE,
 	RMPP_STATE_TIMEOUT,
-	RMPP_STATE_COMPLETE
+	RMPP_STATE_COMPLETE,
+	RMPP_STATE_CANCELING
 };
 
 struct mad_rmpp_recv {
@@ -51,7 +51,7 @@ struct mad_rmpp_recv {
 	struct completion comp;
 	enum rmpp_state state;
 	spinlock_t lock;
-	refcount_t refcount;
+	atomic_t refcount;
 
 	struct ib_ah *ah;
 	struct ib_mad_recv_wc *rmpp_wc;
@@ -63,16 +63,15 @@ struct mad_rmpp_recv {
 
 	__be64 tid;
 	u32 src_qp;
-	u32 slid;
+	u16 slid;
 	u8 mgmt_class;
 	u8 class_version;
 	u8 method;
-	u8 base_version;
 };
 
 static inline void deref_rmpp_recv(struct mad_rmpp_recv *rmpp_recv)
 {
-	if (refcount_dec_and_test(&rmpp_recv->refcount))
+	if (atomic_dec_and_test(&rmpp_recv->refcount))
 		complete(&rmpp_recv->comp);
 }
 
@@ -80,7 +79,7 @@ static void destroy_rmpp_recv(struct mad_rmpp_recv *rmpp_recv)
 {
 	deref_rmpp_recv(rmpp_recv);
 	wait_for_completion(&rmpp_recv->comp);
-	rdma_destroy_ah(rmpp_recv->ah, RDMA_DESTROY_AH_SLEEPABLE);
+	ib_destroy_ah(rmpp_recv->ah);
 	kfree(rmpp_recv);
 }
 
@@ -91,18 +90,22 @@ void ib_cancel_rmpp_recvs(struct ib_mad_agent_private *agent)
 
 	spin_lock_irqsave(&agent->lock, flags);
 	list_for_each_entry(rmpp_recv, &agent->rmpp_list, list) {
+		if (rmpp_recv->state != RMPP_STATE_COMPLETE)
+			ib_free_recv_mad(rmpp_recv->rmpp_wc);
+		rmpp_recv->state = RMPP_STATE_CANCELING;
+	}
+	spin_unlock_irqrestore(&agent->lock, flags);
+
+	list_for_each_entry(rmpp_recv, &agent->rmpp_list, list) {
 		cancel_delayed_work(&rmpp_recv->timeout_work);
 		cancel_delayed_work(&rmpp_recv->cleanup_work);
 	}
-	spin_unlock_irqrestore(&agent->lock, flags);
 
 	flush_workqueue(agent->qp_info->port_priv->wq);
 
 	list_for_each_entry_safe(rmpp_recv, temp_rmpp_recv,
 				 &agent->rmpp_list, list) {
 		list_del(&rmpp_recv->list);
-		if (rmpp_recv->state != RMPP_STATE_COMPLETE)
-			ib_free_recv_mad(rmpp_recv->rmpp_wc);
 		destroy_rmpp_recv(rmpp_recv);
 	}
 }
@@ -136,8 +139,7 @@ static void ack_recv(struct mad_rmpp_recv *rmpp_recv,
 	hdr_len = ib_get_mad_data_offset(recv_wc->recv_buf.mad->mad_hdr.mgmt_class);
 	msg = ib_create_send_mad(&rmpp_recv->agent->agent, recv_wc->wc->src_qp,
 				 recv_wc->wc->pkey_index, 1, hdr_len,
-				 0, GFP_KERNEL,
-				 IB_MGMT_BASE_VERSION);
+				 0, GFP_KERNEL);
 	if (IS_ERR(msg))
 		return;
 
@@ -163,10 +165,9 @@ static struct ib_mad_send_buf *alloc_response_msg(struct ib_mad_agent *agent,
 	hdr_len = ib_get_mad_data_offset(recv_wc->recv_buf.mad->mad_hdr.mgmt_class);
 	msg = ib_create_send_mad(agent, recv_wc->wc->src_qp,
 				 recv_wc->wc->pkey_index, 1,
-				 hdr_len, 0, GFP_KERNEL,
-				 IB_MGMT_BASE_VERSION);
+				 hdr_len, 0, GFP_KERNEL);
 	if (IS_ERR(msg))
-		rdma_destroy_ah(ah, RDMA_DESTROY_AH_SLEEPABLE);
+		ib_destroy_ah(ah);
 	else {
 		msg->ah = ah;
 		msg->context[0] = ah;
@@ -196,7 +197,7 @@ static void ack_ds_ack(struct ib_mad_agent_private *agent,
 
 	ret = ib_post_send_mad(msg, NULL);
 	if (ret) {
-		rdma_destroy_ah(msg->ah, RDMA_DESTROY_AH_SLEEPABLE);
+		ib_destroy_ah(msg->ah);
 		ib_free_send_mad(msg);
 	}
 }
@@ -204,8 +205,7 @@ static void ack_ds_ack(struct ib_mad_agent_private *agent,
 void ib_rmpp_send_handler(struct ib_mad_send_wc *mad_send_wc)
 {
 	if (mad_send_wc->send_buf->context[0] == mad_send_wc->send_buf->ah)
-		rdma_destroy_ah(mad_send_wc->send_buf->ah,
-				RDMA_DESTROY_AH_SLEEPABLE);
+		ib_destroy_ah(mad_send_wc->send_buf->ah);
 	ib_free_send_mad(mad_send_wc->send_buf);
 }
 
@@ -233,7 +233,7 @@ static void nack_recv(struct ib_mad_agent_private *agent,
 
 	ret = ib_post_send_mad(msg, NULL);
 	if (ret) {
-		rdma_destroy_ah(msg->ah, RDMA_DESTROY_AH_SLEEPABLE);
+		ib_destroy_ah(msg->ah);
 		ib_free_send_mad(msg);
 	}
 }
@@ -267,6 +267,10 @@ static void recv_cleanup_handler(struct work_struct *work)
 	unsigned long flags;
 
 	spin_lock_irqsave(&rmpp_recv->agent->lock, flags);
+	if (rmpp_recv->state == RMPP_STATE_CANCELING) {
+		spin_unlock_irqrestore(&rmpp_recv->agent->lock, flags);
+		return;
+	}
 	list_del(&rmpp_recv->list);
 	spin_unlock_irqrestore(&rmpp_recv->agent->lock, flags);
 	destroy_rmpp_recv(rmpp_recv);
@@ -296,7 +300,7 @@ create_rmpp_recv(struct ib_mad_agent_private *agent,
 	INIT_DELAYED_WORK(&rmpp_recv->cleanup_work, recv_cleanup_handler);
 	spin_lock_init(&rmpp_recv->lock);
 	rmpp_recv->state = RMPP_STATE_ACTIVE;
-	refcount_set(&rmpp_recv->refcount, 1);
+	atomic_set(&rmpp_recv->refcount, 1);
 
 	rmpp_recv->rmpp_wc = mad_recv_wc;
 	rmpp_recv->cur_seg_buf = &mad_recv_wc->recv_buf;
@@ -312,7 +316,6 @@ create_rmpp_recv(struct ib_mad_agent_private *agent,
 	rmpp_recv->mgmt_class = mad_hdr->mgmt_class;
 	rmpp_recv->class_version = mad_hdr->class_version;
 	rmpp_recv->method  = mad_hdr->method;
-	rmpp_recv->base_version  = mad_hdr->base_version;
 	return rmpp_recv;
 
 error:	kfree(rmpp_recv);
@@ -348,7 +351,7 @@ acquire_rmpp_recv(struct ib_mad_agent_private *agent,
 	spin_lock_irqsave(&agent->lock, flags);
 	rmpp_recv = find_rmpp_recv(agent, mad_recv_wc);
 	if (rmpp_recv)
-		refcount_inc(&rmpp_recv->refcount);
+		atomic_inc(&rmpp_recv->refcount);
 	spin_unlock_irqrestore(&agent->lock, flags);
 	return rmpp_recv;
 }
@@ -382,8 +385,8 @@ static inline int get_seg_num(struct ib_mad_recv_buf *seg)
 	return be32_to_cpu(rmpp_mad->rmpp_hdr.seg_num);
 }
 
-static inline struct ib_mad_recv_buf *get_next_seg(struct list_head *rmpp_list,
-						   struct ib_mad_recv_buf *seg)
+static inline struct ib_mad_recv_buf * get_next_seg(struct list_head *rmpp_list,
+						    struct ib_mad_recv_buf *seg)
 {
 	if (seg->list.next == rmpp_list)
 		return NULL;
@@ -396,8 +399,8 @@ static inline int window_size(struct ib_mad_agent_private *agent)
 	return max(agent->qp_info->recv_queue.max_active >> 3, 1);
 }
 
-static struct ib_mad_recv_buf *find_seg_location(struct list_head *rmpp_list,
-						 int seg_num)
+static struct ib_mad_recv_buf * find_seg_location(struct list_head *rmpp_list,
+						  int seg_num)
 {
 	struct ib_mad_recv_buf *seg_buf;
 	int cur_seg_num;
@@ -428,28 +431,19 @@ static inline int get_mad_len(struct mad_rmpp_recv *rmpp_recv)
 {
 	struct ib_rmpp_mad *rmpp_mad;
 	int hdr_size, data_size, pad;
-	bool opa = rdma_cap_opa_mad(rmpp_recv->agent->qp_info->port_priv->device,
-				    rmpp_recv->agent->qp_info->port_priv->port_num);
 
 	rmpp_mad = (struct ib_rmpp_mad *)rmpp_recv->cur_seg_buf->mad;
 
 	hdr_size = ib_get_mad_data_offset(rmpp_mad->mad_hdr.mgmt_class);
-	if (opa && rmpp_recv->base_version == OPA_MGMT_BASE_VERSION) {
-		data_size = sizeof(struct opa_rmpp_mad) - hdr_size;
-		pad = OPA_MGMT_RMPP_DATA - be32_to_cpu(rmpp_mad->rmpp_hdr.paylen_newwin);
-		if (pad > OPA_MGMT_RMPP_DATA || pad < 0)
-			pad = 0;
-	} else {
-		data_size = sizeof(struct ib_rmpp_mad) - hdr_size;
-		pad = IB_MGMT_RMPP_DATA - be32_to_cpu(rmpp_mad->rmpp_hdr.paylen_newwin);
-		if (pad > IB_MGMT_RMPP_DATA || pad < 0)
-			pad = 0;
-	}
+	data_size = sizeof(struct ib_rmpp_mad) - hdr_size;
+	pad = IB_MGMT_RMPP_DATA - be32_to_cpu(rmpp_mad->rmpp_hdr.paylen_newwin);
+	if (pad > IB_MGMT_RMPP_DATA || pad < 0)
+		pad = 0;
 
 	return hdr_size + rmpp_recv->seg_num * data_size - pad;
 }
 
-static struct ib_mad_recv_wc *complete_rmpp(struct mad_rmpp_recv *rmpp_recv)
+static struct ib_mad_recv_wc * complete_rmpp(struct mad_rmpp_recv *rmpp_recv)
 {
 	struct ib_mad_recv_wc *rmpp_wc;
 
@@ -544,7 +538,7 @@ start_rmpp(struct ib_mad_agent_private *agent,
 		destroy_rmpp_recv(rmpp_recv);
 		return continue_rmpp(agent, mad_recv_wc);
 	}
-	refcount_inc(&rmpp_recv->refcount);
+	atomic_inc(&rmpp_recv->refcount);
 
 	if (get_last_flag(&mad_recv_wc->recv_buf)) {
 		rmpp_recv->state = RMPP_STATE_COMPLETE;
@@ -576,14 +570,13 @@ static int send_next_seg(struct ib_mad_send_wr_private *mad_send_wr)
 
 	if (mad_send_wr->seg_num == 1) {
 		rmpp_mad->rmpp_hdr.rmpp_rtime_flags |= IB_MGMT_RMPP_FLAG_FIRST;
-		paylen = (mad_send_wr->send_buf.seg_count *
-			  mad_send_wr->send_buf.seg_rmpp_size) -
-			  mad_send_wr->pad;
+		paylen = mad_send_wr->send_buf.seg_count * IB_MGMT_RMPP_DATA -
+			 mad_send_wr->pad;
 	}
 
 	if (mad_send_wr->seg_num == mad_send_wr->send_buf.seg_count) {
 		rmpp_mad->rmpp_hdr.rmpp_rtime_flags |= IB_MGMT_RMPP_FLAG_LAST;
-		paylen = mad_send_wr->send_buf.seg_rmpp_size - mad_send_wr->pad;
+		paylen = IB_MGMT_RMPP_DATA - mad_send_wr->pad;
 	}
 	rmpp_mad->rmpp_hdr.paylen_newwin = cpu_to_be32(paylen);
 
@@ -844,7 +837,7 @@ static int init_newwin(struct ib_mad_send_wr_private *mad_send_wr)
 	struct ib_mad_agent_private *agent = mad_send_wr->mad_agent_priv;
 	struct ib_mad_hdr *mad_hdr = mad_send_wr->send_buf.mad;
 	struct mad_rmpp_recv *rmpp_recv;
-	struct rdma_ah_attr ah_attr;
+	struct ib_ah_attr ah_attr;
 	unsigned long flags;
 	int newwin = 1;
 
@@ -859,10 +852,10 @@ static int init_newwin(struct ib_mad_send_wr_private *mad_send_wr)
 		    (rmpp_recv->method & IB_MGMT_METHOD_RESP))
 			continue;
 
-		if (rdma_query_ah(mad_send_wr->send_buf.ah, &ah_attr))
+		if (ib_query_ah(mad_send_wr->send_buf.ah, &ah_attr))
 			continue;
 
-		if (rmpp_recv->slid == rdma_ah_get_dlid(&ah_attr)) {
+		if (rmpp_recv->slid == ah_attr.dlid) {
 			newwin = rmpp_recv->repwin;
 			break;
 		}

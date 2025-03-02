@@ -60,7 +60,7 @@
 /* disable credit flow control on a specific service */
 #define HTC_CONN_FLGS_DISABLE_CRED_FLOW_CTRL          (1 << 3)
 #define HTC_CONN_FLGS_SET_RECV_ALLOC_SHIFT    8
-#define HTC_CONN_FLGS_SET_RECV_ALLOC_MASK     0xFF00U
+#define HTC_CONN_FLGS_SET_RECV_ALLOC_MASK     0xFF00
 
 /* connect response status codes */
 #define HTC_SERVICE_SUCCESS      0
@@ -153,19 +153,12 @@
  * implementations.
  */
 struct htc_frame_hdr {
-	struct_group_tagged(htc_frame_look_ahead, header,
-		union {
-			struct {
-				u8 eid;
-				u8 flags;
+	u8 eid;
+	u8 flags;
 
-				/* length of data (including trailer) that follows the header */
-				__le16 payld_len;
+	/* length of data (including trailer) that follows the header */
+	__le16 payld_len;
 
-			};
-			u32 word;
-		};
-	);
 	/* end of 4-byte lookahead */
 
 	u8 ctrl[2];
@@ -434,7 +427,7 @@ struct htc_endpoint_credit_dist {
 };
 
 /*
- * credit distribution code that is passed into the distribution function,
+ * credit distibution code that is passed into the distrbution function,
  * there are mandatory and optional codes that must be handled
  */
 enum htc_credit_dist_reason {

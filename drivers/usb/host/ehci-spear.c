@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
 * Driver for EHCI HCD on SPEAr SOC
 *
@@ -6,6 +5,10 @@
 * Deepak Sikri <deepak.sikri@st.com>
 *
 * Based on various ehci-*.c drivers
+*
+* This file is subject to the terms and conditions of the GNU General Public
+* License. See the file COPYING in the main directory of this archive for
+* more details.
 */
 
 #include <linux/clk.h>
@@ -24,6 +27,8 @@
 
 #define DRIVER_DESC "EHCI SPEAr driver"
 
+static const char hcd_name[] = "SPEAr-ehci";
+
 struct spear_ehci {
 	struct clk *clk;
 };
@@ -32,7 +37,8 @@ struct spear_ehci {
 
 static struct hc_driver __read_mostly ehci_spear_hc_driver;
 
-static int __maybe_unused ehci_spear_drv_suspend(struct device *dev)
+#ifdef CONFIG_PM_SLEEP
+static int ehci_spear_drv_suspend(struct device *dev)
 {
 	struct usb_hcd *hcd = dev_get_drvdata(dev);
 	bool do_wakeup = device_may_wakeup(dev);
@@ -40,13 +46,14 @@ static int __maybe_unused ehci_spear_drv_suspend(struct device *dev)
 	return ehci_suspend(hcd, do_wakeup);
 }
 
-static int __maybe_unused ehci_spear_drv_resume(struct device *dev)
+static int ehci_spear_drv_resume(struct device *dev)
 {
 	struct usb_hcd *hcd = dev_get_drvdata(dev);
 
 	ehci_resume(hcd, false);
 	return 0;
 }
+#endif /* CONFIG_PM_SLEEP */
 
 static SIMPLE_DEV_PM_OPS(ehci_spear_pm_ops, ehci_spear_drv_suspend,
 		ehci_spear_drv_resume);
@@ -74,9 +81,10 @@ static int spear_ehci_hcd_drv_probe(struct platform_device *pdev)
 	 * Since shared usb code relies on it, set it here for now.
 	 * Once we have dma capability bindings this can go away.
 	 */
-	retval = dma_coerce_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-	if (retval)
-		goto fail;
+	if (!pdev->dev.dma_mask)
+		pdev->dev.dma_mask = &pdev->dev.coherent_dma_mask;
+	if (!pdev->dev.coherent_dma_mask)
+		pdev->dev.coherent_dma_mask = DMA_BIT_MASK(32);
 
 	usbh_clk = devm_clk_get(&pdev->dev, NULL);
 	if (IS_ERR(usbh_clk)) {
@@ -92,13 +100,25 @@ static int spear_ehci_hcd_drv_probe(struct platform_device *pdev)
 	}
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	hcd->regs = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(hcd->regs)) {
-		retval = PTR_ERR(hcd->regs);
+	if (!res) {
+		retval = -ENODEV;
 		goto err_put_hcd;
 	}
+
 	hcd->rsrc_start = res->start;
 	hcd->rsrc_len = resource_size(res);
+	if (!devm_request_mem_region(&pdev->dev, hcd->rsrc_start, hcd->rsrc_len,
+				driver->description)) {
+		retval = -EBUSY;
+		goto err_put_hcd;
+	}
+
+	hcd->regs = devm_ioremap(&pdev->dev, hcd->rsrc_start, hcd->rsrc_len);
+	if (hcd->regs == NULL) {
+		dev_dbg(&pdev->dev, "error mapping memory\n");
+		retval = -ENOMEM;
+		goto err_put_hcd;
+	}
 
 	sehci = to_spear_ehci(hcd);
 	sehci->clk = usbh_clk;
@@ -111,7 +131,6 @@ static int spear_ehci_hcd_drv_probe(struct platform_device *pdev)
 	if (retval)
 		goto err_stop_ehci;
 
-	device_wakeup_enable(hcd->self.controller);
 	return retval;
 
 err_stop_ehci:
@@ -124,37 +143,42 @@ fail:
 	return retval ;
 }
 
-static void spear_ehci_hcd_drv_remove(struct platform_device *pdev)
+static int spear_ehci_hcd_drv_remove(struct platform_device *pdev)
 {
 	struct usb_hcd *hcd = platform_get_drvdata(pdev);
 	struct spear_ehci *sehci = to_spear_ehci(hcd);
 
+	if (!hcd)
+		return 0;
+	if (in_interrupt())
+		BUG();
 	usb_remove_hcd(hcd);
 
 	if (sehci->clk)
 		clk_disable_unprepare(sehci->clk);
 	usb_put_hcd(hcd);
+
+	return 0;
 }
 
-static const struct of_device_id spear_ehci_id_table[] = {
+static struct of_device_id spear_ehci_id_table[] = {
 	{ .compatible = "st,spear600-ehci", },
 	{ },
 };
-MODULE_DEVICE_TABLE(of, spear_ehci_id_table);
 
 static struct platform_driver spear_ehci_hcd_driver = {
 	.probe		= spear_ehci_hcd_drv_probe,
-	.remove_new	= spear_ehci_hcd_drv_remove,
+	.remove		= spear_ehci_hcd_drv_remove,
 	.shutdown	= usb_hcd_platform_shutdown,
 	.driver		= {
 		.name = "spear-ehci",
 		.bus = &platform_bus_type,
-		.pm = pm_ptr(&ehci_spear_pm_ops),
-		.of_match_table = spear_ehci_id_table,
+		.pm = &ehci_spear_pm_ops,
+		.of_match_table = of_match_ptr(spear_ehci_id_table),
 	}
 };
 
-static const struct ehci_driver_overrides spear_overrides __initconst = {
+static const struct ehci_driver_overrides spear_overrides __initdata = {
 	.extra_priv_size = sizeof(struct spear_ehci),
 };
 
@@ -162,6 +186,8 @@ static int __init ehci_spear_init(void)
 {
 	if (usb_disabled())
 		return -ENODEV;
+
+	pr_info("%s: " DRIVER_DESC "\n", hcd_name);
 
 	ehci_init_driver(&ehci_spear_hc_driver, &spear_overrides);
 	return platform_driver_register(&spear_ehci_hcd_driver);

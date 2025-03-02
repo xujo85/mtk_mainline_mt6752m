@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * pata_sl82c105.c 	- SL82C105 PATA for new ATA layer
  *			  (C) 2005 Red Hat Inc
@@ -20,6 +19,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/init.h>
 #include <linux/blkdev.h>
 #include <linux/delay.h>
 #include <scsi/scsi_host.h>
@@ -173,7 +173,7 @@ static void sl82c105_bmdma_start(struct ata_queued_cmd *qc)
 }
 
 /**
- *	sl82c105_bmdma_stop		-	DMA engine stop
+ *	sl82c105_bmdma_end		-	DMA engine stop
  *	@qc: ATA command
  *
  *	Reset the DMA engine each use as recommended by the errata
@@ -238,7 +238,7 @@ static bool sl82c105_sff_irq_check(struct ata_port *ap)
 	return val & mask;
 }
 
-static const struct scsi_host_template sl82c105_sht = {
+static struct scsi_host_template sl82c105_sht = {
 	ATA_BMDMA_SHT(DRV_NAME),
 };
 
@@ -338,10 +338,10 @@ static int sl82c105_init_one(struct pci_dev *dev, const struct pci_device_id *id
 	return ata_pci_bmdma_init_one(dev, ppi, &sl82c105_sht, NULL, 0);
 }
 
-#ifdef CONFIG_PM_SLEEP
+#ifdef CONFIG_PM
 static int sl82c105_reinit_one(struct pci_dev *pdev)
 {
-	struct ata_host *host = pci_get_drvdata(pdev);
+	struct ata_host *host = dev_get_drvdata(&pdev->dev);
 	int rc;
 
 	rc = ata_pci_device_do_resume(pdev);
@@ -366,7 +366,7 @@ static struct pci_driver sl82c105_pci_driver = {
 	.id_table	= sl82c105,
 	.probe 		= sl82c105_init_one,
 	.remove		= ata_pci_remove_one,
-#ifdef CONFIG_PM_SLEEP
+#ifdef CONFIG_PM
 	.suspend	= ata_pci_device_suspend,
 	.resume		= sl82c105_reinit_one,
 #endif

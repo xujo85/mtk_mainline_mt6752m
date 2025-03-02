@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * sst25l.c
  *
@@ -9,8 +8,14 @@
  * Author: Ryan Mallon
  *
  * Based on m25p80.c
+ *
+ * This code is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
  */
 
+#include <linux/init.h>
 #include <linux/module.h>
 #include <linux/device.h>
 #include <linux/mutex.h>
@@ -191,6 +196,7 @@ static int sst25l_erase(struct mtd_info *mtd, struct erase_info *instr)
 		err = sst25l_erase_sector(flash, addr);
 		if (err) {
 			mutex_unlock(&flash->lock);
+			instr->state = MTD_ERASE_FAILED;
 			dev_err(&flash->spi->dev, "Erase failed\n");
 			return err;
 		}
@@ -200,6 +206,8 @@ static int sst25l_erase(struct mtd_info *mtd, struct erase_info *instr)
 
 	mutex_unlock(&flash->lock);
 
+	instr->state = MTD_ERASE_DONE;
+	mtd_erase_callback(instr);
 	return 0;
 }
 
@@ -356,19 +364,20 @@ static int sst25l_probe(struct spi_device *spi)
 	if (!flash_info)
 		return -ENODEV;
 
-	flash = devm_kzalloc(&spi->dev, sizeof(*flash), GFP_KERNEL);
+	flash = kzalloc(sizeof(struct sst25l_flash), GFP_KERNEL);
 	if (!flash)
 		return -ENOMEM;
 
 	flash->spi = spi;
 	mutex_init(&flash->lock);
-	spi_set_drvdata(spi, flash);
+	dev_set_drvdata(&spi->dev, flash);
 
-	data = dev_get_platdata(&spi->dev);
+	data = spi->dev.platform_data;
 	if (data && data->name)
 		flash->mtd.name = data->name;
+	else
+		flash->mtd.name = dev_name(&spi->dev);
 
-	flash->mtd.dev.parent   = &spi->dev;
 	flash->mtd.type		= MTD_NORFLASH;
 	flash->mtd.flags	= MTD_CAP_NORFLASH;
 	flash->mtd.erasesize	= flash_info->erase_size;
@@ -390,24 +399,33 @@ static int sst25l_probe(struct spi_device *spi)
 	      flash->mtd.numeraseregions);
 
 
-	ret = mtd_device_register(&flash->mtd, data ? data->parts : NULL,
-				  data ? data->nr_parts : 0);
-	if (ret)
+	ret = mtd_device_parse_register(&flash->mtd, NULL, NULL,
+					data ? data->parts : NULL,
+					data ? data->nr_parts : 0);
+	if (ret) {
+		kfree(flash);
+		dev_set_drvdata(&spi->dev, NULL);
 		return -ENODEV;
+	}
 
 	return 0;
 }
 
-static void sst25l_remove(struct spi_device *spi)
+static int sst25l_remove(struct spi_device *spi)
 {
-	struct sst25l_flash *flash = spi_get_drvdata(spi);
+	struct sst25l_flash *flash = dev_get_drvdata(&spi->dev);
+	int ret;
 
-	WARN_ON(mtd_device_unregister(&flash->mtd));
+	ret = mtd_device_unregister(&flash->mtd);
+	if (ret == 0)
+		kfree(flash);
+	return ret;
 }
 
 static struct spi_driver sst25l_driver = {
 	.driver = {
 		.name	= "sst25l",
+		.owner	= THIS_MODULE,
 	},
 	.probe		= sst25l_probe,
 	.remove		= sst25l_remove,

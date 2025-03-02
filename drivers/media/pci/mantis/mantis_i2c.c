@@ -1,9 +1,21 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
 	Mantis PCI bridge driver
 
 	Copyright (C) Manu Abraham (abraham.manu@gmail.com)
 
+	This program is free software; you can redistribute it and/or modify
+	it under the terms of the GNU General Public License as published by
+	the Free Software Foundation; either version 2 of the License, or
+	(at your option) any later version.
+
+	This program is distributed in the hope that it will be useful,
+	but WITHOUT ANY WARRANTY; without even the implied warranty of
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+	GNU General Public License for more details.
+
+	You should have received a copy of the GNU General Public License
+	along with this program; if not, write to the Free Software
+	Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 */
 
 #include <asm/io.h>
@@ -11,11 +23,11 @@
 #include <linux/pci.h>
 #include <linux/i2c.h>
 
-#include <media/dmxdev.h>
-#include <media/dvbdev.h>
-#include <media/dvb_demux.h>
-#include <media/dvb_frontend.h>
-#include <media/dvb_net.h>
+#include "dmxdev.h"
+#include "dvbdev.h"
+#include "dvb_demux.h"
+#include "dvb_frontend.h"
+#include "dvb_net.h"
 
 #include "mantis_common.h"
 #include "mantis_reg.h"
@@ -200,20 +212,20 @@ static u32 mantis_i2c_func(struct i2c_adapter *adapter)
 	return I2C_FUNC_SMBUS_EMUL;
 }
 
-static const struct i2c_algorithm mantis_algo = {
+static struct i2c_algorithm mantis_algo = {
 	.master_xfer		= mantis_i2c_xfer,
 	.functionality		= mantis_i2c_func,
 };
 
 int mantis_i2c_init(struct mantis_pci *mantis)
 {
-	u32 intstat;
+	u32 intstat, intmask;
 	struct i2c_adapter *i2c_adapter = &mantis->adapter;
 	struct pci_dev *pdev		= mantis->pdev;
 
 	init_waitqueue_head(&mantis->i2c_wq);
 	mutex_init(&mantis->i2c_lock);
-	strscpy(i2c_adapter->name, "Mantis I2C", sizeof(i2c_adapter->name));
+	strncpy(i2c_adapter->name, "Mantis I2C", sizeof(i2c_adapter->name));
 	i2c_set_adapdata(i2c_adapter, mantis);
 
 	i2c_adapter->owner	= THIS_MODULE;
@@ -230,10 +242,11 @@ int mantis_i2c_init(struct mantis_pci *mantis)
 	dprintk(MANTIS_DEBUG, 1, "Initializing I2C ..");
 
 	intstat = mmread(MANTIS_INT_STAT);
-	mmread(MANTIS_INT_MASK);
+	intmask = mmread(MANTIS_INT_MASK);
 	mmwrite(intstat, MANTIS_INT_STAT);
 	dprintk(MANTIS_DEBUG, 1, "Disabling I2C interrupt");
-	mantis_mask_ints(mantis, MANTIS_INT_I2CDONE);
+	intmask = mmread(MANTIS_INT_MASK);
+	mmwrite((intmask & ~MANTIS_INT_I2CDONE), MANTIS_INT_MASK);
 
 	return 0;
 }
@@ -241,8 +254,11 @@ EXPORT_SYMBOL_GPL(mantis_i2c_init);
 
 int mantis_i2c_exit(struct mantis_pci *mantis)
 {
+	u32 intmask;
+
 	dprintk(MANTIS_DEBUG, 1, "Disabling I2C interrupt");
-	mantis_mask_ints(mantis, MANTIS_INT_I2CDONE);
+	intmask = mmread(MANTIS_INT_MASK);
+	mmwrite((intmask & ~MANTIS_INT_I2CDONE), MANTIS_INT_MASK);
 
 	dprintk(MANTIS_DEBUG, 1, "Removing I2C adapter");
 	i2c_del_adapter(&mantis->adapter);

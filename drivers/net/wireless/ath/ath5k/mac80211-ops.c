@@ -66,7 +66,7 @@ ath5k_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *control,
 		return;
 	}
 
-	ath5k_tx_queue(hw, skb, &ah->txqs[qnum], control);
+	ath5k_tx_queue(hw, skb, &ah->txqs[qnum]);
 }
 
 
@@ -202,7 +202,7 @@ ath5k_config(struct ieee80211_hw *hw, u32 changed)
 	mutex_lock(&ah->lock);
 
 	if (changed & IEEE80211_CONF_CHANGE_CHANNEL) {
-		ret = ath5k_chan_set(ah, &conf->chandef);
+		ret = ath5k_chan_set(ah, conf->chandef.chan);
 		if (ret < 0)
 			goto unlock;
 	}
@@ -250,7 +250,7 @@ unlock:
 
 static void
 ath5k_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
-		       struct ieee80211_bss_conf *bss_conf, u64 changes)
+		       struct ieee80211_bss_conf *bss_conf, u32 changes)
 {
 	struct ath5k_vif *avf = (void *)vif->drv_priv;
 	struct ath5k_hw *ah = hw->priv;
@@ -263,6 +263,7 @@ ath5k_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 		memcpy(common->curbssid, bss_conf->bssid, ETH_ALEN);
 		common->curaid = 0;
 		ath5k_hw_set_bssid(ah);
+		mmiowb();
 	}
 
 	if (changes & BSS_CHANGED_BEACON_INT)
@@ -278,9 +279,9 @@ ath5k_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	}
 
 	if (changes & BSS_CHANGED_ASSOC) {
-		avf->assoc = vif->cfg.assoc;
-		if (vif->cfg.assoc)
-			ah->assoc = vif->cfg.assoc;
+		avf->assoc = bss_conf->assoc;
+		if (bss_conf->assoc)
+			ah->assoc = bss_conf->assoc;
 		else
 			ah->assoc = ath5k_any_vif_assoc(ah);
 
@@ -288,11 +289,11 @@ ath5k_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 			ath5k_set_beacon_filter(hw, ah->assoc);
 		ath5k_hw_set_ledstate(ah, ah->assoc ?
 			AR5K_LED_ASSOC : AR5K_LED_INIT);
-		if (vif->cfg.assoc) {
+		if (bss_conf->assoc) {
 			ATH5K_DBG(ah, ATH5K_DEBUG_ANY,
 				  "Bss Info ASSOC %d, bssid: %pM\n",
-				  vif->cfg.aid, common->curbssid);
-			common->curaid = vif->cfg.aid;
+				  bss_conf->aid, common->curbssid);
+			common->curaid = bss_conf->aid;
 			ath5k_hw_set_bssid(ah);
 			/* Once ANI is available you would start it here */
 		}
@@ -324,7 +325,7 @@ ath5k_prepare_multicast(struct ieee80211_hw *hw,
 	struct netdev_hw_addr *ha;
 
 	mfilt[0] = 0;
-	mfilt[1] = 0;
+	mfilt[1] = 1;
 
 	netdev_hw_addr_list_for_each(ha, mc_list) {
 		/* calculate XOR of eight 6-bit values */
@@ -368,7 +369,7 @@ ath5k_configure_filter(struct ieee80211_hw *hw, unsigned int changed_flags,
 		       unsigned int *new_flags, u64 multicast)
 {
 #define SUPPORTED_FIF_FLAGS \
-	(FIF_ALLMULTI | FIF_FCSFAIL | \
+	(FIF_PROMISC_IN_BSS |  FIF_ALLMULTI | FIF_FCSFAIL | \
 	FIF_PLCPFAIL | FIF_CONTROL | FIF_OTHER_BSS | \
 	FIF_BCN_PRBRESP_PROMISC)
 
@@ -392,6 +393,16 @@ ath5k_configure_filter(struct ieee80211_hw *hw, unsigned int changed_flags,
 		(AR5K_RX_FILTER_UCAST | AR5K_RX_FILTER_BCAST |
 		AR5K_RX_FILTER_MCAST);
 
+	if (changed_flags & (FIF_PROMISC_IN_BSS | FIF_OTHER_BSS)) {
+		if (*new_flags & FIF_PROMISC_IN_BSS)
+			__set_bit(ATH_STAT_PROMISC, ah->status);
+		else
+			__clear_bit(ATH_STAT_PROMISC, ah->status);
+	}
+
+	if (test_bit(ATH_STAT_PROMISC, ah->status))
+		rfilt |= AR5K_RX_FILTER_PROM;
+
 	/* Note, AR5K_RX_FILTER_MCAST is already enabled */
 	if (*new_flags & FIF_ALLMULTI) {
 		mfilt[0] =  ~0;
@@ -407,10 +418,11 @@ ath5k_configure_filter(struct ieee80211_hw *hw, unsigned int changed_flags,
 	if ((*new_flags & FIF_BCN_PRBRESP_PROMISC) || (ah->nvifs > 1))
 		rfilt |= AR5K_RX_FILTER_BEACON;
 
-	/* FIF_CONTROL doc says we should only pass on control frames for this
+	/* FIF_CONTROL doc says that if FIF_PROMISC_IN_BSS is not
+	 * set we should only pass on control frames for this
 	 * station. This needs testing. I believe right now this
 	 * enables *all* control frames, which is OK.. but
-	 * we should see if we can improve on granularity */
+	 * but we should see if we can improve on granularity */
 	if (*new_flags & FIF_CONTROL)
 		rfilt |= AR5K_RX_FILTER_CONTROL;
 
@@ -433,7 +445,6 @@ ath5k_configure_filter(struct ieee80211_hw *hw, unsigned int changed_flags,
 	case NL80211_IFTYPE_STATION:
 		if (ah->assoc)
 			rfilt |= AR5K_RX_FILTER_BEACON;
-		break;
 	default:
 		break;
 	}
@@ -462,8 +473,6 @@ ath5k_configure_filter(struct ieee80211_hw *hw, unsigned int changed_flags,
 	/* Set the cached hw filter flags, this will later actually
 	 * be set in HW */
 	ah->filter_flags = rfilt;
-	/* Store current FIF filter flags */
-	ah->fif_filter_flags = *new_flags;
 
 	mutex_unlock(&ah->lock);
 }
@@ -522,21 +531,20 @@ ath5k_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 		}
 		break;
 	case DISABLE_KEY:
-		ath_key_delete(common, key->hw_key_idx);
+		ath_key_delete(common, key);
 		break;
 	default:
 		ret = -EINVAL;
 	}
 
+	mmiowb();
 	mutex_unlock(&ah->lock);
 	return ret;
 }
 
 
 static void
-ath5k_sw_scan_start(struct ieee80211_hw *hw,
-		    struct ieee80211_vif *vif,
-		    const u8 *mac_addr)
+ath5k_sw_scan_start(struct ieee80211_hw *hw)
 {
 	struct ath5k_hw *ah = hw->priv;
 	if (!ah->assoc)
@@ -545,7 +553,7 @@ ath5k_sw_scan_start(struct ieee80211_hw *hw,
 
 
 static void
-ath5k_sw_scan_complete(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
+ath5k_sw_scan_complete(struct ieee80211_hw *hw)
 {
 	struct ath5k_hw *ah = hw->priv;
 	ath5k_hw_set_ledstate(ah, ah->assoc ?
@@ -572,8 +580,7 @@ ath5k_get_stats(struct ieee80211_hw *hw,
 
 
 static int
-ath5k_conf_tx(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
-	      unsigned int link_id, u16 queue,
+ath5k_conf_tx(struct ieee80211_hw *hw, struct ieee80211_vif *vif, u16 queue,
 	      const struct ieee80211_tx_queue_params *params)
 {
 	struct ath5k_hw *ah = hw->priv;
@@ -660,10 +667,10 @@ ath5k_get_survey(struct ieee80211_hw *hw, int idx, struct survey_info *survey)
 	spin_lock_bh(&common->cc_lock);
 	ath_hw_cycle_counters_update(common);
 	if (cc->cycles > 0) {
-		ah->survey.time += cc->cycles / div;
-		ah->survey.time_busy += cc->rx_busy / div;
-		ah->survey.time_rx += cc->rx_frame / div;
-		ah->survey.time_tx += cc->tx_frame / div;
+		ah->survey.channel_time += cc->cycles / div;
+		ah->survey.channel_time_busy += cc->rx_busy / div;
+		ah->survey.channel_time_rx += cc->rx_frame / div;
+		ah->survey.channel_time_tx += cc->tx_frame / div;
 	}
 	memset(cc, 0, sizeof(*cc));
 	spin_unlock_bh(&common->cc_lock);
@@ -673,11 +680,10 @@ ath5k_get_survey(struct ieee80211_hw *hw, int idx, struct survey_info *survey)
 	survey->channel = conf->chandef.chan;
 	survey->noise = ah->ah_noise_floor;
 	survey->filled = SURVEY_INFO_NOISE_DBM |
-			SURVEY_INFO_IN_USE |
-			SURVEY_INFO_TIME |
-			SURVEY_INFO_TIME_BUSY |
-			SURVEY_INFO_TIME_RX |
-			SURVEY_INFO_TIME_TX;
+			SURVEY_INFO_CHANNEL_TIME |
+			SURVEY_INFO_CHANNEL_TIME_BUSY |
+			SURVEY_INFO_CHANNEL_TIME_RX |
+			SURVEY_INFO_CHANNEL_TIME_TX;
 
 	return 0;
 }
@@ -694,7 +700,7 @@ ath5k_get_survey(struct ieee80211_hw *hw, int idx, struct survey_info *survey)
  * reset.
  */
 static void
-ath5k_set_coverage_class(struct ieee80211_hw *hw, s16 coverage_class)
+ath5k_set_coverage_class(struct ieee80211_hw *hw, u8 coverage_class)
 {
 	struct ath5k_hw *ah = hw->priv;
 
@@ -781,7 +787,6 @@ static int ath5k_set_ringparam(struct ieee80211_hw *hw, u32 tx, u32 rx)
 
 const struct ieee80211_ops ath5k_hw_ops = {
 	.tx			= ath5k_tx,
-	.wake_tx_queue		= ieee80211_handle_wake_tx_queue,
 	.start			= ath5k_start,
 	.stop			= ath5k_stop,
 	.add_interface		= ath5k_add_interface,
@@ -798,6 +803,7 @@ const struct ieee80211_ops ath5k_hw_ops = {
 	.sw_scan_start		= ath5k_sw_scan_start,
 	.sw_scan_complete	= ath5k_sw_scan_complete,
 	.get_stats		= ath5k_get_stats,
+	/* .get_tkip_seq	= not implemented */
 	/* .set_frag_threshold	= not implemented */
 	/* .set_rts_threshold	= not implemented */
 	/* .sta_add		= not implemented */

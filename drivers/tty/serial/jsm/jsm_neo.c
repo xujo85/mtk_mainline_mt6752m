@@ -1,8 +1,22 @@
-// SPDX-License-Identifier: GPL-2.0+
 /************************************************************************
  * Copyright 2003 Digi International (www.digi.com)
  *
  * Copyright (C) 2004 IBM Corporation. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY, EXPRESS OR IMPLIED; without even the
+ * implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+ * PURPOSE.  See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 * Temple Place - Suite 330, Boston,
+ * MA  02111-1307, USA.
  *
  * Contact Information:
  * Scott H Kilau <Scott_Kilau@digi.com>
@@ -282,6 +296,9 @@ static void neo_copy_data_from_uart_to_queue(struct jsm_channel *ch)
 	u16 head;
 	u16 tail;
 
+	if (!ch)
+		return;
+
 	/* cache head and tail of queue */
 	head = ch->ch_r_head & RQUEUEMASK;
 	tail = ch->ch_r_tail & RQUEUEMASK;
@@ -291,8 +308,7 @@ static void neo_copy_data_from_uart_to_queue(struct jsm_channel *ch)
 	ch->ch_cached_lsr = 0;
 
 	/* Store how much space we have left in the queue */
-	qleft = tail - head - 1;
-	if (qleft < 0)
+	if ((qleft = tail - head - 1) < 0)
 		qleft += RQUEUEMASK + 1;
 
 	/*
@@ -633,7 +649,7 @@ static void neo_flush_uart_write(struct jsm_channel *ch)
 
 		/* Check to see if the UART feels it completely flushed the FIFO. */
 		tmp = readb(&ch->ch_neo_uart->isr_fcr);
-		if (tmp & UART_FCR_CLEAR_XMIT) {
+		if (tmp & 4) {
 			jsm_dbg(IOCTL, &ch->ch_bd->pci_dev,
 				"Still flushing TX UART... i: %d\n", i);
 			udelay(10);
@@ -678,7 +694,7 @@ static void neo_flush_uart_read(struct jsm_channel *ch)
 /*
  * No locks are assumed to be held when calling this function.
  */
-static void neo_clear_break(struct jsm_channel *ch)
+static void neo_clear_break(struct jsm_channel *ch, int force)
 {
 	unsigned long lock_flags;
 
@@ -703,7 +719,7 @@ static void neo_clear_break(struct jsm_channel *ch)
 /*
  * Parse the ISR register.
  */
-static void neo_parse_isr(struct jsm_board *brd, u32 port)
+static inline void neo_parse_isr(struct jsm_board *brd, u32 port)
 {
 	struct jsm_channel *ch;
 	u8 isr;
@@ -713,7 +729,7 @@ static void neo_parse_isr(struct jsm_board *brd, u32 port)
 	if (!brd)
 		return;
 
-	if (port >= brd->maxports)
+	if (port > brd->maxports)
 		return;
 
 	ch = brd->channels[port];
@@ -816,9 +832,7 @@ static void neo_parse_isr(struct jsm_board *brd, u32 port)
 		/* Parse any modem signal changes */
 		jsm_dbg(INTR, &ch->ch_bd->pci_dev,
 			"MOD_STAT: sending to parse_modem_sigs\n");
-		spin_lock_irqsave(&ch->uart_port.lock, lock_flags);
 		neo_parse_modem(ch, readb(&ch->ch_neo_uart->msr));
-		spin_unlock_irqrestore(&ch->uart_port.lock, lock_flags);
 	}
 }
 
@@ -831,7 +845,7 @@ static inline void neo_parse_lsr(struct jsm_board *brd, u32 port)
 	if (!brd)
 		return;
 
-	if (port >= brd->maxports)
+	if (port > brd->maxports)
 		return;
 
 	ch = brd->channels[port];
@@ -938,7 +952,7 @@ static void neo_param(struct jsm_channel *ch)
 	/*
 	 * If baud rate is zero, flush queues, and set mval to drop DTR.
 	 */
-	if ((ch->ch_c_cflag & CBAUD) == B0) {
+	if ((ch->ch_c_cflag & (CBAUD)) == 0) {
 		ch->ch_r_head = ch->ch_r_tail = 0;
 		ch->ch_e_head = ch->ch_e_tail = 0;
 
@@ -997,16 +1011,39 @@ static void neo_param(struct jsm_channel *ch)
 	if (!(ch->ch_c_cflag & PARODD))
 		lcr |= UART_LCR_EPAR;
 
+	/*
+	 * Not all platforms support mark/space parity,
+	 * so this will hide behind an ifdef.
+	 */
+#ifdef CMSPAR
 	if (ch->ch_c_cflag & CMSPAR)
 		lcr |= UART_LCR_SPAR;
+#endif
 
 	if (ch->ch_c_cflag & CSTOPB)
 		lcr |= UART_LCR_STOP;
 
-	lcr |= UART_LCR_WLEN(tty_get_char_size(ch->ch_c_cflag));
+	switch (ch->ch_c_cflag & CSIZE) {
+		case CS5:
+			lcr |= UART_LCR_WLEN5;
+			break;
+		case CS6:
+			lcr |= UART_LCR_WLEN6;
+			break;
+		case CS7:
+			lcr |= UART_LCR_WLEN7;
+			break;
+		case CS8:
+		default:
+			lcr |= UART_LCR_WLEN8;
+		break;
+	}
 
 	ier = readb(&ch->ch_neo_uart->ier);
 	uart_lcr = readb(&ch->ch_neo_uart->lcr);
+
+	if (baud == 0)
+		baud = 9600;
 
 	quot = ch->ch_bd->bd_dividend / baud;
 
@@ -1151,13 +1188,10 @@ static irqreturn_t neo_intr(int irq, void *voidbrd)
 			 */
 
 			/* Verify the port is in range. */
-			if (port >= brd->nasync)
+			if (port > brd->nasync)
 				continue;
 
 			ch = brd->channels[port];
-			if (!ch)
-				continue;
-
 			neo_copy_data_from_uart_to_queue(ch);
 
 			/* Call our tty layer to enforce queue flow control if needed. */

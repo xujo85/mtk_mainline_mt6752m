@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /* NXP PCF50633 ADC Driver
  *
  * (C) 2006-2008 by Openmoko, Inc.
@@ -8,6 +7,11 @@
  * Broken down from monstrous PCF50633 driver mainly by
  * Harald Welte, Andy Green and Werner Almesberger
  *
+ *  This program is free software; you can redistribute  it and/or modify it
+ *  under  the terms of  the GNU General  Public License as published by the
+ *  Free Software Foundation;  either version 2 of the  License, or (at your
+ *  option) any later version.
+ *
  *  NOTE: This driver does not yet support subtractive ADC mode, which means
  *  you can do only one measurement per read request.
  */
@@ -15,6 +19,7 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/module.h>
+#include <linux/init.h>
 #include <linux/device.h>
 #include <linux/platform_device.h>
 #include <linux/completion.h>
@@ -136,7 +141,6 @@ int pcf50633_adc_async_read(struct pcf50633 *pcf, int mux, int avg,
 			     void *callback_param)
 {
 	struct pcf50633_adc_request *req;
-	int ret;
 
 	/* req is freed when the result is ready, in interrupt handler */
 	req = kmalloc(sizeof(*req), GFP_KERNEL);
@@ -148,11 +152,7 @@ int pcf50633_adc_async_read(struct pcf50633 *pcf, int mux, int avg,
 	req->callback = callback;
 	req->callback_param = callback_param;
 
-	ret = adc_enqueue_request(pcf, req);
-	if (ret)
-		kfree(req);
-
-	return ret;
+	return adc_enqueue_request(pcf, req);
 }
 EXPORT_SYMBOL_GPL(pcf50633_adc_async_read);
 
@@ -203,7 +203,7 @@ static int pcf50633_adc_probe(struct platform_device *pdev)
 {
 	struct pcf50633_adc *adc;
 
-	adc = devm_kzalloc(&pdev->dev, sizeof(*adc), GFP_KERNEL);
+	adc = kzalloc(sizeof(*adc), GFP_KERNEL);
 	if (!adc)
 		return -ENOMEM;
 
@@ -236,6 +236,7 @@ static int pcf50633_adc_remove(struct platform_device *pdev)
 		kfree(adc->queue[i]);
 
 	mutex_unlock(&adc->queue_mutex);
+	kfree(adc);
 
 	return 0;
 }

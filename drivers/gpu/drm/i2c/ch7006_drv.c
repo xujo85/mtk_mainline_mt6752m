@@ -26,8 +26,6 @@
 
 #include <linux/module.h>
 
-#include <drm/drm_crtc_helper.h>
-
 #include "ch7006_priv.h"
 
 /* DRM encoder functions */
@@ -121,8 +119,8 @@ static void ch7006_encoder_mode_set(struct drm_encoder *encoder,
 	struct ch7006_encoder_params *params = &priv->params;
 	struct ch7006_state *state = &priv->state;
 	uint8_t *regs = state->regs;
-	const struct ch7006_mode *mode = priv->mode;
-	const struct ch7006_tv_norm_info *norm = &ch7006_tv_norms[priv->norm];
+	struct ch7006_mode *mode = priv->mode;
+	struct ch7006_tv_norm_info *norm = &ch7006_tv_norms[priv->norm];
 	int start_active;
 
 	ch7006_dbg(client, "\n");
@@ -228,7 +226,7 @@ static int ch7006_encoder_get_modes(struct drm_encoder *encoder,
 				    struct drm_connector *connector)
 {
 	struct ch7006_priv *priv = to_ch7006_priv(encoder);
-	const struct ch7006_mode *mode;
+	struct ch7006_mode *mode;
 	int n = 0;
 
 	for (mode = ch7006_modes; mode->mode.clock; mode++) {
@@ -252,11 +250,9 @@ static int ch7006_encoder_create_resources(struct drm_encoder *encoder,
 	struct drm_device *dev = encoder->dev;
 	struct drm_mode_config *conf = &dev->mode_config;
 
-	drm_mode_create_tv_properties_legacy(dev, NUM_TV_NORMS, ch7006_tv_norm_names);
+	drm_mode_create_tv_properties(dev, NUM_TV_NORMS, ch7006_tv_norm_names);
 
 	priv->scale_property = drm_property_create_range(dev, 0, "scale", 0, 2);
-	if (!priv->scale_property)
-		return -ENOMEM;
 
 	drm_object_attach_property(&connector->base, conf->tv_select_subconnector_property,
 				      priv->select_subconnector);
@@ -266,8 +262,8 @@ static int ch7006_encoder_create_resources(struct drm_encoder *encoder,
 				      priv->hmargin);
 	drm_object_attach_property(&connector->base, conf->tv_bottom_margin_property,
 				      priv->vmargin);
-	drm_object_attach_property(&connector->base, conf->legacy_tv_mode_property,
-				   priv->norm);
+	drm_object_attach_property(&connector->base, conf->tv_mode_property,
+				      priv->norm);
 	drm_object_attach_property(&connector->base, conf->tv_brightness_property,
 				      priv->brightness);
 	drm_object_attach_property(&connector->base, conf->tv_contrast_property,
@@ -317,7 +313,7 @@ static int ch7006_encoder_set_property(struct drm_encoder *encoder,
 		ch7006_load_reg(client, state, CH7006_POV);
 		ch7006_load_reg(client, state, CH7006_VPOS);
 
-	} else if (property == conf->legacy_tv_mode_property) {
+	} else if (property == conf->tv_mode_property) {
 		if (connector->dpms != DRM_MODE_DPMS_OFF)
 			return -EINVAL;
 
@@ -361,16 +357,21 @@ static int ch7006_encoder_set_property(struct drm_encoder *encoder,
 	if (modes_changed) {
 		drm_helper_probe_single_connector_modes(connector, 0, 0);
 
-		if (crtc)
-			drm_crtc_helper_set_mode(crtc, &crtc->mode,
-						 crtc->x, crtc->y,
-						 crtc->primary->fb);
+		/* Disable the crtc to ensure a full modeset is
+		 * performed whenever it's turned on again. */
+		if (crtc) {
+			struct drm_mode_set modeset = {
+				.crtc = crtc,
+			};
+
+			drm_mode_set_config_internal(&modeset);
+		}
 	}
 
 	return 0;
 }
 
-static const struct drm_encoder_slave_funcs ch7006_encoder_funcs = {
+static struct drm_encoder_slave_funcs ch7006_encoder_funcs = {
 	.set_config = ch7006_encoder_set_config,
 	.destroy = ch7006_encoder_destroy,
 	.dpms = ch7006_encoder_dpms,
@@ -388,7 +389,7 @@ static const struct drm_encoder_slave_funcs ch7006_encoder_funcs = {
 
 /* I2C driver functions */
 
-static int ch7006_probe(struct i2c_client *client)
+static int ch7006_probe(struct i2c_client *client, const struct i2c_device_id *id)
 {
 	uint8_t addr = CH7006_VERSION_ID;
 	uint8_t val;
@@ -419,9 +420,11 @@ fail:
 	return -ENODEV;
 }
 
-static void ch7006_remove(struct i2c_client *client)
+static int ch7006_remove(struct i2c_client *client)
 {
 	ch7006_dbg(client, "\n");
+
+	return 0;
 }
 
 static int ch7006_resume(struct device *dev)
@@ -485,7 +488,7 @@ static int ch7006_encoder_init(struct i2c_client *client,
 	return 0;
 }
 
-static const struct i2c_device_id ch7006_ids[] = {
+static struct i2c_device_id ch7006_ids[] = {
 	{ "ch7006", 0 },
 	{ }
 };
@@ -497,7 +500,7 @@ static const struct dev_pm_ops ch7006_pm_ops = {
 
 static struct drm_i2c_encoder_driver ch7006_driver = {
 	.i2c_driver = {
-		.probe_new = ch7006_probe,
+		.probe = ch7006_probe,
 		.remove = ch7006_remove,
 
 		.driver = {

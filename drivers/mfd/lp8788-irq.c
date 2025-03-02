@@ -1,10 +1,14 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * TI LP8788 MFD - interrupt handler
  *
  * Copyright 2012 Texas Instruments
  *
  * Author: Milo(Woogyom) Kim <milo.kim@ti.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
  */
 
 #include <linux/delay.h>
@@ -62,14 +66,12 @@ static inline u8 _irq_to_val(enum lp8788_int_id id, int enable)
 static void lp8788_irq_enable(struct irq_data *data)
 {
 	struct lp8788_irq_data *irqd = irq_data_get_irq_chip_data(data);
-
 	irqd->enabled[data->hwirq] = 1;
 }
 
 static void lp8788_irq_disable(struct irq_data *data)
 {
 	struct lp8788_irq_data *irqd = irq_data_get_irq_chip_data(data);
-
 	irqd->enabled[data->hwirq] = 0;
 }
 
@@ -108,7 +110,7 @@ static irqreturn_t lp8788_irq_handler(int irq, void *ptr)
 	struct lp8788_irq_data *irqd = ptr;
 	struct lp8788 *lp = irqd->lp;
 	u8 status[NUM_REGS], addr, mask;
-	bool handled = false;
+	bool handled;
 	int i;
 
 	if (lp8788_read_multi_bytes(lp, LP8788_INT_1, status, NUM_REGS))
@@ -137,12 +139,17 @@ static int lp8788_irq_map(struct irq_domain *d, unsigned int virq,
 	irq_set_chip_data(virq, irqd);
 	irq_set_chip_and_handler(virq, chip, handle_edge_irq);
 	irq_set_nested_thread(virq, 1);
+
+#ifdef CONFIG_ARM
+	set_irq_flags(virq, IRQF_VALID);
+#else
 	irq_set_noprobe(virq);
+#endif
 
 	return 0;
 }
 
-static const struct irq_domain_ops lp8788_domain_ops = {
+static struct irq_domain_ops lp8788_domain_ops = {
 	.map = lp8788_irq_map,
 };
 
@@ -175,7 +182,6 @@ int lp8788_irq_init(struct lp8788 *lp, int irq)
 				IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
 				"lp8788-irq", irqd);
 	if (ret) {
-		irq_domain_remove(lp->irqdm);
 		dev_err(lp->dev, "failed to create a thread for IRQ_N\n");
 		return ret;
 	}
@@ -189,6 +195,4 @@ void lp8788_irq_exit(struct lp8788 *lp)
 {
 	if (lp->irq)
 		free_irq(lp->irq, lp->irqdm);
-	if (lp->irqdm)
-		irq_domain_remove(lp->irqdm);
 }

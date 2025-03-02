@@ -1,7 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-only
-
 /* New Hydra driver using generic 8390 core */
 /* Based on old hydra driver by Topi Kanerva (topi@susanna.oulu.fi) */
+
+/* This file is subject to the terms and conditions of the GNU General      */
+/* Public License.  See the file COPYING in the main directory of the       */
+/* Linux distribution for more details.                                     */
 
 /* Peter De Schrijver (p2@mind.be) */
 /* Oldenburg 2000 */
@@ -102,6 +104,7 @@ static const struct net_device_ops hydra_netdev_ops = {
 	.ndo_set_rx_mode	= __ei_set_multicast_list,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_mac_address	= eth_mac_addr,
+	.ndo_change_mtu		= eth_change_mtu,
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	= __ei_poll,
 #endif
@@ -110,11 +113,10 @@ static const struct net_device_ops hydra_netdev_ops = {
 static int hydra_init(struct zorro_dev *z)
 {
     struct net_device *dev;
-    unsigned long board = (unsigned long)ZTWO_VADDR(z->resource.start);
+    unsigned long board = ZTWO_VADDR(z->resource.start);
     unsigned long ioaddr = board+HYDRA_NIC_BASE;
     const char name[] = "NE2000";
     int start_page, stop_page;
-    u8 macaddr[ETH_ALEN];
     int j;
     int err;
 
@@ -128,8 +130,7 @@ static int hydra_init(struct zorro_dev *z)
 	return -ENOMEM;
 
     for (j = 0; j < ETH_ALEN; j++)
-	macaddr[j] = *((u8 *)(board + HYDRA_ADDRPROM + 2*j));
-    eth_hw_addr_set(dev, macaddr);
+	dev->dev_addr[j] = *((u8 *)(board + HYDRA_ADDRPROM + 2*j));
 
     /* We must set the 8390 for word mode. */
     z_writeb(0x4b, ioaddr + NE_EN0_DCFG);
@@ -186,16 +187,15 @@ static int hydra_open(struct net_device *dev)
 
 static int hydra_close(struct net_device *dev)
 {
-    struct ei_device *ei_local = netdev_priv(dev);
-
-    netif_dbg(ei_local, ifdown, dev, "Shutting down ethercard.\n");
+    if (ei_debug > 1)
+	printk(KERN_DEBUG "%s: Shutting down ethercard.\n", dev->name);
     __ei_close(dev);
     return 0;
 }
 
 static void hydra_reset_8390(struct net_device *dev)
 {
-    netdev_info(dev, "Hydra hw reset not there\n");
+    printk(KERN_INFO "Hydra hw reset not there\n");
 }
 
 static void hydra_get_8390_hdr(struct net_device *dev,

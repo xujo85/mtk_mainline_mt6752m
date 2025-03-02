@@ -1,9 +1,13 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *	IndyDog	0.3	A Hardware Watchdog Device for SGI IP22
  *
  *	(c) Copyright 2002 Guido Guenther <agx@sigxcpu.org>,
  *						All Rights Reserved.
+ *
+ *	This program is free software; you can redistribute it and/or
+ *	modify it under the terms of the GNU General Public License
+ *	as published by the Free Software Foundation; either version
+ *	2 of the License, or (at your option) any later version.
  *
  *	based on softdog.c by Alan Cox <alan@lxorguk.ukuu.org.uk>
  */
@@ -37,15 +41,24 @@ MODULE_PARM_DESC(nowayout,
 
 static void indydog_start(void)
 {
+	u32 mc_ctrl0;
+
 	spin_lock(&indydog_lock);
-	sgimc->cpuctrl0 |= SGIMC_CCTRL0_WDOG;
+	mc_ctrl0 = sgimc->cpuctrl0;
+	mc_ctrl0 = sgimc->cpuctrl0 | SGIMC_CCTRL0_WDOG;
+	sgimc->cpuctrl0 = mc_ctrl0;
 	spin_unlock(&indydog_lock);
 }
 
 static void indydog_stop(void)
 {
+	u32 mc_ctrl0;
+
 	spin_lock(&indydog_lock);
-	sgimc->cpuctrl0 &= ~SGIMC_CCTRL0_WDOG;
+
+	mc_ctrl0 = sgimc->cpuctrl0;
+	mc_ctrl0 &= ~SGIMC_CCTRL0_WDOG;
+	sgimc->cpuctrl0 = mc_ctrl0;
 	spin_unlock(&indydog_lock);
 
 	pr_info("Stopped watchdog timer\n");
@@ -73,7 +86,7 @@ static int indydog_open(struct inode *inode, struct file *file)
 
 	pr_info("Started watchdog timer\n");
 
-	return stream_open(inode, file);
+	return nonseekable_open(inode, file);
 }
 
 static int indydog_release(struct inode *inode, struct file *file)
@@ -152,7 +165,6 @@ static const struct file_operations indydog_fops = {
 	.llseek		= no_llseek,
 	.write		= indydog_write,
 	.unlocked_ioctl	= indydog_ioctl,
-	.compat_ioctl	= compat_ptr_ioctl,
 	.open		= indydog_open,
 	.release	= indydog_release,
 };
@@ -202,3 +214,4 @@ module_exit(watchdog_exit);
 MODULE_AUTHOR("Guido Guenther <agx@sigxcpu.org>");
 MODULE_DESCRIPTION("Hardware Watchdog Device for SGI IP22");
 MODULE_LICENSE("GPL");
+MODULE_ALIAS_MISCDEV(WATCHDOG_MINOR);

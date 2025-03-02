@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * FireDTV driver -- firewire I/O backend
  */
@@ -22,7 +21,7 @@
 
 #include <asm/page.h>
 
-#include <media/dvb_demux.h>
+#include <dvb_demux.h>
 
 #include "firedtv.h"
 
@@ -249,7 +248,7 @@ static const char * const model_names[] = {
 /* Adjust the template string if models with longer names appear. */
 #define MAX_MODEL_NAME_LEN sizeof("FireDTV ????")
 
-static int node_probe(struct fw_unit *unit, const struct ieee1394_device_id *id)
+static int node_probe(struct device *dev)
 {
 	struct firedtv *fdtv;
 	char name[MAX_MODEL_NAME_LEN];
@@ -259,8 +258,8 @@ static int node_probe(struct fw_unit *unit, const struct ieee1394_device_id *id)
 	if (!fdtv)
 		return -ENOMEM;
 
-	dev_set_drvdata(&unit->device, fdtv);
-	fdtv->device		= &unit->device;
+	dev_set_drvdata(dev, fdtv);
+	fdtv->device		= dev;
 	fdtv->isochannel	= -1;
 	fdtv->voltage		= 0xff;
 	fdtv->tone		= 0xff;
@@ -270,19 +269,15 @@ static int node_probe(struct fw_unit *unit, const struct ieee1394_device_id *id)
 	mutex_init(&fdtv->demux_mutex);
 	INIT_WORK(&fdtv->remote_ctrl_work, avc_remote_ctrl_work);
 
-	name_len = fw_csr_string(unit->directory, CSR_MODEL,
+	name_len = fw_csr_string(fw_unit(dev)->directory, CSR_MODEL,
 				 name, sizeof(name));
-	if (name_len < 0) {
-		err = name_len;
-		goto fail_free;
-	}
 	for (i = ARRAY_SIZE(model_names); --i; )
 		if (strlen(model_names[i]) <= name_len &&
 		    strncmp(name, model_names[i], name_len) == 0)
 			break;
 	fdtv->type = i;
 
-	err = fdtv_register_rc(fdtv, &unit->device);
+	err = fdtv_register_rc(fdtv, dev);
 	if (err)
 		goto fail_free;
 
@@ -312,9 +307,9 @@ fail_free:
 	return err;
 }
 
-static void node_remove(struct fw_unit *unit)
+static int node_remove(struct device *dev)
 {
-	struct firedtv *fdtv = dev_get_drvdata(&unit->device);
+	struct firedtv *fdtv = dev_get_drvdata(dev);
 
 	fdtv_dvb_unregister(fdtv);
 
@@ -325,6 +320,7 @@ static void node_remove(struct fw_unit *unit)
 	fdtv_unregister_rc(fdtv);
 
 	kfree(fdtv);
+	return 0;
 }
 
 static void node_update(struct fw_unit *unit)
@@ -395,10 +391,10 @@ static struct fw_driver fdtv_driver = {
 		.owner  = THIS_MODULE,
 		.name   = "firedtv",
 		.bus    = &fw_bus_type,
+		.probe  = node_probe,
+		.remove = node_remove,
 	},
-	.probe    = node_probe,
 	.update   = node_update,
-	.remove   = node_remove,
 	.id_table = fdtv_id_table,
 };
 
@@ -430,3 +426,4 @@ MODULE_AUTHOR("Andreas Monitzer <andy@monitzer.com>");
 MODULE_AUTHOR("Ben Backx <ben@bbackx.com>");
 MODULE_DESCRIPTION("FireDTV DVB Driver");
 MODULE_LICENSE("GPL");
+MODULE_SUPPORTED_DEVICE("FireDTV DVB");

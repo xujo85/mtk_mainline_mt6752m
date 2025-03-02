@@ -1,29 +1,37 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Clock driver for the ARM Integrator/IM-PD1 board
- * Copyright (C) 2012-2013 Linus Walleij
+ * Copyright (C) 2012 Linus Walleij
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  */
 #include <linux/clk-provider.h>
+#include <linux/clk.h>
 #include <linux/clkdev.h>
 #include <linux/err.h>
 #include <linux/io.h>
-#include <linux/platform_device.h>
-#include <linux/module.h>
-#include <linux/mfd/syscon.h>
-#include <linux/regmap.h>
+#include <linux/platform_data/clk-integrator.h>
 
-#include "icst.h"
+#include <mach/impd1.h>
+
 #include "clk-icst.h"
 
-#define IMPD1_OSC1	0x00
-#define IMPD1_OSC2	0x04
-#define IMPD1_LOCK	0x08
+struct impd1_clk {
+	struct clk *vcoclk;
+	struct clk *uartclk;
+	struct clk_lookup *clks[3];
+};
+
+static struct impd1_clk impd1_clks[4];
 
 /*
- * There are two VCO's on the IM-PD1
+ * There are two VCO's on the IM-PD1 but only one is used by the
+ * kernel, that is why we are only implementing the control of
+ * IMPD1_OSC1 here.
  */
 
-static const struct icst_params impd1_vco1_params = {
+static const struct icst_params impd1_vco_params = {
 	.ref		= 24000000,	/* 24 MHz */
 	.vco_max	= ICST525_VCO_MAX_3V,
 	.vco_min	= ICST525_VCO_MIN,
@@ -36,103 +44,54 @@ static const struct icst_params impd1_vco1_params = {
 };
 
 static const struct clk_icst_desc impd1_icst1_desc = {
-	.params = &impd1_vco1_params,
+	.params = &impd1_vco_params,
 	.vco_offset = IMPD1_OSC1,
 	.lock_offset = IMPD1_LOCK,
 };
 
-static const struct icst_params impd1_vco2_params = {
-	.ref		= 24000000,	/* 24 MHz */
-	.vco_max	= ICST525_VCO_MAX_3V,
-	.vco_min	= ICST525_VCO_MIN,
-	.vd_min		= 12,
-	.vd_max		= 519,
-	.rd_min		= 3,
-	.rd_max		= 120,
-	.s2div		= icst525_s2div,
-	.idx2s		= icst525_idx2s,
-};
-
-static const struct clk_icst_desc impd1_icst2_desc = {
-	.params = &impd1_vco2_params,
-	.vco_offset = IMPD1_OSC2,
-	.lock_offset = IMPD1_LOCK,
-};
-
-static int integrator_impd1_clk_spawn(struct device *dev,
-				      struct device_node *parent,
-				      struct device_node *np)
+/**
+ * integrator_impd1_clk_init() - set up the integrator clock tree
+ * @base: base address of the logic module (LM)
+ * @id: the ID of this LM
+ */
+void integrator_impd1_clk_init(void __iomem *base, unsigned int id)
 {
-	struct regmap *map;
-	struct clk *clk = ERR_PTR(-EINVAL);
-	const char *name = np->name;
-	const char *parent_name;
-	const struct clk_icst_desc *desc;
-	int ret;
+	struct impd1_clk *imc;
+	struct clk *clk;
+	int i;
 
-	map = syscon_node_to_regmap(parent);
-	if (IS_ERR(map)) {
-		pr_err("no regmap for syscon IM-PD1 ICST clock parent\n");
-		return PTR_ERR(map);
+	if (id > 3) {
+		pr_crit("no more than 4 LMs can be attached\n");
+		return;
 	}
+	imc = &impd1_clks[id];
 
-	if (of_device_is_compatible(np, "arm,impd1-vco1")) {
-		desc = &impd1_icst1_desc;
-	} else if (of_device_is_compatible(np, "arm,impd1-vco2")) {
-		desc = &impd1_icst2_desc;
-	} else {
-		dev_err(dev, "not a clock node %s\n", name);
-		return -ENODEV;
-	}
+	clk = icst_clk_register(NULL, &impd1_icst1_desc, base);
+	imc->vcoclk = clk;
+	imc->clks[0] = clkdev_alloc(clk, NULL, "lm%x:01000", id);
 
-	of_property_read_string(np, "clock-output-names", &name);
-	parent_name = of_clk_get_parent_name(np, 0);
-	clk = icst_clk_setup(NULL, desc, name, parent_name, map,
-			     ICST_INTEGRATOR_IM_PD1);
-	if (!IS_ERR(clk)) {
-		of_clk_add_provider(np, of_clk_src_simple_get, clk);
-		ret = 0;
-	} else {
-		dev_err(dev, "error setting up IM-PD1 ICST clock\n");
-		ret = PTR_ERR(clk);
-	}
+	/* UART reference clock */
+	clk = clk_register_fixed_rate(NULL, "uartclk", NULL, CLK_IS_ROOT,
+				14745600);
+	imc->uartclk = clk;
+	imc->clks[1] = clkdev_alloc(clk, NULL, "lm%x:00100", id);
+	imc->clks[2] = clkdev_alloc(clk, NULL, "lm%x:00200", id);
 
-	return ret;
+	for (i = 0; i < ARRAY_SIZE(imc->clks); i++)
+		clkdev_add(imc->clks[i]);
 }
 
-static int integrator_impd1_clk_probe(struct platform_device *pdev)
+void integrator_impd1_clk_exit(unsigned int id)
 {
-	struct device *dev = &pdev->dev;
-	struct device_node *np = dev->of_node;
-	struct device_node *child;
-	int ret = 0;
+	int i;
+	struct impd1_clk *imc;
 
-	for_each_available_child_of_node(np, child) {
-		ret = integrator_impd1_clk_spawn(dev, np, child);
-		if (ret) {
-			of_node_put(child);
-			break;
-		}
-	}
+	if (id > 3)
+		return;
+	imc = &impd1_clks[id];
 
-	return ret;
+	for (i = 0; i < ARRAY_SIZE(imc->clks); i++)
+		clkdev_drop(imc->clks[i]);
+	clk_unregister(imc->uartclk);
+	clk_unregister(imc->vcoclk);
 }
-
-static const struct of_device_id impd1_syscon_match[] = {
-	{ .compatible = "arm,im-pd1-syscon", },
-	{}
-};
-MODULE_DEVICE_TABLE(of, impd1_syscon_match);
-
-static struct platform_driver impd1_clk_driver = {
-	.driver = {
-		.name = "impd1-clk",
-		.of_match_table = impd1_syscon_match,
-	},
-	.probe  = integrator_impd1_clk_probe,
-};
-builtin_platform_driver(impd1_clk_driver);
-
-MODULE_AUTHOR("Linus Walleij <linusw@kernel.org>");
-MODULE_DESCRIPTION("Arm IM-PD1 module clock driver");
-MODULE_LICENSE("GPL v2");

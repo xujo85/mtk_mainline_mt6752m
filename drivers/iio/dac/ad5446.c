@@ -1,8 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * AD5446 SPI DAC driver
  *
  * Copyright 2010 Analog Devices Inc.
+ *
+ * Licensed under the GPL-2 or later.
  */
 
 #include <linux/interrupt.h>
@@ -17,12 +18,9 @@
 #include <linux/regulator/consumer.h>
 #include <linux/err.h>
 #include <linux/module.h>
-#include <linux/mod_devicetable.h>
 
 #include <linux/iio/iio.h>
 #include <linux/iio/sysfs.h>
-
-#include <asm/unaligned.h>
 
 #define MODE_PWRDWN_1k		0x1
 #define MODE_PWRDWN_100k	0x2
@@ -30,14 +28,10 @@
 
 /**
  * struct ad5446_state - driver instance specific data
- * @dev:		this device
+ * @spi:		spi_device
  * @chip_info:		chip model specific constants, available modes etc
  * @reg:		supply regulator
  * @vref_mv:		actual reference voltage used
- * @cached_val:		store/retrieve values during power down
- * @pwr_down_mode:	power down mode (1k, 100k or tristate)
- * @pwr_down:		true if the device is in power down
- * @lock:		lock to protect the data buffer during write ops
  */
 
 struct ad5446_state {
@@ -48,7 +42,6 @@ struct ad5446_state {
 	unsigned			cached_val;
 	unsigned			pwr_down_mode;
 	unsigned			pwr_down;
-	struct mutex			lock;
 };
 
 /**
@@ -100,7 +93,7 @@ static ssize_t ad5446_read_dac_powerdown(struct iio_dev *indio_dev,
 {
 	struct ad5446_state *st = iio_priv(indio_dev);
 
-	return sysfs_emit(buf, "%d\n", st->pwr_down);
+	return sprintf(buf, "%d\n", st->pwr_down);
 }
 
 static ssize_t ad5446_write_dac_powerdown(struct iio_dev *indio_dev,
@@ -114,11 +107,11 @@ static ssize_t ad5446_write_dac_powerdown(struct iio_dev *indio_dev,
 	bool powerdown;
 	int ret;
 
-	ret = kstrtobool(buf, &powerdown);
+	ret = strtobool(buf, &powerdown);
 	if (ret)
 		return ret;
 
-	mutex_lock(&st->lock);
+	mutex_lock(&indio_dev->mlock);
 	st->pwr_down = powerdown;
 
 	if (st->pwr_down) {
@@ -129,7 +122,7 @@ static ssize_t ad5446_write_dac_powerdown(struct iio_dev *indio_dev,
 	}
 
 	ret = st->chip_info->write(st, val);
-	mutex_unlock(&st->lock);
+	mutex_unlock(&indio_dev->mlock);
 
 	return ret ? ret : len;
 }
@@ -139,26 +132,20 @@ static const struct iio_chan_spec_ext_info ad5446_ext_info_powerdown[] = {
 		.name = "powerdown",
 		.read = ad5446_read_dac_powerdown,
 		.write = ad5446_write_dac_powerdown,
-		.shared = IIO_SEPARATE,
 	},
-	IIO_ENUM("powerdown_mode", IIO_SEPARATE, &ad5446_powerdown_mode_enum),
-	IIO_ENUM_AVAILABLE("powerdown_mode", IIO_SHARED_BY_TYPE, &ad5446_powerdown_mode_enum),
+	IIO_ENUM("powerdown_mode", false, &ad5446_powerdown_mode_enum),
+	IIO_ENUM_AVAILABLE("powerdown_mode", &ad5446_powerdown_mode_enum),
 	{ },
 };
 
-#define _AD5446_CHANNEL(bits, storage, _shift, ext) { \
+#define _AD5446_CHANNEL(bits, storage, shift, ext) { \
 	.type = IIO_VOLTAGE, \
 	.indexed = 1, \
 	.output = 1, \
 	.channel = 0, \
 	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW), \
 	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE), \
-	.scan_type = { \
-		.sign = 'u', \
-		.realbits = (bits), \
-		.storagebits = (storage), \
-		.shift = (_shift), \
-		}, \
+	.scan_type = IIO_ST('u', (bits), (storage), (shift)), \
 	.ext_info = (ext), \
 }
 
@@ -175,15 +162,18 @@ static int ad5446_read_raw(struct iio_dev *indio_dev,
 			   long m)
 {
 	struct ad5446_state *st = iio_priv(indio_dev);
+	unsigned long scale_uv;
 
 	switch (m) {
 	case IIO_CHAN_INFO_RAW:
-		*val = st->cached_val >> chan->scan_type.shift;
+		*val = st->cached_val;
 		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_SCALE:
-		*val = st->vref_mv;
-		*val2 = chan->scan_type.realbits;
-		return IIO_VAL_FRACTIONAL_LOG2;
+		scale_uv = (st->vref_mv * 1000) >> chan->scan_type.realbits;
+		*val =  scale_uv / 1000;
+		*val2 = (scale_uv % 1000) * 1000;
+		return IIO_VAL_INT_PLUS_MICRO;
+
 	}
 	return -EINVAL;
 }
@@ -203,11 +193,11 @@ static int ad5446_write_raw(struct iio_dev *indio_dev,
 			return -EINVAL;
 
 		val <<= chan->scan_type.shift;
-		mutex_lock(&st->lock);
+		mutex_lock(&indio_dev->mlock);
 		st->cached_val = val;
 		if (!st->pwr_down)
 			ret = st->chip_info->write(st, val);
-		mutex_unlock(&st->lock);
+		mutex_unlock(&indio_dev->mlock);
 		break;
 	default:
 		ret = -EINVAL;
@@ -219,6 +209,7 @@ static int ad5446_write_raw(struct iio_dev *indio_dev,
 static const struct iio_info ad5446_info = {
 	.read_raw = ad5446_read_raw,
 	.write_raw = ad5446_write_raw,
+	.driver_module = THIS_MODULE,
 };
 
 static int ad5446_probe(struct device *dev, const char *name,
@@ -229,11 +220,11 @@ static int ad5446_probe(struct device *dev, const char *name,
 	struct regulator *reg;
 	int ret, voltage_uv = 0;
 
-	reg = devm_regulator_get(dev, "vcc");
+	reg = regulator_get(dev, "vcc");
 	if (!IS_ERR(reg)) {
 		ret = regulator_enable(reg);
 		if (ret)
-			return ret;
+			goto error_put_reg;
 
 		ret = regulator_get_voltage(reg);
 		if (ret < 0)
@@ -242,7 +233,7 @@ static int ad5446_probe(struct device *dev, const char *name,
 		voltage_uv = ret;
 	}
 
-	indio_dev = devm_iio_device_alloc(dev, sizeof(*st));
+	indio_dev = iio_device_alloc(sizeof(*st));
 	if (indio_dev == NULL) {
 		ret = -ENOMEM;
 		goto error_disable_reg;
@@ -254,13 +245,13 @@ static int ad5446_probe(struct device *dev, const char *name,
 	st->reg = reg;
 	st->dev = dev;
 
+	/* Establish that the iio_dev is a child of the device */
+	indio_dev->dev.parent = dev;
 	indio_dev->name = name;
 	indio_dev->info = &ad5446_info;
 	indio_dev->modes = INDIO_DIRECT_MODE;
 	indio_dev->channels = &st->chip_info->channel;
 	indio_dev->num_channels = 1;
-
-	mutex_init(&st->lock);
 
 	st->pwr_down_mode = MODE_PWRDWN_1k;
 
@@ -273,24 +264,35 @@ static int ad5446_probe(struct device *dev, const char *name,
 
 	ret = iio_device_register(indio_dev);
 	if (ret)
-		goto error_disable_reg;
+		goto error_free_device;
 
 	return 0;
 
+error_free_device:
+	iio_device_free(indio_dev);
 error_disable_reg:
 	if (!IS_ERR(reg))
 		regulator_disable(reg);
+error_put_reg:
+	if (!IS_ERR(reg))
+		regulator_put(reg);
+
 	return ret;
 }
 
-static void ad5446_remove(struct device *dev)
+static int ad5446_remove(struct device *dev)
 {
 	struct iio_dev *indio_dev = dev_get_drvdata(dev);
 	struct ad5446_state *st = iio_priv(indio_dev);
 
 	iio_device_unregister(indio_dev);
-	if (!IS_ERR(st->reg))
+	if (!IS_ERR(st->reg)) {
 		regulator_disable(st->reg);
+		regulator_put(st->reg);
+	}
+	iio_device_free(indio_dev);
+
+	return 0;
 }
 
 #if IS_ENABLED(CONFIG_SPI_MASTER)
@@ -308,12 +310,14 @@ static int ad5660_write(struct ad5446_state *st, unsigned val)
 	struct spi_device *spi = to_spi_device(st->dev);
 	uint8_t data[3];
 
-	put_unaligned_be24(val, &data[0]);
+	data[0] = (val >> 16) & 0xFF;
+	data[1] = (val >> 8) & 0xFF;
+	data[2] = val & 0xFF;
 
 	return spi_write(spi, data, sizeof(data));
 }
 
-/*
+/**
  * ad5446_supported_spi_device_ids:
  * The AD5620/40/60 parts are available in different fixed internal reference
  * voltage options. The actual part numbers may look differently
@@ -331,11 +335,9 @@ enum ad5446_supported_spi_device_ids {
 	ID_AD5541A,
 	ID_AD5512A,
 	ID_AD5553,
-	ID_AD5600,
 	ID_AD5601,
 	ID_AD5611,
 	ID_AD5621,
-	ID_AD5641,
 	ID_AD5620_2500,
 	ID_AD5620_1250,
 	ID_AD5640_2500,
@@ -386,10 +388,6 @@ static const struct ad5446_chip_info ad5446_spi_chip_info[] = {
 		.channel = AD5446_CHANNEL(14, 16, 0),
 		.write = ad5446_write,
 	},
-	[ID_AD5600] = {
-		.channel = AD5446_CHANNEL(16, 16, 0),
-		.write = ad5446_write,
-	},
 	[ID_AD5601] = {
 		.channel = AD5446_CHANNEL_POWERDOWN(8, 16, 6),
 		.write = ad5446_write,
@@ -400,10 +398,6 @@ static const struct ad5446_chip_info ad5446_spi_chip_info[] = {
 	},
 	[ID_AD5621] = {
 		.channel = AD5446_CHANNEL_POWERDOWN(12, 16, 2),
-		.write = ad5446_write,
-	},
-	[ID_AD5641] = {
-		.channel = AD5446_CHANNEL_POWERDOWN(14, 16, 0),
 		.write = ad5446_write,
 	},
 	[ID_AD5620_2500] = {
@@ -457,11 +451,9 @@ static const struct spi_device_id ad5446_spi_ids[] = {
 	{"ad5542a", ID_AD5541A}, /* ad5541a and ad5542a are compatible */
 	{"ad5543", ID_AD5541A}, /* ad5541a and ad5543 are compatible */
 	{"ad5553", ID_AD5553},
-	{"ad5600", ID_AD5600},
 	{"ad5601", ID_AD5601},
 	{"ad5611", ID_AD5611},
 	{"ad5621", ID_AD5621},
-	{"ad5641", ID_AD5641},
 	{"ad5620-2500", ID_AD5620_2500}, /* AD5620/40/60: */
 	{"ad5620-1250", ID_AD5620_1250}, /* part numbers may look differently */
 	{"ad5640-2500", ID_AD5640_2500},
@@ -469,19 +461,9 @@ static const struct spi_device_id ad5446_spi_ids[] = {
 	{"ad5660-2500", ID_AD5660_2500},
 	{"ad5660-1250", ID_AD5660_1250},
 	{"ad5662", ID_AD5662},
-	{"dac081s101", ID_AD5300}, /* compatible Texas Instruments chips */
-	{"dac101s101", ID_AD5310},
-	{"dac121s101", ID_AD5320},
-	{"dac7512", ID_AD5320},
 	{}
 };
 MODULE_DEVICE_TABLE(spi, ad5446_spi_ids);
-
-static const struct of_device_id ad5446_of_ids[] = {
-	{ .compatible = "ti,dac7512" },
-	{ }
-};
-MODULE_DEVICE_TABLE(of, ad5446_of_ids);
 
 static int ad5446_spi_probe(struct spi_device *spi)
 {
@@ -491,15 +473,15 @@ static int ad5446_spi_probe(struct spi_device *spi)
 		&ad5446_spi_chip_info[id->driver_data]);
 }
 
-static void ad5446_spi_remove(struct spi_device *spi)
+static int ad5446_spi_remove(struct spi_device *spi)
 {
-	ad5446_remove(&spi->dev);
+	return ad5446_remove(&spi->dev);
 }
 
 static struct spi_driver ad5446_spi_driver = {
 	.driver = {
 		.name	= "ad5446",
-		.of_match_table = ad5446_of_ids,
+		.owner	= THIS_MODULE,
 	},
 	.probe		= ad5446_spi_probe,
 	.remove		= ad5446_spi_remove,
@@ -529,18 +511,11 @@ static int ad5622_write(struct ad5446_state *st, unsigned val)
 {
 	struct i2c_client *client = to_i2c_client(st->dev);
 	__be16 data = cpu_to_be16(val);
-	int ret;
 
-	ret = i2c_master_send(client, (char *)&data, sizeof(data));
-	if (ret < 0)
-		return ret;
-	if (ret != sizeof(data))
-		return -EIO;
-
-	return 0;
+	return i2c_master_send(client, (char *)&data, sizeof(data));
 }
 
-/*
+/**
  * ad5446_supported_i2c_device_ids:
  * The AD5620/40/60 parts are available in different fixed internal reference
  * voltage options. The actual part numbers may look differently
@@ -568,16 +543,16 @@ static const struct ad5446_chip_info ad5446_i2c_chip_info[] = {
 	},
 };
 
-static int ad5446_i2c_probe(struct i2c_client *i2c)
+static int ad5446_i2c_probe(struct i2c_client *i2c,
+			    const struct i2c_device_id *id)
 {
-	const struct i2c_device_id *id = i2c_client_get_device_id(i2c);
 	return ad5446_probe(&i2c->dev, id->name,
 		&ad5446_i2c_chip_info[id->driver_data]);
 }
 
-static void ad5446_i2c_remove(struct i2c_client *i2c)
+static int ad5446_i2c_remove(struct i2c_client *i2c)
 {
-	ad5446_remove(&i2c->dev);
+	return ad5446_remove(&i2c->dev);
 }
 
 static const struct i2c_device_id ad5446_i2c_ids[] = {
@@ -594,6 +569,7 @@ MODULE_DEVICE_TABLE(i2c, ad5446_i2c_ids);
 static struct i2c_driver ad5446_i2c_driver = {
 	.driver = {
 		   .name = "ad5446",
+		   .owner = THIS_MODULE,
 	},
 	.probe = ad5446_i2c_probe,
 	.remove = ad5446_i2c_remove,
@@ -642,6 +618,6 @@ static void __exit ad5446_exit(void)
 }
 module_exit(ad5446_exit);
 
-MODULE_AUTHOR("Michael Hennerich <michael.hennerich@analog.com>");
+MODULE_AUTHOR("Michael Hennerich <hennerich@blackfin.uclinux.org>");
 MODULE_DESCRIPTION("Analog Devices AD5444/AD5446 DAC");
 MODULE_LICENSE("GPL v2");

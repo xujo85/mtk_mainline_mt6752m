@@ -1,6 +1,19 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Copyright (c) International Business Machines Corp., 2006
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+ * the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
  *
  * Author: Artem Bityutskiy (Битюцкий Артём), Joern Engel
  */
@@ -86,6 +99,9 @@ static int gluebi_get_device(struct mtd_info *mtd)
 	struct gluebi_device *gluebi;
 	int ubi_mode = UBI_READONLY;
 
+	if (!try_module_get(THIS_MODULE))
+		return -ENODEV;
+
 	if (mtd->flags & MTD_WRITEABLE)
 		ubi_mode = UBI_READWRITE;
 
@@ -96,8 +112,8 @@ static int gluebi_get_device(struct mtd_info *mtd)
 		 * The MTD device is already referenced and this is just one
 		 * more reference. MTD allows many users to open the same
 		 * volume simultaneously and do not distinguish between
-		 * readers/writers/exclusive/meta openers as UBI does. So we do
-		 * not open the UBI volume again - just increase the reference
+		 * readers/writers/exclusive openers as UBI does. So we do not
+		 * open the UBI volume again - just increase the reference
 		 * counter and return.
 		 */
 		gluebi->refcnt += 1;
@@ -113,6 +129,7 @@ static int gluebi_get_device(struct mtd_info *mtd)
 				       ubi_mode);
 	if (IS_ERR(gluebi->desc)) {
 		mutex_unlock(&devices_mutex);
+		module_put(THIS_MODULE);
 		return PTR_ERR(gluebi->desc);
 	}
 	gluebi->refcnt += 1;
@@ -136,6 +153,7 @@ static void gluebi_put_device(struct mtd_info *mtd)
 	gluebi->refcnt -= 1;
 	if (gluebi->refcnt == 0)
 		ubi_close_volume(gluebi->desc);
+	module_put(THIS_MODULE);
 	mutex_unlock(&devices_mutex);
 }
 
@@ -165,7 +183,8 @@ static int gluebi_read(struct mtd_info *mtd, loff_t from, size_t len,
 		if (to_read > bytes_left)
 			to_read = bytes_left;
 
-		err = ubi_read(gluebi->desc, lnum, buf, offs, to_read);
+		//err = ubi_read(gluebi->desc, lnum, buf, offs, to_read);
+		err = ubi_leb_read(gluebi->desc, lnum, buf, offs, to_read, 0);
 		if (err)
 			break;
 
@@ -209,6 +228,7 @@ static int gluebi_write(struct mtd_info *mtd, loff_t to, size_t len,
 		if (to_write > bytes_left)
 			to_write = bytes_left;
 
+		//err = ubi_write(gluebi->desc, lnum, buf, offs, to_write);
 		err = ubi_leb_write(gluebi->desc, lnum, buf, offs, to_write);
 		if (err)
 			break;
@@ -243,6 +263,13 @@ static int gluebi_erase(struct mtd_info *mtd, struct erase_info *instr)
 	count = mtd_div_by_eb(instr->len, mtd);
 	gluebi = container_of(mtd, struct gluebi_device, mtd);
 
+#ifdef CONFIG_MTK_HIBERNATION
+	for (i = 0; i < count; i++) {
+		err = ubi_leb_unmap(gluebi->desc, lnum + i);
+		if (err)
+			goto out_err;
+	}
+#else
 	for (i = 0; i < count - 1; i++) {
 		err = ubi_leb_unmap(gluebi->desc, lnum + i);
 		if (err)
@@ -258,10 +285,14 @@ static int gluebi_erase(struct mtd_info *mtd, struct erase_info *instr)
 	err = ubi_leb_erase(gluebi->desc, lnum + i);
 	if (err)
 		goto out_err;
+#endif
 
+	instr->state = MTD_ERASE_DONE;
+	mtd_erase_callback(instr);
 	return 0;
 
 out_err:
+	instr->state = MTD_ERASE_FAILED;
 	instr->fail_addr = (long long)lnum * mtd->erasesize;
 	return err;
 }
@@ -439,7 +470,7 @@ static int gluebi_resized(struct ubi_volume_info *vi)
  * gluebi_notify - UBI notification handler.
  * @nb: registered notifier block
  * @l: notification type
- * @ns_ptr: pointer to the &struct ubi_notification object
+ * @ptr: pointer to the &struct ubi_notification object
  */
 static int gluebi_notify(struct notifier_block *nb, unsigned long l,
 			 void *ns_ptr)

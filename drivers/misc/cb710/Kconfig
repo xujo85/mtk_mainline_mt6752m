@@ -1,7 +1,6 @@
-# SPDX-License-Identifier: GPL-2.0-only
 config CB710_CORE
 	tristate "ENE CB710/720 Flash memory card reader support"
-	depends on PCI
+	depends on PCI && GENERIC_HARDIRQS
 	help
 	  This option enables support for PCI ENE CB710/720 Flash memory card
 	  reader found in some laptops (ie. some versions of HP Compaq nx9500).
@@ -15,6 +14,7 @@ config CB710_CORE
 config CB710_DEBUG
 	bool "Enable driver debugging"
 	depends on CB710_CORE != n
+	default n
 	help
 	  This is an option for use by developers; most people should
 	  say N here.  This adds a lot of debugging output to dmesg.

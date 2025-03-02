@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  *    Lance ethernet driver for the MIPS processor based
  *      DECstation family
@@ -73,7 +72,7 @@
 #include <asm/dec/machtype.h>
 #include <asm/dec/system.h>
 
-static const char version[] =
+static char version[] =
 "declance.c: v0.011 by Linux MIPS DECstation task force\n";
 
 MODULE_AUTHOR("Linux MIPS DECstation task force");
@@ -261,7 +260,6 @@ struct lance_private {
 	unsigned short busmaster_regval;
 
 	struct timer_list       multicast_timer;
-	struct net_device	*dev;
 
 	/* Pointers to the ring buffers as seen from the CPU */
 	char *rx_buf_ptr_cpu[RX_RING_SIZE];
@@ -346,8 +344,8 @@ static void cp_to_buf(const int type, void *to, const void *from, int len)
 		}
 
 		clen = len & 1;
-		rtp = (unsigned char *)tp;
-		rfp = (const unsigned char *)fp;
+		rtp = tp;
+		rfp = fp;
 		while (clen--) {
 			*rtp++ = *rfp++;
 		}
@@ -374,8 +372,8 @@ static void cp_to_buf(const int type, void *to, const void *from, int len)
 		 * do the rest, if any.
 		 */
 		clen = len & 15;
-		rtp = (unsigned char *)tp;
-		rfp = (const unsigned char *)fp;
+		rtp = (unsigned char *) tp;
+		rfp = (unsigned char *) fp;
 		while (clen--) {
 			*rtp++ = *rfp++;
 		}
@@ -405,8 +403,8 @@ static void cp_from_buf(const int type, void *to, const void *from, int len)
 
 		clen = len & 1;
 
-		rtp = (unsigned char *)tp;
-		rfp = (const unsigned char *)fp;
+		rtp = tp;
+		rfp = fp;
 
 		while (clen--) {
 			*rtp++ = *rfp++;
@@ -435,8 +433,8 @@ static void cp_from_buf(const int type, void *to, const void *from, int len)
 		 * do the rest, if any.
 		 */
 		clen = len & 15;
-		rtp = (unsigned char *)tp;
-		rfp = (const unsigned char *)fp;
+		rtp = (unsigned char *) tp;
+		rfp = (unsigned char *) fp;
 		while (clen--) {
 			*rtp++ = *rfp++;
 		}
@@ -477,7 +475,7 @@ static void lance_init_ring(struct net_device *dev)
 	*lib_ptr(ib, rx_ptr, lp->type) = leptr;
 	if (ZERO)
 		printk("RX ptr: %8.8x(%8.8x)\n",
-		       leptr, (uint)lib_off(brx_ring, lp->type));
+		       leptr, lib_off(brx_ring, lp->type));
 
 	/* Setup tx descriptor pointer */
 	leptr = offsetof(struct lance_init_block, btx_ring);
@@ -486,7 +484,7 @@ static void lance_init_ring(struct net_device *dev)
 	*lib_ptr(ib, tx_ptr, lp->type) = leptr;
 	if (ZERO)
 		printk("TX ptr: %8.8x(%8.8x)\n",
-		       leptr, (uint)lib_off(btx_ring, lp->type));
+		       leptr, lib_off(btx_ring, lp->type));
 
 	if (ZERO)
 		printk("TX rings:\n");
@@ -501,8 +499,8 @@ static void lance_init_ring(struct net_device *dev)
 						/* The ones required by tmd2 */
 		*lib_ptr(ib, btx_ring[i].misc, lp->type) = 0;
 		if (i < 3 && ZERO)
-			printk("%d: %8.8x(%p)\n",
-			       i, leptr, lp->tx_buf_ptr_cpu[i]);
+			printk("%d: 0x%8.8x(0x%8.8x)\n",
+			       i, leptr, (uint)lp->tx_buf_ptr_cpu[i]);
 	}
 
 	/* Setup the Rx ring entries */
@@ -518,8 +516,8 @@ static void lance_init_ring(struct net_device *dev)
 							     0xf000;
 		*lib_ptr(ib, brx_ring[i].mblength, lp->type) = 0;
 		if (i < 3 && ZERO)
-			printk("%d: %8.8x(%p)\n",
-			       i, leptr, lp->rx_buf_ptr_cpu[i]);
+			printk("%d: 0x%8.8x(0x%8.8x)\n",
+			       i, leptr, (uint)lp->rx_buf_ptr_cpu[i]);
 	}
 	iob();
 }
@@ -608,7 +606,7 @@ static int lance_rx(struct net_device *dev)
 			len = (*rds_ptr(rd, mblength, lp->type) & 0xfff) - 4;
 			skb = netdev_alloc_skb(dev, len + 2);
 
-			if (!skb) {
+			if (skb == 0) {
 				dev->stats.rx_dropped++;
 				*rds_ptr(rd, mblength, lp->type) = 0;
 				*rds_ptr(rd, rmd1, lp->type) =
@@ -813,7 +811,7 @@ static int lance_open(struct net_device *dev)
 	if (lp->dma_irq >= 0) {
 		unsigned long flags;
 
-		if (request_irq(lp->dma_irq, lance_dma_merr_int, IRQF_ONESHOT,
+		if (request_irq(lp->dma_irq, lance_dma_merr_int, 0,
 				"lance error", dev)) {
 			free_irq(dev->irq, dev);
 			printk("%s: Can't get DMA IRQ %d\n", dev->name,
@@ -879,12 +877,12 @@ static inline int lance_reset(struct net_device *dev)
 
 	lance_init_ring(dev);
 	load_csrs(lp);
-	netif_trans_update(dev); /* prevent tx timeout */
+	dev->trans_start = jiffies; /* prevent tx timeout */
 	status = init_restart_lance(lp);
 	return status;
 }
 
-static void lance_tx_timeout(struct net_device *dev, unsigned int txqueue)
+static void lance_tx_timeout(struct net_device *dev)
 {
 	struct lance_private *lp = netdev_priv(dev);
 	volatile struct lance_regs *ll = lp->ll;
@@ -895,7 +893,7 @@ static void lance_tx_timeout(struct net_device *dev, unsigned int txqueue)
 	netif_wake_queue(dev);
 }
 
-static netdev_tx_t lance_start_xmit(struct sk_buff *skb, struct net_device *dev)
+static int lance_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct lance_private *lp = netdev_priv(dev);
 	volatile struct lance_regs *ll = lp->ll;
@@ -937,7 +935,7 @@ static netdev_tx_t lance_start_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	dev_kfree_skb(skb);
 
-	return NETDEV_TX_OK;
+ 	return NETDEV_TX_OK;
 }
 
 static void lance_load_multicast(struct net_device *dev)
@@ -1002,10 +1000,9 @@ static void lance_set_multicast(struct net_device *dev)
 	netif_wake_queue(dev);
 }
 
-static void lance_set_multicast_retry(struct timer_list *t)
+static void lance_set_multicast_retry(unsigned long _opaque)
 {
-	struct lance_private *lp = from_timer(lp, t, multicast_timer);
-	struct net_device *dev = lp->dev;
+	struct net_device *dev = (struct net_device *) _opaque;
 
 	lance_set_multicast(dev);
 }
@@ -1016,6 +1013,7 @@ static const struct net_device_ops lance_netdev_ops = {
 	.ndo_start_xmit		= lance_start_xmit,
 	.ndo_tx_timeout		= lance_tx_timeout,
 	.ndo_set_rx_mode	= lance_set_multicast,
+	.ndo_change_mtu		= eth_change_mtu,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_mac_address	= eth_mac_addr,
 };
@@ -1032,8 +1030,6 @@ static int dec_lance_probe(struct device *bdev, const int type)
 	int i, ret;
 	unsigned long esar_base;
 	unsigned char *esar;
-	u8 addr[ETH_ALEN];
-	const char *desc;
 
 	if (dec_lance_debug && version_printed++ == 0)
 		printk(version);
@@ -1219,21 +1215,19 @@ static int dec_lance_probe(struct device *bdev, const int type)
 	 */
 	switch (type) {
 	case ASIC_LANCE:
-		desc = "IOASIC onboard LANCE";
+		printk("%s: IOASIC onboard LANCE", name);
 		break;
 	case PMAD_LANCE:
-		desc = "PMAD-AA";
+		printk("%s: PMAD-AA", name);
 		break;
 	case PMAX_LANCE:
-		desc = "PMAX onboard LANCE";
+		printk("%s: PMAX onboard LANCE", name);
 		break;
 	}
 	for (i = 0; i < 6; i++)
-		addr[i] = esar[i * 4];
-	eth_hw_addr_set(dev, addr);
+		dev->dev_addr[i] = esar[i * 4];
 
-	printk("%s: %s, addr = %pM, irq = %d\n",
-	       name, desc, dev->dev_addr, dev->irq);
+	printk(", addr = %pM, irq = %d\n", dev->dev_addr, dev->irq);
 
 	dev->netdev_ops = &lance_netdev_ops;
 	dev->watchdog_timeo = 5*HZ;
@@ -1253,9 +1247,9 @@ static int dec_lance_probe(struct device *bdev, const int type)
 	 * can occur from interrupts (ex. IPv6).  So we
 	 * use a timer to try again later when necessary. -DaveM
 	 */
-	lp->dev = dev;
-	timer_setup(&lp->multicast_timer, lance_set_multicast_retry, 0);
-
+	init_timer(&lp->multicast_timer);
+	lp->multicast_timer.data = (unsigned long) dev;
+	lp->multicast_timer.function = lance_set_multicast_retry;
 
 	ret = register_netdev(dev);
 	if (ret) {
@@ -1281,6 +1275,18 @@ err_out_dev:
 
 err_out:
 	return ret;
+}
+
+static void __exit dec_lance_remove(struct device *bdev)
+{
+	struct net_device *dev = dev_get_drvdata(bdev);
+	resource_size_t start, len;
+
+	unregister_netdev(dev);
+	start = to_tc_dev(bdev)->resource.start;
+	len = to_tc_dev(bdev)->resource.end - start + 1;
+	release_mem_region(start, len);
+	free_netdev(dev);
 }
 
 /* Find all the lance cards on the system and initialize them */
@@ -1315,7 +1321,7 @@ static void __exit dec_lance_platform_remove(void)
 
 #ifdef CONFIG_TC
 static int dec_lance_tc_probe(struct device *dev);
-static int dec_lance_tc_remove(struct device *dev);
+static int __exit dec_lance_tc_remove(struct device *dev);
 
 static const struct tc_device_id dec_lance_tc_table[] = {
 	{ "DEC     ", "PMAD-AA " },
@@ -1329,7 +1335,7 @@ static struct tc_driver dec_lance_tc_driver = {
 		.name	= "declance",
 		.bus	= &tc_bus_type,
 		.probe	= dec_lance_tc_probe,
-		.remove	= dec_lance_tc_remove,
+		.remove	= __exit_p(dec_lance_tc_remove),
 	},
 };
 
@@ -1341,19 +1347,7 @@ static int dec_lance_tc_probe(struct device *dev)
         return status;
 }
 
-static void dec_lance_remove(struct device *bdev)
-{
-	struct net_device *dev = dev_get_drvdata(bdev);
-	resource_size_t start, len;
-
-	unregister_netdev(dev);
-	start = to_tc_dev(bdev)->resource.start;
-	len = to_tc_dev(bdev)->resource.end - start + 1;
-	release_mem_region(start, len);
-	free_netdev(dev);
-}
-
-static int dec_lance_tc_remove(struct device *dev)
+static int __exit dec_lance_tc_remove(struct device *dev)
 {
         put_device(dev);
         dec_lance_remove(dev);

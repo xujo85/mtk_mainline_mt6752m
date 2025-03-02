@@ -33,8 +33,12 @@ static void hp680bl_send_intensity(struct backlight_device *bd)
 {
 	unsigned long flags;
 	u16 v;
-	int intensity = backlight_get_brightness(bd);
+	int intensity = bd->props.brightness;
 
+	if (bd->props.power != FB_BLANK_UNBLANK)
+		intensity = 0;
+	if (bd->props.fb_blank != FB_BLANK_UNBLANK)
+		intensity = 0;
 	if (hp680bl_suspended)
 		intensity = 0;
 
@@ -106,8 +110,8 @@ static int hp680bl_probe(struct platform_device *pdev)
 	memset(&props, 0, sizeof(struct backlight_properties));
 	props.type = BACKLIGHT_RAW;
 	props.max_brightness = HP680_MAX_INTENSITY;
-	bd = devm_backlight_device_register(&pdev->dev, "hp680-bl", &pdev->dev,
-					NULL, &hp680bl_ops, &props);
+	bd = backlight_device_register("hp680-bl", &pdev->dev, NULL,
+				       &hp680bl_ops, &props);
 	if (IS_ERR(bd))
 		return PTR_ERR(bd);
 
@@ -119,18 +123,22 @@ static int hp680bl_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static void hp680bl_remove(struct platform_device *pdev)
+static int hp680bl_remove(struct platform_device *pdev)
 {
 	struct backlight_device *bd = platform_get_drvdata(pdev);
 
 	bd->props.brightness = 0;
 	bd->props.power = 0;
 	hp680bl_send_intensity(bd);
+
+	backlight_device_unregister(bd);
+
+	return 0;
 }
 
 static struct platform_driver hp680bl_driver = {
 	.probe		= hp680bl_probe,
-	.remove_new	= hp680bl_remove,
+	.remove		= hp680bl_remove,
 	.driver		= {
 		.name	= "hp680-bl",
 		.pm	= &hp680bl_pm_ops,

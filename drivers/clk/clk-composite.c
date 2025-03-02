@@ -1,12 +1,25 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (c) 2013 NVIDIA CORPORATION.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms and conditions of the GNU General Public License,
+ * version 2, as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <linux/clk.h>
 #include <linux/clk-provider.h>
-#include <linux/device.h>
 #include <linux/err.h>
 #include <linux/slab.h>
+
+#define to_clk_composite(_hw) container_of(_hw, struct clk_composite, hw)
 
 static u8 clk_composite_get_parent(struct clk_hw *hw)
 {
@@ -14,7 +27,7 @@ static u8 clk_composite_get_parent(struct clk_hw *hw)
 	const struct clk_ops *mux_ops = composite->mux_ops;
 	struct clk_hw *mux_hw = composite->mux_hw;
 
-	__clk_hw_set_clk(mux_hw, hw);
+	mux_hw->clk = hw->clk;
 
 	return mux_ops->get_parent(mux_hw);
 }
@@ -25,7 +38,7 @@ static int clk_composite_set_parent(struct clk_hw *hw, u8 index)
 	const struct clk_ops *mux_ops = composite->mux_ops;
 	struct clk_hw *mux_hw = composite->mux_hw;
 
-	__clk_hw_set_clk(mux_hw, hw);
+	mux_hw->clk = hw->clk;
 
 	return mux_ops->set_parent(mux_hw, index);
 }
@@ -37,117 +50,9 @@ static unsigned long clk_composite_recalc_rate(struct clk_hw *hw,
 	const struct clk_ops *rate_ops = composite->rate_ops;
 	struct clk_hw *rate_hw = composite->rate_hw;
 
-	__clk_hw_set_clk(rate_hw, hw);
+	rate_hw->clk = hw->clk;
 
 	return rate_ops->recalc_rate(rate_hw, parent_rate);
-}
-
-static int clk_composite_determine_rate_for_parent(struct clk_hw *rate_hw,
-						   struct clk_rate_request *req,
-						   struct clk_hw *parent_hw,
-						   const struct clk_ops *rate_ops)
-{
-	long rate;
-
-	req->best_parent_hw = parent_hw;
-	req->best_parent_rate = clk_hw_get_rate(parent_hw);
-
-	if (rate_ops->determine_rate)
-		return rate_ops->determine_rate(rate_hw, req);
-
-	rate = rate_ops->round_rate(rate_hw, req->rate,
-				    &req->best_parent_rate);
-	if (rate < 0)
-		return rate;
-
-	req->rate = rate;
-
-	return 0;
-}
-
-static int clk_composite_determine_rate(struct clk_hw *hw,
-					struct clk_rate_request *req)
-{
-	struct clk_composite *composite = to_clk_composite(hw);
-	const struct clk_ops *rate_ops = composite->rate_ops;
-	const struct clk_ops *mux_ops = composite->mux_ops;
-	struct clk_hw *rate_hw = composite->rate_hw;
-	struct clk_hw *mux_hw = composite->mux_hw;
-	struct clk_hw *parent;
-	unsigned long rate_diff;
-	unsigned long best_rate_diff = ULONG_MAX;
-	unsigned long best_rate = 0;
-	int i, ret;
-
-	if (rate_hw && rate_ops &&
-	    (rate_ops->determine_rate || rate_ops->round_rate) &&
-	    mux_hw && mux_ops && mux_ops->set_parent) {
-		req->best_parent_hw = NULL;
-
-		if (clk_hw_get_flags(hw) & CLK_SET_RATE_NO_REPARENT) {
-			struct clk_rate_request tmp_req;
-
-			parent = clk_hw_get_parent(mux_hw);
-
-			clk_hw_forward_rate_request(hw, req, parent, &tmp_req, req->rate);
-			ret = clk_composite_determine_rate_for_parent(rate_hw,
-								      &tmp_req,
-								      parent,
-								      rate_ops);
-			if (ret)
-				return ret;
-
-			req->rate = tmp_req.rate;
-			req->best_parent_hw = tmp_req.best_parent_hw;
-			req->best_parent_rate = tmp_req.best_parent_rate;
-
-			return 0;
-		}
-
-		for (i = 0; i < clk_hw_get_num_parents(mux_hw); i++) {
-			struct clk_rate_request tmp_req;
-
-			parent = clk_hw_get_parent_by_index(mux_hw, i);
-			if (!parent)
-				continue;
-
-			clk_hw_forward_rate_request(hw, req, parent, &tmp_req, req->rate);
-			ret = clk_composite_determine_rate_for_parent(rate_hw,
-								      &tmp_req,
-								      parent,
-								      rate_ops);
-			if (ret)
-				continue;
-
-			if (req->rate >= tmp_req.rate)
-				rate_diff = req->rate - tmp_req.rate;
-			else
-				rate_diff = tmp_req.rate - req->rate;
-
-			if (!rate_diff || !req->best_parent_hw
-				       || best_rate_diff > rate_diff) {
-				req->best_parent_hw = parent;
-				req->best_parent_rate = tmp_req.best_parent_rate;
-				best_rate_diff = rate_diff;
-				best_rate = tmp_req.rate;
-			}
-
-			if (!rate_diff)
-				return 0;
-		}
-
-		req->rate = best_rate;
-		return 0;
-	} else if (rate_hw && rate_ops && rate_ops->determine_rate) {
-		__clk_hw_set_clk(rate_hw, hw);
-		return rate_ops->determine_rate(rate_hw, req);
-	} else if (mux_hw && mux_ops && mux_ops->determine_rate) {
-		__clk_hw_set_clk(mux_hw, hw);
-		return mux_ops->determine_rate(mux_hw, req);
-	} else {
-		pr_err("clk: clk_composite_determine_rate function called, but no mux or rate callback set!\n");
-		return -EINVAL;
-	}
 }
 
 static long clk_composite_round_rate(struct clk_hw *hw, unsigned long rate,
@@ -157,7 +62,7 @@ static long clk_composite_round_rate(struct clk_hw *hw, unsigned long rate,
 	const struct clk_ops *rate_ops = composite->rate_ops;
 	struct clk_hw *rate_hw = composite->rate_hw;
 
-	__clk_hw_set_clk(rate_hw, hw);
+	rate_hw->clk = hw->clk;
 
 	return rate_ops->round_rate(rate_hw, rate, prate);
 }
@@ -169,36 +74,9 @@ static int clk_composite_set_rate(struct clk_hw *hw, unsigned long rate,
 	const struct clk_ops *rate_ops = composite->rate_ops;
 	struct clk_hw *rate_hw = composite->rate_hw;
 
-	__clk_hw_set_clk(rate_hw, hw);
+	rate_hw->clk = hw->clk;
 
 	return rate_ops->set_rate(rate_hw, rate, parent_rate);
-}
-
-static int clk_composite_set_rate_and_parent(struct clk_hw *hw,
-					     unsigned long rate,
-					     unsigned long parent_rate,
-					     u8 index)
-{
-	struct clk_composite *composite = to_clk_composite(hw);
-	const struct clk_ops *rate_ops = composite->rate_ops;
-	const struct clk_ops *mux_ops = composite->mux_ops;
-	struct clk_hw *rate_hw = composite->rate_hw;
-	struct clk_hw *mux_hw = composite->mux_hw;
-	unsigned long temp_rate;
-
-	__clk_hw_set_clk(rate_hw, hw);
-	__clk_hw_set_clk(mux_hw, hw);
-
-	temp_rate = rate_ops->recalc_rate(rate_hw, parent_rate);
-	if (temp_rate > rate) {
-		rate_ops->set_rate(rate_hw, rate, parent_rate);
-		mux_ops->set_parent(mux_hw, index);
-	} else {
-		mux_ops->set_parent(mux_hw, index);
-		rate_ops->set_rate(rate_hw, rate, parent_rate);
-	}
-
-	return 0;
 }
 
 static int clk_composite_is_enabled(struct clk_hw *hw)
@@ -207,7 +85,7 @@ static int clk_composite_is_enabled(struct clk_hw *hw)
 	const struct clk_ops *gate_ops = composite->gate_ops;
 	struct clk_hw *gate_hw = composite->gate_hw;
 
-	__clk_hw_set_clk(gate_hw, hw);
+	gate_hw->clk = hw->clk;
 
 	return gate_ops->is_enabled(gate_hw);
 }
@@ -218,7 +96,7 @@ static int clk_composite_enable(struct clk_hw *hw)
 	const struct clk_ops *gate_ops = composite->gate_ops;
 	struct clk_hw *gate_hw = composite->gate_hw;
 
-	__clk_hw_set_clk(gate_hw, hw);
+	gate_hw->clk = hw->clk;
 
 	return gate_ops->enable(gate_hw);
 }
@@ -229,93 +107,75 @@ static void clk_composite_disable(struct clk_hw *hw)
 	const struct clk_ops *gate_ops = composite->gate_ops;
 	struct clk_hw *gate_hw = composite->gate_hw;
 
-	__clk_hw_set_clk(gate_hw, hw);
+	gate_hw->clk = hw->clk;
 
 	gate_ops->disable(gate_hw);
 }
 
-static struct clk_hw *__clk_hw_register_composite(struct device *dev,
-			const char *name, const char * const *parent_names,
-			const struct clk_parent_data *pdata, int num_parents,
+struct clk *clk_register_composite(struct device *dev, const char *name,
+			const char **parent_names, int num_parents,
 			struct clk_hw *mux_hw, const struct clk_ops *mux_ops,
 			struct clk_hw *rate_hw, const struct clk_ops *rate_ops,
 			struct clk_hw *gate_hw, const struct clk_ops *gate_ops,
 			unsigned long flags)
 {
-	struct clk_hw *hw;
-	struct clk_init_data init = {};
+	struct clk *clk;
+	struct clk_init_data init;
 	struct clk_composite *composite;
 	struct clk_ops *clk_composite_ops;
-	int ret;
 
 	composite = kzalloc(sizeof(*composite), GFP_KERNEL);
-	if (!composite)
+	if (!composite) {
+		pr_err("%s: could not allocate composite clk\n", __func__);
 		return ERR_PTR(-ENOMEM);
+	}
 
 	init.name = name;
-	init.flags = flags;
-	if (parent_names)
-		init.parent_names = parent_names;
-	else
-		init.parent_data = pdata;
+	init.flags = flags | CLK_IS_BASIC;
+	init.parent_names = parent_names;
 	init.num_parents = num_parents;
-	hw = &composite->hw;
 
 	clk_composite_ops = &composite->ops;
 
 	if (mux_hw && mux_ops) {
-		if (!mux_ops->get_parent) {
-			hw = ERR_PTR(-EINVAL);
+		if (!mux_ops->get_parent || !mux_ops->set_parent) {
+			clk = ERR_PTR(-EINVAL);
 			goto err;
 		}
 
 		composite->mux_hw = mux_hw;
 		composite->mux_ops = mux_ops;
 		clk_composite_ops->get_parent = clk_composite_get_parent;
-		if (mux_ops->set_parent)
-			clk_composite_ops->set_parent = clk_composite_set_parent;
-		if (mux_ops->determine_rate)
-			clk_composite_ops->determine_rate = clk_composite_determine_rate;
+		clk_composite_ops->set_parent = clk_composite_set_parent;
 	}
 
 	if (rate_hw && rate_ops) {
 		if (!rate_ops->recalc_rate) {
-			hw = ERR_PTR(-EINVAL);
+			clk = ERR_PTR(-EINVAL);
 			goto err;
 		}
-		clk_composite_ops->recalc_rate = clk_composite_recalc_rate;
 
-		if (rate_ops->determine_rate)
-			clk_composite_ops->determine_rate =
-				clk_composite_determine_rate;
-		else if (rate_ops->round_rate)
-			clk_composite_ops->round_rate =
-				clk_composite_round_rate;
-
-		/* .set_rate requires either .round_rate or .determine_rate */
-		if (rate_ops->set_rate) {
-			if (rate_ops->determine_rate || rate_ops->round_rate)
-				clk_composite_ops->set_rate =
-						clk_composite_set_rate;
-			else
-				WARN(1, "%s: missing round_rate op is required\n",
-						__func__);
+		/* .round_rate is a prerequisite for .set_rate */
+		if (rate_ops->round_rate) {
+			clk_composite_ops->round_rate = clk_composite_round_rate;
+			if (rate_ops->set_rate) {
+				clk_composite_ops->set_rate = clk_composite_set_rate;
+			}
+		} else {
+			WARN(rate_ops->set_rate,
+				"%s: missing round_rate op is required\n",
+				__func__);
 		}
 
 		composite->rate_hw = rate_hw;
 		composite->rate_ops = rate_ops;
-	}
-
-	if (mux_hw && mux_ops && rate_hw && rate_ops) {
-		if (mux_ops->set_parent && rate_ops->set_rate)
-			clk_composite_ops->set_rate_and_parent =
-			clk_composite_set_rate_and_parent;
+		clk_composite_ops->recalc_rate = clk_composite_recalc_rate;
 	}
 
 	if (gate_hw && gate_ops) {
 		if (!gate_ops->is_enabled || !gate_ops->enable ||
 		    !gate_ops->disable) {
-			hw = ERR_PTR(-EINVAL);
+			clk = ERR_PTR(-EINVAL);
 			goto err;
 		}
 
@@ -329,164 +189,22 @@ static struct clk_hw *__clk_hw_register_composite(struct device *dev,
 	init.ops = clk_composite_ops;
 	composite->hw.init = &init;
 
-	ret = clk_hw_register(dev, hw);
-	if (ret) {
-		hw = ERR_PTR(ret);
+	clk = clk_register(dev, &composite->hw);
+	if (IS_ERR(clk))
 		goto err;
-	}
 
 	if (composite->mux_hw)
-		composite->mux_hw->clk = hw->clk;
+		composite->mux_hw->clk = clk;
 
 	if (composite->rate_hw)
-		composite->rate_hw->clk = hw->clk;
+		composite->rate_hw->clk = clk;
 
 	if (composite->gate_hw)
-		composite->gate_hw->clk = hw->clk;
+		composite->gate_hw->clk = clk;
 
-	return hw;
+	return clk;
 
 err:
 	kfree(composite);
-	return hw;
-}
-
-struct clk_hw *clk_hw_register_composite(struct device *dev, const char *name,
-			const char * const *parent_names, int num_parents,
-			struct clk_hw *mux_hw, const struct clk_ops *mux_ops,
-			struct clk_hw *rate_hw, const struct clk_ops *rate_ops,
-			struct clk_hw *gate_hw, const struct clk_ops *gate_ops,
-			unsigned long flags)
-{
-	return __clk_hw_register_composite(dev, name, parent_names, NULL,
-					   num_parents, mux_hw, mux_ops,
-					   rate_hw, rate_ops, gate_hw,
-					   gate_ops, flags);
-}
-EXPORT_SYMBOL_GPL(clk_hw_register_composite);
-
-struct clk_hw *clk_hw_register_composite_pdata(struct device *dev,
-			const char *name,
-			const struct clk_parent_data *parent_data,
-			int num_parents,
-			struct clk_hw *mux_hw, const struct clk_ops *mux_ops,
-			struct clk_hw *rate_hw, const struct clk_ops *rate_ops,
-			struct clk_hw *gate_hw, const struct clk_ops *gate_ops,
-			unsigned long flags)
-{
-	return __clk_hw_register_composite(dev, name, NULL, parent_data,
-					   num_parents, mux_hw, mux_ops,
-					   rate_hw, rate_ops, gate_hw,
-					   gate_ops, flags);
-}
-
-struct clk *clk_register_composite(struct device *dev, const char *name,
-			const char * const *parent_names, int num_parents,
-			struct clk_hw *mux_hw, const struct clk_ops *mux_ops,
-			struct clk_hw *rate_hw, const struct clk_ops *rate_ops,
-			struct clk_hw *gate_hw, const struct clk_ops *gate_ops,
-			unsigned long flags)
-{
-	struct clk_hw *hw;
-
-	hw = clk_hw_register_composite(dev, name, parent_names, num_parents,
-			mux_hw, mux_ops, rate_hw, rate_ops, gate_hw, gate_ops,
-			flags);
-	if (IS_ERR(hw))
-		return ERR_CAST(hw);
-	return hw->clk;
-}
-EXPORT_SYMBOL_GPL(clk_register_composite);
-
-struct clk *clk_register_composite_pdata(struct device *dev, const char *name,
-			const struct clk_parent_data *parent_data,
-			int num_parents,
-			struct clk_hw *mux_hw, const struct clk_ops *mux_ops,
-			struct clk_hw *rate_hw, const struct clk_ops *rate_ops,
-			struct clk_hw *gate_hw, const struct clk_ops *gate_ops,
-			unsigned long flags)
-{
-	struct clk_hw *hw;
-
-	hw = clk_hw_register_composite_pdata(dev, name, parent_data,
-			num_parents, mux_hw, mux_ops, rate_hw, rate_ops,
-			gate_hw, gate_ops, flags);
-	if (IS_ERR(hw))
-		return ERR_CAST(hw);
-	return hw->clk;
-}
-
-void clk_unregister_composite(struct clk *clk)
-{
-	struct clk_composite *composite;
-	struct clk_hw *hw;
-
-	hw = __clk_get_hw(clk);
-	if (!hw)
-		return;
-
-	composite = to_clk_composite(hw);
-
-	clk_unregister(clk);
-	kfree(composite);
-}
-
-void clk_hw_unregister_composite(struct clk_hw *hw)
-{
-	struct clk_composite *composite;
-
-	composite = to_clk_composite(hw);
-
-	clk_hw_unregister(hw);
-	kfree(composite);
-}
-EXPORT_SYMBOL_GPL(clk_hw_unregister_composite);
-
-static void devm_clk_hw_release_composite(struct device *dev, void *res)
-{
-	clk_hw_unregister_composite(*(struct clk_hw **)res);
-}
-
-static struct clk_hw *__devm_clk_hw_register_composite(struct device *dev,
-			const char *name, const char * const *parent_names,
-			const struct clk_parent_data *pdata, int num_parents,
-			struct clk_hw *mux_hw, const struct clk_ops *mux_ops,
-			struct clk_hw *rate_hw, const struct clk_ops *rate_ops,
-			struct clk_hw *gate_hw, const struct clk_ops *gate_ops,
-			unsigned long flags)
-{
-	struct clk_hw **ptr, *hw;
-
-	ptr = devres_alloc(devm_clk_hw_release_composite, sizeof(*ptr),
-			   GFP_KERNEL);
-	if (!ptr)
-		return ERR_PTR(-ENOMEM);
-
-	hw = __clk_hw_register_composite(dev, name, parent_names, pdata,
-					 num_parents, mux_hw, mux_ops, rate_hw,
-					 rate_ops, gate_hw, gate_ops, flags);
-
-	if (!IS_ERR(hw)) {
-		*ptr = hw;
-		devres_add(dev, ptr);
-	} else {
-		devres_free(ptr);
-	}
-
-	return hw;
-}
-
-struct clk_hw *devm_clk_hw_register_composite_pdata(struct device *dev,
-			const char *name,
-			const struct clk_parent_data *parent_data,
-			int num_parents,
-			struct clk_hw *mux_hw, const struct clk_ops *mux_ops,
-			struct clk_hw *rate_hw, const struct clk_ops *rate_ops,
-			struct clk_hw *gate_hw, const struct clk_ops *gate_ops,
-			unsigned long flags)
-{
-	return __devm_clk_hw_register_composite(dev, name, NULL, parent_data,
-						num_parents, mux_hw, mux_ops,
-						rate_hw, rate_ops, gate_hw,
-						gate_ops, flags);
+	return clk;
 }

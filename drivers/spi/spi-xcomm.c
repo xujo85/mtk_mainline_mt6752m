@@ -1,12 +1,14 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Analog Devices AD-FMCOMMS1-EBZ board I2C-SPI bridge driver
  *
  * Copyright 2012 Analog Devices Inc.
  * Author: Lars-Peter Clausen <lars@metafoo.de>
+ *
+ * Licensed under the GPL-2 or later.
  */
 
 #include <linux/kernel.h>
+#include <linux/init.h>
 #include <linux/module.h>
 #include <linux/delay.h>
 #include <linux/i2c.h>
@@ -58,7 +60,7 @@ static int spi_xcomm_sync_config(struct spi_xcomm *spi_xcomm, unsigned int len)
 static void spi_xcomm_chipselect(struct spi_xcomm *spi_xcomm,
 	struct spi_device *spi, int is_active)
 {
-	unsigned long cs = spi_get_chipselect(spi, 0);
+	unsigned long cs = spi->chip_select;
 	uint16_t chipselect = spi_xcomm->chipselect;
 
 	if (is_active)
@@ -72,13 +74,15 @@ static void spi_xcomm_chipselect(struct spi_xcomm *spi_xcomm,
 static int spi_xcomm_setup_transfer(struct spi_xcomm *spi_xcomm,
 	struct spi_device *spi, struct spi_transfer *t, unsigned int *settings)
 {
-	if (t->len > 62)
+	unsigned int speed;
+
+	if ((t->bits_per_word && t->bits_per_word != 8) || t->len > 62)
 		return -EINVAL;
 
-	if (t->speed_hz != spi_xcomm->current_speed) {
-		unsigned int divider;
+	speed = t->speed_hz ? t->speed_hz : spi->max_speed_hz;
 
-		divider = DIV_ROUND_UP(SPI_XCOMM_CLOCK, t->speed_hz);
+	if (speed != spi_xcomm->current_speed) {
+		unsigned int divider = DIV_ROUND_UP(SPI_XCOMM_CLOCK, speed);
 		if (divider >= 64)
 			*settings |= SPI_XCOMM_SETTINGS_CLOCK_DIV_64;
 		else if (divider >= 16)
@@ -86,7 +90,7 @@ static int spi_xcomm_setup_transfer(struct spi_xcomm *spi_xcomm,
 		else
 			*settings |= SPI_XCOMM_SETTINGS_CLOCK_DIV_4;
 
-		spi_xcomm->current_speed = t->speed_hz;
+		spi_xcomm->current_speed = speed;
 	}
 
 	if (spi->mode & SPI_CPOL)
@@ -144,6 +148,8 @@ static int spi_xcomm_transfer_one(struct spi_master *master,
 	int status = 0;
 	bool is_last;
 
+	is_first = true;
+
 	spi_xcomm_chipselect(spi_xcomm, spi, true);
 
 	list_for_each_entry(t, &msg->transfers, transfer_list) {
@@ -188,7 +194,8 @@ static int spi_xcomm_transfer_one(struct spi_master *master,
 		}
 		status = 0;
 
-		spi_transfer_delay_exec(t);
+		if (t->delay_usecs)
+			udelay(t->delay_usecs);
 
 		is_first = false;
 	}
@@ -202,7 +209,16 @@ static int spi_xcomm_transfer_one(struct spi_master *master,
 	return status;
 }
 
-static int spi_xcomm_probe(struct i2c_client *i2c)
+static int spi_xcomm_setup(struct spi_device *spi)
+{
+	if (spi->bits_per_word != 8)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int spi_xcomm_probe(struct i2c_client *i2c,
+	const struct i2c_device_id *id)
 {
 	struct spi_xcomm *spi_xcomm;
 	struct spi_master *master;
@@ -217,31 +233,41 @@ static int spi_xcomm_probe(struct i2c_client *i2c)
 
 	master->num_chipselect = 16;
 	master->mode_bits = SPI_CPHA | SPI_CPOL | SPI_3WIRE;
-	master->bits_per_word_mask = SPI_BPW_MASK(8);
 	master->flags = SPI_MASTER_HALF_DUPLEX;
+	master->setup = spi_xcomm_setup;
 	master->transfer_one_message = spi_xcomm_transfer_one;
 	master->dev.of_node = i2c->dev.of_node;
 	i2c_set_clientdata(i2c, master);
 
-	ret = devm_spi_register_master(&i2c->dev, master);
+	ret = spi_register_master(master);
 	if (ret < 0)
 		spi_master_put(master);
 
 	return ret;
 }
 
+static int spi_xcomm_remove(struct i2c_client *i2c)
+{
+	struct spi_master *master = i2c_get_clientdata(i2c);
+
+	spi_unregister_master(master);
+
+	return 0;
+}
+
 static const struct i2c_device_id spi_xcomm_ids[] = {
 	{ "spi-xcomm" },
 	{ },
 };
-MODULE_DEVICE_TABLE(i2c, spi_xcomm_ids);
 
 static struct i2c_driver spi_xcomm_driver = {
 	.driver = {
 		.name	= "spi-xcomm",
+		.owner	= THIS_MODULE,
 	},
 	.id_table	= spi_xcomm_ids,
 	.probe		= spi_xcomm_probe,
+	.remove		= spi_xcomm_remove,
 };
 module_i2c_driver(spi_xcomm_driver);
 

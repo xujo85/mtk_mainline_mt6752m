@@ -1,10 +1,13 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Driver for EETI eGalax Multiple Touch Controller
  *
  * Copyright (C) 2011 Freescale Semiconductor, Inc.
  *
  * based on max11801_ts.c
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  */
 
 /* EETI eGalax serial touch screen controller is a I2C based multiple
@@ -14,17 +17,18 @@
   - auto idle mode support
 */
 
-#include <linux/err.h>
 #include <linux/module.h>
+#include <linux/init.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
 #include <linux/input.h>
 #include <linux/irq.h>
-#include <linux/gpio/consumer.h>
+#include <linux/gpio.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/bitops.h>
 #include <linux/input/mt.h>
+#include <linux/of_gpio.h>
 
 /*
  * Mouse Mode: some panel may configure the controller to mouse mode,
@@ -119,26 +123,32 @@ static irqreturn_t egalax_ts_interrupt(int irq, void *dev_id)
 /* wake up controller by an falling edge of interrupt gpio.  */
 static int egalax_wake_up_device(struct i2c_client *client)
 {
-	struct gpio_desc *gpio;
+	struct device_node *np = client->dev.of_node;
+	int gpio;
 	int ret;
 
-	/* wake up controller via an falling edge on IRQ gpio. */
-	gpio = gpiod_get(&client->dev, "wakeup", GPIOD_OUT_HIGH);
-	ret = PTR_ERR_OR_ZERO(gpio);
-	if (ret) {
-		if (ret != -EPROBE_DEFER)
-			dev_err(&client->dev,
-				"failed to request wakeup gpio, cannot wake up controller: %d\n",
-				ret);
+	if (!np)
+		return -ENODEV;
+
+	gpio = of_get_named_gpio(np, "wakeup-gpios", 0);
+	if (!gpio_is_valid(gpio))
+		return -ENODEV;
+
+	ret = gpio_request(gpio, "egalax_irq");
+	if (ret < 0) {
+		dev_err(&client->dev,
+			"request gpio failed, cannot wake up controller: %d\n",
+			ret);
 		return ret;
 	}
 
-	/* release the line */
-	gpiod_set_value_cansleep(gpio, 0);
+	/* wake up controller via an falling edge on IRQ gpio. */
+	gpio_direction_output(gpio, 0);
+	gpio_set_value(gpio, 1);
 
-	/* controller should be woken up, return irq.  */
-	gpiod_direction_input(gpio);
-	gpiod_put(gpio);
+	/* controller should be waken up, return irq.  */
+	gpio_direction_input(gpio);
+	gpio_free(gpio);
 
 	return 0;
 }
@@ -155,22 +165,25 @@ static int egalax_firmware_version(struct i2c_client *client)
 	return 0;
 }
 
-static int egalax_ts_probe(struct i2c_client *client)
+static int egalax_ts_probe(struct i2c_client *client,
+				       const struct i2c_device_id *id)
 {
 	struct egalax_ts *ts;
 	struct input_dev *input_dev;
+	int ret;
 	int error;
 
-	ts = devm_kzalloc(&client->dev, sizeof(struct egalax_ts), GFP_KERNEL);
+	ts = kzalloc(sizeof(struct egalax_ts), GFP_KERNEL);
 	if (!ts) {
 		dev_err(&client->dev, "Failed to allocate memory\n");
 		return -ENOMEM;
 	}
 
-	input_dev = devm_input_allocate_device(&client->dev);
+	input_dev = input_allocate_device();
 	if (!input_dev) {
 		dev_err(&client->dev, "Failed to allocate memory\n");
-		return -ENOMEM;
+		error = -ENOMEM;
+		goto err_free_ts;
 	}
 
 	ts->client = client;
@@ -178,17 +191,21 @@ static int egalax_ts_probe(struct i2c_client *client)
 
 	/* controller may be in sleep, wake it up. */
 	error = egalax_wake_up_device(client);
-	if (error)
-		return error;
+	if (error) {
+		dev_err(&client->dev, "Failed to wake up the controller\n");
+		goto err_free_dev;
+	}
 
-	error = egalax_firmware_version(client);
-	if (error < 0) {
+	ret = egalax_firmware_version(client);
+	if (ret < 0) {
 		dev_err(&client->dev, "Failed to read firmware version\n");
-		return error;
+		error = -EIO;
+		goto err_free_dev;
 	}
 
 	input_dev->name = "EETI eGalax Touch Screen";
 	input_dev->id.bustype = BUS_I2C;
+	input_dev->dev.parent = &client->dev;
 
 	__set_bit(EV_ABS, input_dev->evbit);
 	__set_bit(EV_KEY, input_dev->evbit);
@@ -202,17 +219,41 @@ static int egalax_ts_probe(struct i2c_client *client)
 			     ABS_MT_POSITION_Y, 0, EGALAX_MAX_Y, 0, 0);
 	input_mt_init_slots(input_dev, MAX_SUPPORT_POINTS, 0);
 
-	error = devm_request_threaded_irq(&client->dev, client->irq,
-					  NULL, egalax_ts_interrupt,
-					  IRQF_ONESHOT, "egalax_ts", ts);
+	input_set_drvdata(input_dev, ts);
+
+	error = request_threaded_irq(client->irq, NULL, egalax_ts_interrupt,
+				     IRQF_TRIGGER_LOW | IRQF_ONESHOT,
+				     "egalax_ts", ts);
 	if (error < 0) {
 		dev_err(&client->dev, "Failed to register interrupt\n");
-		return error;
+		goto err_free_dev;
 	}
 
 	error = input_register_device(ts->input_dev);
 	if (error)
-		return error;
+		goto err_free_irq;
+
+	i2c_set_clientdata(client, ts);
+	return 0;
+
+err_free_irq:
+	free_irq(client->irq, ts);
+err_free_dev:
+	input_free_device(input_dev);
+err_free_ts:
+	kfree(ts);
+
+	return error;
+}
+
+static int egalax_ts_remove(struct i2c_client *client)
+{
+	struct egalax_ts *ts = i2c_get_clientdata(client);
+
+	free_irq(client->irq, ts);
+
+	input_unregister_device(ts->input_dev);
+	kfree(ts);
 
 	return 0;
 }
@@ -223,6 +264,7 @@ static const struct i2c_device_id egalax_ts_id[] = {
 };
 MODULE_DEVICE_TABLE(i2c, egalax_ts_id);
 
+#ifdef CONFIG_PM_SLEEP
 static int egalax_ts_suspend(struct device *dev)
 {
 	static const u8 suspend_cmd[MAX_I2C_DATA_LEN] = {
@@ -230,9 +272,6 @@ static int egalax_ts_suspend(struct device *dev)
 	};
 	struct i2c_client *client = to_i2c_client(dev);
 	int ret;
-
-	if (device_may_wakeup(dev))
-		return enable_irq_wake(client->irq);
 
 	ret = i2c_master_send(client, suspend_cmd, MAX_I2C_DATA_LEN);
 	return ret > 0 ? 0 : ret;
@@ -242,29 +281,27 @@ static int egalax_ts_resume(struct device *dev)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 
-	if (device_may_wakeup(dev))
-		return disable_irq_wake(client->irq);
-
 	return egalax_wake_up_device(client);
 }
+#endif
 
-static DEFINE_SIMPLE_DEV_PM_OPS(egalax_ts_pm_ops,
-				egalax_ts_suspend, egalax_ts_resume);
+static SIMPLE_DEV_PM_OPS(egalax_ts_pm_ops, egalax_ts_suspend, egalax_ts_resume);
 
-static const struct of_device_id egalax_ts_dt_ids[] = {
+static struct of_device_id egalax_ts_dt_ids[] = {
 	{ .compatible = "eeti,egalax_ts" },
 	{ /* sentinel */ }
 };
-MODULE_DEVICE_TABLE(of, egalax_ts_dt_ids);
 
 static struct i2c_driver egalax_ts_driver = {
 	.driver = {
 		.name	= "egalax_ts",
-		.pm	= pm_sleep_ptr(&egalax_ts_pm_ops),
-		.of_match_table	= egalax_ts_dt_ids,
+		.owner	= THIS_MODULE,
+		.pm	= &egalax_ts_pm_ops,
+		.of_match_table	= of_match_ptr(egalax_ts_dt_ids),
 	},
 	.id_table	= egalax_ts_id,
 	.probe		= egalax_ts_probe,
+	.remove		= egalax_ts_remove,
 };
 
 module_i2c_driver(egalax_ts_driver);

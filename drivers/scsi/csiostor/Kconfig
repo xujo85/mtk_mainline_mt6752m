@@ -1,8 +1,7 @@
-# SPDX-License-Identifier: GPL-2.0-only
 config SCSI_CHELSIO_FCOE
 	tristate "Chelsio Communications FCoE support"
 	depends on PCI && SCSI
-	depends on SCSI_FC_ATTRS
+	select SCSI_FC_ATTRS
 	select FW_LOADER
 	help
 	  This driver supports FCoE Offload functionality over

@@ -1,10 +1,15 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /* NXP PCF50633 Power Management Unit (PMU) driver
  *
  * (C) 2006-2008 by Openmoko, Inc.
  * Author: Harald Welte <laforge@openmoko.org>
  * 	   Balaji Rao <balajirrao@openmoko.org>
  * All rights reserved.
+ *
+ *  This program is free software; you can redistribute  it and/or modify it
+ *  under  the terms of  the GNU General  Public License as published by the
+ *  Free Software Foundation;  either version 2 of the  License, or (at your
+ *  option) any later version.
+ *
  */
 
 #include <linux/kernel.h>
@@ -77,8 +82,8 @@ int pcf50633_reg_clear_bits(struct pcf50633 *pcf, u8 reg, u8 val)
 EXPORT_SYMBOL_GPL(pcf50633_reg_clear_bits);
 
 /* sysfs attributes */
-static ssize_t dump_regs_show(struct device *dev,
-			      struct device_attribute *attr, char *buf)
+static ssize_t show_dump_regs(struct device *dev, struct device_attribute *attr,
+			    char *buf)
 {
 	struct pcf50633 *pcf = dev_get_drvdata(dev);
 	u8 dump[16];
@@ -101,15 +106,18 @@ static ssize_t dump_regs_show(struct device *dev,
 			} else
 				dump[n1] = pcf50633_reg_read(pcf, n + n1);
 
-		buf1 += sprintf(buf1, "%*ph\n", (int)sizeof(dump), dump);
+		hex_dump_to_buffer(dump, sizeof(dump), 16, 1, buf1, 128, 0);
+		buf1 += strlen(buf1);
+		*buf1++ = '\n';
+		*buf1 = '\0';
 	}
 
 	return buf1 - buf;
 }
-static DEVICE_ATTR_ADMIN_RO(dump_regs);
+static DEVICE_ATTR(dump_regs, 0400, show_dump_regs, NULL);
 
-static ssize_t resume_reason_show(struct device *dev,
-				  struct device_attribute *attr, char *buf)
+static ssize_t show_resume_reason(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
 	struct pcf50633 *pcf = dev_get_drvdata(dev);
 	int n;
@@ -123,7 +131,7 @@ static ssize_t resume_reason_show(struct device *dev,
 
 	return n;
 }
-static DEVICE_ATTR_ADMIN_RO(resume_reason);
+static DEVICE_ATTR(resume_reason, 0400, show_resume_reason, NULL);
 
 static struct attribute *pcf_sysfs_entries[] = {
 	&dev_attr_dump_regs.attr,
@@ -144,7 +152,7 @@ pcf50633_client_dev_register(struct pcf50633 *pcf, const char *name,
 
 	*pdev = platform_device_alloc(name, -1);
 	if (!*pdev) {
-		dev_err(pcf->dev, "Failed to allocate %s\n", name);
+		dev_err(pcf->dev, "Falied to allocate %s\n", name);
 		return;
 	}
 
@@ -158,17 +166,37 @@ pcf50633_client_dev_register(struct pcf50633 *pcf, const char *name,
 	}
 }
 
-static const struct regmap_config pcf50633_regmap_config = {
+#ifdef CONFIG_PM_SLEEP
+static int pcf50633_suspend(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct pcf50633 *pcf = i2c_get_clientdata(client);
+
+	return pcf50633_irq_suspend(pcf);
+}
+
+static int pcf50633_resume(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct pcf50633 *pcf = i2c_get_clientdata(client);
+
+	return pcf50633_irq_resume(pcf);
+}
+#endif
+
+static SIMPLE_DEV_PM_OPS(pcf50633_pm, pcf50633_suspend, pcf50633_resume);
+
+static struct regmap_config pcf50633_regmap_config = {
 	.reg_bits = 8,
 	.val_bits = 8,
 };
 
-static int pcf50633_probe(struct i2c_client *client)
+static int pcf50633_probe(struct i2c_client *client,
+				const struct i2c_device_id *ids)
 {
 	struct pcf50633 *pcf;
-	struct platform_device *pdev;
-	struct pcf50633_platform_data *pdata = dev_get_platdata(&client->dev);
-	int i, j, ret;
+	struct pcf50633_platform_data *pdata = client->dev.platform_data;
+	int i, ret;
 	int version, variant;
 
 	if (!client->irq) {
@@ -215,44 +243,38 @@ static int pcf50633_probe(struct i2c_client *client)
 
 
 	for (i = 0; i < PCF50633_NUM_REGULATORS; i++) {
-		pdev = platform_device_alloc("pcf50633-regulator", i);
+		struct platform_device *pdev;
+
+		pdev = platform_device_alloc("pcf50633-regltr", i);
 		if (!pdev) {
-			ret = -ENOMEM;
-			goto err2;
+			dev_err(pcf->dev, "Cannot create regulator %d\n", i);
+			continue;
 		}
 
 		pdev->dev.parent = pcf->dev;
-		ret = platform_device_add_data(pdev, &pdata->reg_init_data[i],
-					       sizeof(pdata->reg_init_data[i]));
-		if (ret)
-			goto err;
-
-		ret = platform_device_add(pdev);
-		if (ret)
-			goto err;
-
+		if (platform_device_add_data(pdev, &pdata->reg_init_data[i],
+					sizeof(pdata->reg_init_data[i])) < 0) {
+			platform_device_put(pdev);
+			dev_err(pcf->dev, "Out of memory for regulator parameters %d\n",
+									i);
+			continue;
+		}
 		pcf->regulator_pdev[i] = pdev;
+
+		platform_device_add(pdev);
 	}
 
 	ret = sysfs_create_group(&client->dev.kobj, &pcf_attr_group);
 	if (ret)
-		dev_warn(pcf->dev, "error creating sysfs entries\n");
+		dev_err(pcf->dev, "error creating sysfs entries\n");
 
 	if (pdata->probe_done)
 		pdata->probe_done(pcf);
 
 	return 0;
-
-err:
-	platform_device_put(pdev);
-err2:
-	for (j = 0; j < i; j++)
-		platform_device_put(pcf->regulator_pdev[j]);
-
-	return ret;
 }
 
-static void pcf50633_remove(struct i2c_client *client)
+static int pcf50633_remove(struct i2c_client *client)
 {
 	struct pcf50633 *pcf = i2c_get_clientdata(client);
 	int i;
@@ -268,6 +290,8 @@ static void pcf50633_remove(struct i2c_client *client)
 
 	for (i = 0; i < PCF50633_NUM_REGULATORS; i++)
 		platform_device_unregister(pcf->regulator_pdev[i]);
+
+	return 0;
 }
 
 static const struct i2c_device_id pcf50633_id_table[] = {
@@ -279,7 +303,7 @@ MODULE_DEVICE_TABLE(i2c, pcf50633_id_table);
 static struct i2c_driver pcf50633_driver = {
 	.driver = {
 		.name	= "pcf50633",
-		.pm	= pm_sleep_ptr(&pcf50633_pm),
+		.pm	= &pcf50633_pm,
 	},
 	.id_table = pcf50633_id_table,
 	.probe = pcf50633_probe,

@@ -11,8 +11,11 @@
 #include <linux/slab.h>
 #include <linux/ctype.h>
 
-#include "edac_pci.h"
+#include "edac_core.h"
 #include "edac_module.h"
+
+/* Turn off this whole feature if PCI is not configured */
+#ifdef CONFIG_PCI
 
 #define EDAC_PCI_SYMLINK	"device"
 
@@ -135,18 +138,17 @@ INSTANCE_ATTR(pe_count, S_IRUGO, instance_pe_count_show, NULL);
 INSTANCE_ATTR(npe_count, S_IRUGO, instance_npe_count_show, NULL);
 
 /* pci instance attributes */
-static struct attribute *pci_instance_attrs[] = {
-	&attr_instance_pe_count.attr,
-	&attr_instance_npe_count.attr,
+static struct instance_attribute *pci_instance_attr[] = {
+	&attr_instance_pe_count,
+	&attr_instance_npe_count,
 	NULL
 };
-ATTRIBUTE_GROUPS(pci_instance);
 
 /* the ktype for a pci instance */
 static struct kobj_type ktype_pci_instance = {
 	.release = edac_pci_instance_release,
 	.sysfs_ops = &pci_instance_ops,
-	.default_groups = pci_instance_groups,
+	.default_attrs = (struct attribute **)pci_instance_attr,
 };
 
 /*
@@ -293,16 +295,15 @@ EDAC_PCI_ATTR(pci_parity_count, S_IRUGO, edac_pci_int_show, NULL);
 EDAC_PCI_ATTR(pci_nonparity_count, S_IRUGO, edac_pci_int_show, NULL);
 
 /* Base Attributes of the memory ECC object */
-static struct attribute *edac_pci_attrs[] = {
-	&edac_pci_attr_check_pci_errors.attr,
-	&edac_pci_attr_edac_pci_log_pe.attr,
-	&edac_pci_attr_edac_pci_log_npe.attr,
-	&edac_pci_attr_edac_pci_panic_on_pe.attr,
-	&edac_pci_attr_pci_parity_count.attr,
-	&edac_pci_attr_pci_nonparity_count.attr,
+static struct edac_pci_dev_attribute *edac_pci_attr[] = {
+	&edac_pci_attr_check_pci_errors,
+	&edac_pci_attr_edac_pci_log_pe,
+	&edac_pci_attr_edac_pci_log_npe,
+	&edac_pci_attr_edac_pci_panic_on_pe,
+	&edac_pci_attr_pci_parity_count,
+	&edac_pci_attr_pci_nonparity_count,
 	NULL,
 };
-ATTRIBUTE_GROUPS(edac_pci);
 
 /*
  * edac_pci_release_main_kobj
@@ -329,17 +330,19 @@ static void edac_pci_release_main_kobj(struct kobject *kobj)
 static struct kobj_type ktype_edac_pci_main_kobj = {
 	.release = edac_pci_release_main_kobj,
 	.sysfs_ops = &edac_pci_sysfs_ops,
-	.default_groups = edac_pci_groups,
+	.default_attrs = (struct attribute **)edac_pci_attr,
 };
 
 /**
- * edac_pci_main_kobj_setup: Setup the sysfs for EDAC PCI attributes.
+ * edac_pci_main_kobj_setup()
+ *
+ *	setup the sysfs for EDAC PCI attributes
+ *	assumes edac_subsys has already been initialized
  */
 static int edac_pci_main_kobj_setup(void)
 {
-	int err = -ENODEV;
+	int err;
 	struct bus_type *edac_subsys;
-	struct device *dev_root;
 
 	edac_dbg(0, "\n");
 
@@ -351,6 +354,11 @@ static int edac_pci_main_kobj_setup(void)
 	 * controls and attributes
 	 */
 	edac_subsys = edac_get_sysfs_subsys();
+	if (edac_subsys == NULL) {
+		edac_dbg(1, "no edac_subsys\n");
+		err = -ENODEV;
+		goto decrement_count_fail;
+	}
 
 	/* Bump the reference count on this module to ensure the
 	 * modules isn't unloaded until we deconstruct the top
@@ -358,7 +366,8 @@ static int edac_pci_main_kobj_setup(void)
 	 */
 	if (!try_module_get(THIS_MODULE)) {
 		edac_dbg(1, "try_module_get() failed\n");
-		goto decrement_count_fail;
+		err = -ENODEV;
+		goto mod_get_fail;
 	}
 
 	edac_pci_top_main_kobj = kzalloc(sizeof(struct kobject), GFP_KERNEL);
@@ -369,13 +378,9 @@ static int edac_pci_main_kobj_setup(void)
 	}
 
 	/* Instanstiate the pci object */
-	dev_root = bus_get_dev_root(edac_subsys);
-	if (dev_root) {
-		err = kobject_init_and_add(edac_pci_top_main_kobj,
-					   &ktype_edac_pci_main_kobj,
-					   &dev_root->kobj, "pci");
-		put_device(dev_root);
-	}
+	err = kobject_init_and_add(edac_pci_top_main_kobj,
+				   &ktype_edac_pci_main_kobj,
+				   &edac_subsys->dev_root->kobj, "pci");
 	if (err) {
 		edac_dbg(1, "Failed to register '.../edac/pci'\n");
 		goto kobject_init_and_add_fail;
@@ -392,10 +397,13 @@ static int edac_pci_main_kobj_setup(void)
 
 	/* Error unwind statck */
 kobject_init_and_add_fail:
-	kobject_put(edac_pci_top_main_kobj);
+	kfree(edac_pci_top_main_kobj);
 
 kzalloc_fail:
 	module_put(THIS_MODULE);
+
+mod_get_fail:
+	edac_put_sysfs_subsys();
 
 decrement_count_fail:
 	/* if are on this error exit, nothing to tear down */
@@ -421,9 +429,16 @@ static void edac_pci_main_kobj_teardown(void)
 	if (atomic_dec_return(&edac_pci_sysfs_refcount) == 0) {
 		edac_dbg(0, "called kobject_put on main kobj\n");
 		kobject_put(edac_pci_top_main_kobj);
+		edac_put_sysfs_subsys();
 	}
 }
 
+/*
+ *
+ * edac_pci_create_sysfs
+ *
+ *	Create the controls/attributes for the specified EDAC PCI device
+ */
 int edac_pci_create_sysfs(struct edac_pci_ctl_info *pci)
 {
 	int err;
@@ -459,6 +474,11 @@ unregister_cleanup:
 	return err;
 }
 
+/*
+ * edac_pci_remove_sysfs
+ *
+ *	remove the controls and attributes for this EDAC PCI device
+ */
 void edac_pci_remove_sysfs(struct edac_pci_ctl_info *pci)
 {
 	edac_dbg(0, "index=%d\n", pci->pci_idx);
@@ -741,3 +761,5 @@ MODULE_PARM_DESC(check_pci_errors,
 module_param(edac_pci_panic_on_pe, int, 0644);
 MODULE_PARM_DESC(edac_pci_panic_on_pe,
 		 "Panic on PCI Bus Parity error: 0=off 1=on");
+
+#endif				/* CONFIG_PCI */

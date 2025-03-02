@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /* flash.c: Allow mmap access to the OBP Flash, for OBP updates.
  *
  * Copyright (C) 1997  Eddie C. Dost  (ecd@skynet.be)
@@ -10,13 +9,15 @@
 #include <linux/miscdevice.h>
 #include <linux/fcntl.h>
 #include <linux/poll.h>
+#include <linux/init.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/mm.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
 
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
+#include <asm/pgtable.h>
 #include <asm/io.h>
 #include <asm/upa.h>
 
@@ -29,6 +30,8 @@ static struct {
 	unsigned long write_size;	/* Size of write area */
 	unsigned long busy;		/* In use? */
 } flash;
+
+#define FLASH_MINOR	152
 
 static int
 flash_mmap(struct file *file, struct vm_area_struct *vma)
@@ -154,7 +157,7 @@ static const struct file_operations flash_fops = {
 	.release =	flash_release,
 };
 
-static struct miscdevice flash_dev = { SBUS_FLASH_MINOR, "flash", &flash_fops };
+static struct miscdevice flash_dev = { FLASH_MINOR, "flash", &flash_fops };
 
 static int flash_probe(struct platform_device *op)
 {
@@ -163,9 +166,9 @@ static int flash_probe(struct platform_device *op)
 
 	parent = dp->parent;
 
-	if (!of_node_name_eq(parent, "sbus") &&
-	    !of_node_name_eq(parent, "sbi") &&
-	    !of_node_name_eq(parent, "ebus"))
+	if (strcmp(parent->name, "sbus") &&
+	    strcmp(parent->name, "sbi") &&
+	    strcmp(parent->name, "ebus"))
 		return -ENODEV;
 
 	flash.read_base = op->resource[0].start;
@@ -179,8 +182,8 @@ static int flash_probe(struct platform_device *op)
 	}
 	flash.busy = 0;
 
-	printk(KERN_INFO "%pOF: OBP Flash, RD %lx[%lx] WR %lx[%lx]\n",
-	       op->dev.of_node,
+	printk(KERN_INFO "%s: OBP Flash, RD %lx[%lx] WR %lx[%lx]\n",
+	       op->dev.of_node->full_name,
 	       flash.read_base, flash.read_size,
 	       flash.write_base, flash.write_size);
 
@@ -205,6 +208,7 @@ MODULE_DEVICE_TABLE(of, flash_match);
 static struct platform_driver flash_driver = {
 	.driver = {
 		.name = "flash",
+		.owner = THIS_MODULE,
 		.of_match_table = flash_match,
 	},
 	.probe		= flash_probe,

@@ -1,8 +1,17 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Kirkwood thermal sensor driver
  *
  * Copyright (C) 2012 Nobuhiro Iwamatsu <iwamatsu@nigauri.org>
+ *
+ * This software is licensed under the terms of the GNU General Public
+ * License version 2, as published by the Free Software Foundation, and
+ * may be copied, distributed, and modified under those terms.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
  */
 #include <linux/device.h>
 #include <linux/err.h>
@@ -24,17 +33,20 @@ struct kirkwood_thermal_priv {
 };
 
 static int kirkwood_get_temp(struct thermal_zone_device *thermal,
-			  int *temp)
+			  unsigned long *temp)
 {
 	unsigned long reg;
-	struct kirkwood_thermal_priv *priv = thermal_zone_device_priv(thermal);
+	struct kirkwood_thermal_priv *priv = thermal->devdata;
 
 	reg = readl_relaxed(priv->sensor);
 
 	/* Valid check */
 	if (!((reg >> KIRKWOOD_THERMAL_VALID_OFFSET) &
-	    KIRKWOOD_THERMAL_VALID_MASK))
+	    KIRKWOOD_THERMAL_VALID_MASK)) {
+		dev_err(&thermal->device,
+			"Temperature sensor reading not valid\n");
 		return -EIO;
+	}
 
 	/*
 	 * Calculate temperature. According to Marvell internal
@@ -61,13 +73,19 @@ static int kirkwood_thermal_probe(struct platform_device *pdev)
 {
 	struct thermal_zone_device *thermal = NULL;
 	struct kirkwood_thermal_priv *priv;
-	int ret;
+	struct resource *res;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res) {
+		dev_err(&pdev->dev, "Failed to get platform resource\n");
+		return -ENODEV;
+	}
 
 	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
 
-	priv->sensor = devm_platform_get_and_ioremap_resource(pdev, 0, NULL);
+	priv->sensor = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(priv->sensor))
 		return PTR_ERR(priv->sensor);
 
@@ -77,12 +95,6 @@ static int kirkwood_thermal_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev,
 			"Failed to register thermal zone device\n");
 		return PTR_ERR(thermal);
-	}
-	ret = thermal_zone_device_enable(thermal);
-	if (ret) {
-		thermal_zone_device_unregister(thermal);
-		dev_err(&pdev->dev, "Failed to enable thermal zone device\n");
-		return ret;
 	}
 
 	platform_set_drvdata(pdev, thermal);
@@ -96,6 +108,7 @@ static int kirkwood_thermal_exit(struct platform_device *pdev)
 		platform_get_drvdata(pdev);
 
 	thermal_zone_device_unregister(kirkwood_thermal);
+	platform_set_drvdata(pdev, NULL);
 
 	return 0;
 }
@@ -107,7 +120,8 @@ static struct platform_driver kirkwood_thermal_driver = {
 	.remove = kirkwood_thermal_exit,
 	.driver = {
 		.name = "kirkwood_thermal",
-		.of_match_table = kirkwood_thermal_id_table,
+		.owner = THIS_MODULE,
+		.of_match_table = of_match_ptr(kirkwood_thermal_id_table),
 	},
 };
 

@@ -1,8 +1,11 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Driver for SMM665 Power Controller / Monitor
  *
  * Copyright (C) 2010 Ericsson AB.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; version 2 of the License.
  *
  * This driver should also work for SMM465, SMM764, and SMM766, but is untested
  * for those chips. Only monitoring functionality is implemented.
@@ -137,7 +140,7 @@ enum chips { smm465, smm665, smm665c, smm764, smm766 };
 struct smm665_data {
 	enum chips type;
 	int conversion_time;		/* ADC conversion time */
-	struct i2c_client *client;
+	struct device *hwmon_dev;
 	struct mutex update_lock;
 	bool valid;
 	unsigned long last_updated;	/* in jiffies */
@@ -197,7 +200,7 @@ static int smm665_read_adc(struct smm665_data *data, int adc)
 	if (rv != -ENXIO) {
 		/*
 		 * We expect ENXIO to reflect NACK
-		 * (per Documentation/i2c/fault-codes.rst).
+		 * (per Documentation/i2c/fault-codes).
 		 * Everything else is an error.
 		 */
 		dev_dbg(&client->dev,
@@ -219,7 +222,7 @@ static int smm665_read_adc(struct smm665_data *data, int adc)
 	rv = i2c_smbus_read_word_swapped(client, 0);
 	if (rv < 0) {
 		dev_dbg(&client->dev, "Failed to read ADC value: error %d", rv);
-		return rv;
+		return -1;
 	}
 	/*
 	 * Validate/verify readback adc channel (in bit 11..14).
@@ -236,8 +239,8 @@ static int smm665_read_adc(struct smm665_data *data, int adc)
 
 static struct smm665_data *smm665_update_device(struct device *dev)
 {
-	struct smm665_data *data = dev_get_drvdata(dev);
-	struct i2c_client *client = data->client;
+	struct i2c_client *client = to_i2c_client(dev);
+	struct smm665_data *data = i2c_get_clientdata(client);
 	struct smm665_data *ret = data;
 
 	mutex_lock(&data->update_lock);
@@ -265,7 +268,7 @@ static struct smm665_data *smm665_update_device(struct device *dev)
 			data->adc[i] = val;
 		}
 		data->last_updated = jiffies;
-		data->valid = true;
+		data->valid = 1;
 	}
 abort:
 	mutex_unlock(&data->update_lock);
@@ -312,28 +315,32 @@ static int smm665_convert(u16 adcval, int index)
 
 static int smm665_get_min(struct device *dev, int index)
 {
-	struct smm665_data *data = dev_get_drvdata(dev);
+	struct i2c_client *client = to_i2c_client(dev);
+	struct smm665_data *data = i2c_get_clientdata(client);
 
 	return data->alarm_min_limit[index];
 }
 
 static int smm665_get_max(struct device *dev, int index)
 {
-	struct smm665_data *data = dev_get_drvdata(dev);
+	struct i2c_client *client = to_i2c_client(dev);
+	struct smm665_data *data = i2c_get_clientdata(client);
 
 	return data->alarm_max_limit[index];
 }
 
 static int smm665_get_lcrit(struct device *dev, int index)
 {
-	struct smm665_data *data = dev_get_drvdata(dev);
+	struct i2c_client *client = to_i2c_client(dev);
+	struct smm665_data *data = i2c_get_clientdata(client);
 
 	return data->critical_min_limit[index];
 }
 
 static int smm665_get_crit(struct device *dev, int index)
 {
-	struct smm665_data *data = dev_get_drvdata(dev);
+	struct i2c_client *client = to_i2c_client(dev);
+	struct smm665_data *data = i2c_get_clientdata(client);
 
 	return data->critical_max_limit[index];
 }
@@ -351,7 +358,7 @@ static ssize_t smm665_show_crit_alarm(struct device *dev,
 	if (data->faults & (1 << attr->index))
 		val = 1;
 
-	return sysfs_emit(buf, "%d\n", val);
+	return snprintf(buf, PAGE_SIZE, "%d\n", val);
 }
 
 static ssize_t smm665_show_input(struct device *dev,
@@ -366,7 +373,7 @@ static ssize_t smm665_show_input(struct device *dev,
 		return PTR_ERR(data);
 
 	val = smm665_convert(data->adc[adc], adc);
-	return sysfs_emit(buf, "%d\n", val);
+	return snprintf(buf, PAGE_SIZE, "%d\n", val);
 }
 
 #define SMM665_SHOW(what) \
@@ -479,7 +486,7 @@ SMM665_ATTR(temp1, crit_alarm, SMM665_FAULT_TEMP);
  * Finally, construct an array of pointers to members of the above objects,
  * as required for sysfs_create_group()
  */
-static struct attribute *smm665_attrs[] = {
+static struct attribute *smm665_attributes[] = {
 	&sensor_dev_attr_in1_input.dev_attr.attr,
 	&sensor_dev_attr_in1_min.dev_attr.attr,
 	&sensor_dev_attr_in1_max.dev_attr.attr,
@@ -560,15 +567,15 @@ static struct attribute *smm665_attrs[] = {
 	NULL,
 };
 
-ATTRIBUTE_GROUPS(smm665);
+static const struct attribute_group smm665_group = {
+	.attrs = smm665_attributes,
+};
 
-static const struct i2c_device_id smm665_id[];
-
-static int smm665_probe(struct i2c_client *client)
+static int smm665_probe(struct i2c_client *client,
+			const struct i2c_device_id *id)
 {
 	struct i2c_adapter *adapter = client->adapter;
 	struct smm665_data *data;
-	struct device *hwmon_dev;
 	int i, ret;
 
 	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE_DATA
@@ -585,12 +592,11 @@ static int smm665_probe(struct i2c_client *client)
 	i2c_set_clientdata(client, data);
 	mutex_init(&data->update_lock);
 
-	data->client = client;
-	data->type = i2c_match_id(smm665_id, client)->driver_data;
-	data->cmdreg = i2c_new_dummy_device(adapter, (client->addr & ~SMM665_REGMASK)
+	data->type = id->driver_data;
+	data->cmdreg = i2c_new_dummy(adapter, (client->addr & ~SMM665_REGMASK)
 				     | SMM665_CMDREG_BASE);
-	if (IS_ERR(data->cmdreg))
-		return PTR_ERR(data->cmdreg);
+	if (!data->cmdreg)
+		return -ENOMEM;
 
 	switch (data->type) {
 	case smm465:
@@ -656,26 +662,35 @@ static int smm665_probe(struct i2c_client *client)
 			data->alarm_max_limit[i] = smm665_convert(val, i);
 	}
 
-	hwmon_dev = devm_hwmon_device_register_with_groups(&client->dev,
-							   client->name, data,
-							   smm665_groups);
-	if (IS_ERR(hwmon_dev)) {
-		ret = PTR_ERR(hwmon_dev);
+	/* Register sysfs hooks */
+	ret = sysfs_create_group(&client->dev.kobj, &smm665_group);
+	if (ret)
 		goto out_unregister;
+
+	data->hwmon_dev = hwmon_device_register(&client->dev);
+	if (IS_ERR(data->hwmon_dev)) {
+		ret = PTR_ERR(data->hwmon_dev);
+		goto out_remove_group;
 	}
 
 	return 0;
 
+out_remove_group:
+	sysfs_remove_group(&client->dev.kobj, &smm665_group);
 out_unregister:
 	i2c_unregister_device(data->cmdreg);
 	return ret;
 }
 
-static void smm665_remove(struct i2c_client *client)
+static int smm665_remove(struct i2c_client *client)
 {
 	struct smm665_data *data = i2c_get_clientdata(client);
 
 	i2c_unregister_device(data->cmdreg);
+	hwmon_device_unregister(data->hwmon_dev);
+	sysfs_remove_group(&client->dev.kobj, &smm665_group);
+
+	return 0;
 }
 
 static const struct i2c_device_id smm665_id[] = {

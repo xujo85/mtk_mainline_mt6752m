@@ -1,9 +1,24 @@
-// SPDX-License-Identifier: GPL-2.0+
-/*
- * Driver for USB Mass Storage devices
+/* Driver for USB Mass Storage devices
  * Usual Tables File for usb-storage and libusual
  *
  * Copyright (C) 2009 Alan Stern (stern@rowland.harvard.edu)
+ *
+ * Please see http://www.one-eyed-alien.net/~mdharm/linux-usb for more
+ * information about this driver.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; either version 2, or (at your option) any
+ * later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc.,
+ * 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
 #include <linux/kernel.h>
@@ -40,7 +55,18 @@
 	.driver_info = (flags) \
 }
 
-const struct usb_device_id usb_storage_usb_ids[] = {
+#define HW_UNUSUAL_DEV(id_vendor, cl, sc, pr, \
+vendorName, productName,useProtocol, useTransport, \
+initFunction, flags) \
+{ \
+.match_flags = USB_DEVICE_ID_MATCH_INT_INFO | USB_DEVICE_ID_MATCH_VENDOR, \
+.idVendor = (id_vendor), \
+.bInterfaceClass = (cl), \
+.bInterfaceSubClass = (sc), \
+.bInterfaceProtocol = (pr), \
+.driver_info = (flags)}
+
+struct usb_device_id usb_storage_usb_ids[] = {
 #	include "unusual_devs.h"
 	{ }		/* Terminating entry */
 };
@@ -48,6 +74,7 @@ MODULE_DEVICE_TABLE(usb, usb_storage_usb_ids);
 
 #undef UNUSUAL_DEV
 #undef COMPLIANT_DEV
+#undef HW_UNUSUAL_DEV
 #undef USUAL_DEV
 #undef UNUSUAL_VENDOR_INTF
 
@@ -68,7 +95,7 @@ struct ignore_entry {
 	.bcdmax = bcdDeviceMax,		\
 }
 
-static const struct ignore_entry ignore_ids[] = {
+static struct ignore_entry ignore_ids[] = {
 #	include "unusual_alauda.h"
 #	include "unusual_cypress.h"
 #	include "unusual_datafab.h"
@@ -92,12 +119,17 @@ int usb_usual_ignore_device(struct usb_interface *intf)
 {
 	struct usb_device *udev;
 	unsigned vid, pid, bcd;
-	const struct ignore_entry *p;
+	struct ignore_entry *p;
 
 	udev = interface_to_usbdev(intf);
 	vid = le16_to_cpu(udev->descriptor.idVendor);
 	pid = le16_to_cpu(udev->descriptor.idProduct);
 	bcd = le16_to_cpu(udev->descriptor.bcdDevice);
+
+	if((0x19d2 == vid) && (0xfff1 == pid)){
+	      //  printk("disable zte dongle mass storage driver\n");
+        	return -ENXIO;
+    	}
 
 	for (p = ignore_ids; p->vid; ++p) {
 		if (p->vid == vid && p->pid == pid &&

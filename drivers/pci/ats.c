@@ -1,12 +1,13 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
- * PCI Express I/O Virtualization (IOV) support
- *   Address Translation Service 1.0
- *   Page Request Interface added by Joerg Roedel <joerg.roedel@amd.com>
- *   PASID support added by Joerg Roedel <joerg.roedel@amd.com>
+ * drivers/pci/ats.c
  *
  * Copyright (C) 2009 Intel Corporation, Yu Zhao <yu.zhao@intel.com>
  * Copyright (C) 2011 Advanced Micro Devices,
+ *
+ * PCI Express I/O Virtualization (IOV) support.
+ *   Address Translation Service 1.0
+ *   Page Request Interface added by Joerg Roedel <joerg.roedel@amd.com>
+ *   PASID support added by Joerg Roedel <joerg.roedel@amd.com>
  */
 
 #include <linux/export.h>
@@ -16,35 +17,35 @@
 
 #include "pci.h"
 
-void pci_ats_init(struct pci_dev *dev)
+static int ats_alloc_one(struct pci_dev *dev, int ps)
 {
 	int pos;
-
-	if (pci_ats_disabled())
-		return;
+	u16 cap;
+	struct pci_ats *ats;
 
 	pos = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_ATS);
 	if (!pos)
-		return;
+		return -ENODEV;
 
-	dev->ats_cap = pos;
+	ats = kzalloc(sizeof(*ats), GFP_KERNEL);
+	if (!ats)
+		return -ENOMEM;
+
+	ats->pos = pos;
+	ats->stu = ps;
+	pci_read_config_word(dev, pos + PCI_ATS_CAP, &cap);
+	ats->qdep = PCI_ATS_CAP_QDEP(cap) ? PCI_ATS_CAP_QDEP(cap) :
+					    PCI_ATS_MAX_QDEP;
+	dev->ats = ats;
+
+	return 0;
 }
 
-/**
- * pci_ats_supported - check if the device can use ATS
- * @dev: the PCI device
- *
- * Returns true if the device supports ATS and is allowed to use it, false
- * otherwise.
- */
-bool pci_ats_supported(struct pci_dev *dev)
+static void ats_free_one(struct pci_dev *dev)
 {
-	if (!dev->ats_cap)
-		return false;
-
-	return (dev->untrusted == 0);
+	kfree(dev->ats);
+	dev->ats = NULL;
 }
-EXPORT_SYMBOL_GPL(pci_ats_supported);
 
 /**
  * pci_enable_ats - enable the ATS capability
@@ -55,34 +56,43 @@ EXPORT_SYMBOL_GPL(pci_ats_supported);
  */
 int pci_enable_ats(struct pci_dev *dev, int ps)
 {
+	int rc;
 	u16 ctrl;
-	struct pci_dev *pdev;
 
-	if (!pci_ats_supported(dev))
-		return -EINVAL;
-
-	if (WARN_ON(dev->ats_enabled))
-		return -EBUSY;
+	BUG_ON(dev->ats && dev->ats->is_enabled);
 
 	if (ps < PCI_ATS_MIN_STU)
 		return -EINVAL;
 
-	/*
-	 * Note that enabling ATS on a VF fails unless it's already enabled
-	 * with the same STU on the PF.
-	 */
-	ctrl = PCI_ATS_CTRL_ENABLE;
-	if (dev->is_virtfn) {
-		pdev = pci_physfn(dev);
-		if (pdev->ats_stu != ps)
-			return -EINVAL;
-	} else {
-		dev->ats_stu = ps;
-		ctrl |= PCI_ATS_CTRL_STU(dev->ats_stu - PCI_ATS_MIN_STU);
-	}
-	pci_write_config_word(dev, dev->ats_cap + PCI_ATS_CTRL, ctrl);
+	if (dev->is_physfn || dev->is_virtfn) {
+		struct pci_dev *pdev = dev->is_physfn ? dev : dev->physfn;
 
-	dev->ats_enabled = 1;
+		mutex_lock(&pdev->sriov->lock);
+		if (pdev->ats)
+			rc = pdev->ats->stu == ps ? 0 : -EINVAL;
+		else
+			rc = ats_alloc_one(pdev, ps);
+
+		if (!rc)
+			pdev->ats->ref_cnt++;
+		mutex_unlock(&pdev->sriov->lock);
+		if (rc)
+			return rc;
+	}
+
+	if (!dev->is_physfn) {
+		rc = ats_alloc_one(dev, ps);
+		if (rc)
+			return rc;
+	}
+
+	ctrl = PCI_ATS_CTRL_ENABLE;
+	if (!dev->is_virtfn)
+		ctrl |= PCI_ATS_CTRL_STU(ps - PCI_ATS_MIN_STU);
+	pci_write_config_word(dev, dev->ats->pos + PCI_ATS_CTRL, ctrl);
+
+	dev->ats->is_enabled = 1;
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(pci_enable_ats);
@@ -95,14 +105,26 @@ void pci_disable_ats(struct pci_dev *dev)
 {
 	u16 ctrl;
 
-	if (WARN_ON(!dev->ats_enabled))
-		return;
+	BUG_ON(!dev->ats || !dev->ats->is_enabled);
 
-	pci_read_config_word(dev, dev->ats_cap + PCI_ATS_CTRL, &ctrl);
+	pci_read_config_word(dev, dev->ats->pos + PCI_ATS_CTRL, &ctrl);
 	ctrl &= ~PCI_ATS_CTRL_ENABLE;
-	pci_write_config_word(dev, dev->ats_cap + PCI_ATS_CTRL, ctrl);
+	pci_write_config_word(dev, dev->ats->pos + PCI_ATS_CTRL, ctrl);
 
-	dev->ats_enabled = 0;
+	dev->ats->is_enabled = 0;
+
+	if (dev->is_physfn || dev->is_virtfn) {
+		struct pci_dev *pdev = dev->is_physfn ? dev : dev->physfn;
+
+		mutex_lock(&pdev->sriov->lock);
+		pdev->ats->ref_cnt--;
+		if (!pdev->ats->ref_cnt)
+			ats_free_one(pdev);
+		mutex_unlock(&pdev->sriov->lock);
+	}
+
+	if (!dev->is_physfn)
+		ats_free_one(dev);
 }
 EXPORT_SYMBOL_GPL(pci_disable_ats);
 
@@ -110,14 +132,18 @@ void pci_restore_ats_state(struct pci_dev *dev)
 {
 	u16 ctrl;
 
-	if (!dev->ats_enabled)
+	if (!pci_ats_enabled(dev))
 		return;
+	if (!pci_find_ext_capability(dev, PCI_EXT_CAP_ID_ATS))
+		BUG();
 
 	ctrl = PCI_ATS_CTRL_ENABLE;
 	if (!dev->is_virtfn)
-		ctrl |= PCI_ATS_CTRL_STU(dev->ats_stu - PCI_ATS_MIN_STU);
-	pci_write_config_word(dev, dev->ats_cap + PCI_ATS_CTRL, ctrl);
+		ctrl |= PCI_ATS_CTRL_STU(dev->ats->stu - PCI_ATS_MIN_STU);
+
+	pci_write_config_word(dev, dev->ats->pos + PCI_ATS_CTRL, ctrl);
 }
+EXPORT_SYMBOL_GPL(pci_restore_ats_state);
 
 /**
  * pci_ats_queue_depth - query the ATS Invalidate Queue Depth
@@ -133,63 +159,30 @@ void pci_restore_ats_state(struct pci_dev *dev)
  */
 int pci_ats_queue_depth(struct pci_dev *dev)
 {
+	int pos;
 	u16 cap;
-
-	if (!dev->ats_cap)
-		return -EINVAL;
 
 	if (dev->is_virtfn)
 		return 0;
 
-	pci_read_config_word(dev, dev->ats_cap + PCI_ATS_CAP, &cap);
-	return PCI_ATS_CAP_QDEP(cap) ? PCI_ATS_CAP_QDEP(cap) : PCI_ATS_MAX_QDEP;
+	if (dev->ats)
+		return dev->ats->qdep;
+
+	pos = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_ATS);
+	if (!pos)
+		return -ENODEV;
+
+	pci_read_config_word(dev, pos + PCI_ATS_CAP, &cap);
+
+	return PCI_ATS_CAP_QDEP(cap) ? PCI_ATS_CAP_QDEP(cap) :
+				       PCI_ATS_MAX_QDEP;
 }
-
-/**
- * pci_ats_page_aligned - Return Page Aligned Request bit status.
- * @pdev: the PCI device
- *
- * Returns 1, if the Untranslated Addresses generated by the device
- * are always aligned or 0 otherwise.
- *
- * Per PCIe spec r4.0, sec 10.5.1.2, if the Page Aligned Request bit
- * is set, it indicates the Untranslated Addresses generated by the
- * device are always aligned to a 4096 byte boundary.
- */
-int pci_ats_page_aligned(struct pci_dev *pdev)
-{
-	u16 cap;
-
-	if (!pdev->ats_cap)
-		return 0;
-
-	pci_read_config_word(pdev, pdev->ats_cap + PCI_ATS_CAP, &cap);
-
-	if (cap & PCI_ATS_CAP_PAGE_ALIGNED)
-		return 1;
-
-	return 0;
-}
+EXPORT_SYMBOL_GPL(pci_ats_queue_depth);
 
 #ifdef CONFIG_PCI_PRI
-void pci_pri_init(struct pci_dev *pdev)
-{
-	u16 status;
-
-	pdev->pri_cap = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_PRI);
-
-	if (!pdev->pri_cap)
-		return;
-
-	pci_read_config_word(pdev, pdev->pri_cap + PCI_PRI_STATUS, &status);
-	if (status & PCI_PRI_STATUS_PASID)
-		pdev->pasid_required = 1;
-}
-
 /**
  * pci_enable_pri - Enable PRI capability
- * @pdev: PCI device structure
- * @reqs: outstanding requests
+ * @ pdev: PCI device structure
  *
  * Returns 0 on success, negative value on error
  */
@@ -197,41 +190,28 @@ int pci_enable_pri(struct pci_dev *pdev, u32 reqs)
 {
 	u16 control, status;
 	u32 max_requests;
-	int pri = pdev->pri_cap;
+	int pos;
 
-	/*
-	 * VFs must not implement the PRI Capability.  If their PF
-	 * implements PRI, it is shared by the VFs, so if the PF PRI is
-	 * enabled, it is also enabled for the VF.
-	 */
-	if (pdev->is_virtfn) {
-		if (pci_physfn(pdev)->pri_enabled)
-			return 0;
-		return -EINVAL;
-	}
-
-	if (WARN_ON(pdev->pri_enabled))
-		return -EBUSY;
-
-	if (!pri)
+	pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_PRI);
+	if (!pos)
 		return -EINVAL;
 
-	pci_read_config_word(pdev, pri + PCI_PRI_STATUS, &status);
-	if (!(status & PCI_PRI_STATUS_STOPPED))
+	pci_read_config_word(pdev, pos + PCI_PRI_CTRL, &control);
+	pci_read_config_word(pdev, pos + PCI_PRI_STATUS, &status);
+	if ((control & PCI_PRI_CTRL_ENABLE) ||
+	    !(status & PCI_PRI_STATUS_STOPPED))
 		return -EBUSY;
 
-	pci_read_config_dword(pdev, pri + PCI_PRI_MAX_REQ, &max_requests);
+	pci_read_config_dword(pdev, pos + PCI_PRI_MAX_REQ, &max_requests);
 	reqs = min(max_requests, reqs);
-	pdev->pri_reqs_alloc = reqs;
-	pci_write_config_dword(pdev, pri + PCI_PRI_ALLOC_REQ, reqs);
+	pci_write_config_dword(pdev, pos + PCI_PRI_ALLOC_REQ, reqs);
 
-	control = PCI_PRI_CTRL_ENABLE;
-	pci_write_config_word(pdev, pri + PCI_PRI_CTRL, control);
-
-	pdev->pri_enabled = 1;
+	control |= PCI_PRI_CTRL_ENABLE;
+	pci_write_config_word(pdev, pos + PCI_PRI_CTRL, control);
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(pci_enable_pri);
 
 /**
  * pci_disable_pri - Disable PRI capability
@@ -242,48 +222,38 @@ int pci_enable_pri(struct pci_dev *pdev, u32 reqs)
 void pci_disable_pri(struct pci_dev *pdev)
 {
 	u16 control;
-	int pri = pdev->pri_cap;
+	int pos;
 
-	/* VFs share the PF PRI */
-	if (pdev->is_virtfn)
+	pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_PRI);
+	if (!pos)
 		return;
 
-	if (WARN_ON(!pdev->pri_enabled))
-		return;
-
-	if (!pri)
-		return;
-
-	pci_read_config_word(pdev, pri + PCI_PRI_CTRL, &control);
+	pci_read_config_word(pdev, pos + PCI_PRI_CTRL, &control);
 	control &= ~PCI_PRI_CTRL_ENABLE;
-	pci_write_config_word(pdev, pri + PCI_PRI_CTRL, control);
-
-	pdev->pri_enabled = 0;
+	pci_write_config_word(pdev, pos + PCI_PRI_CTRL, control);
 }
 EXPORT_SYMBOL_GPL(pci_disable_pri);
 
 /**
- * pci_restore_pri_state - Restore PRI
+ * pci_pri_enabled - Checks if PRI capability is enabled
  * @pdev: PCI device structure
+ *
+ * Returns true if PRI is enabled on the device, false otherwise
  */
-void pci_restore_pri_state(struct pci_dev *pdev)
+bool pci_pri_enabled(struct pci_dev *pdev)
 {
-	u16 control = PCI_PRI_CTRL_ENABLE;
-	u32 reqs = pdev->pri_reqs_alloc;
-	int pri = pdev->pri_cap;
+	u16 control;
+	int pos;
 
-	if (pdev->is_virtfn)
-		return;
+	pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_PRI);
+	if (!pos)
+		return false;
 
-	if (!pdev->pri_enabled)
-		return;
+	pci_read_config_word(pdev, pos + PCI_PRI_CTRL, &control);
 
-	if (!pri)
-		return;
-
-	pci_write_config_dword(pdev, pri + PCI_PRI_ALLOC_REQ, reqs);
-	pci_write_config_word(pdev, pri + PCI_PRI_CTRL, control);
+	return (control & PCI_PRI_CTRL_ENABLE) ? true : false;
 }
+EXPORT_SYMBOL_GPL(pci_pri_enabled);
 
 /**
  * pci_reset_pri - Resets device's PRI state
@@ -295,60 +265,87 @@ void pci_restore_pri_state(struct pci_dev *pdev)
 int pci_reset_pri(struct pci_dev *pdev)
 {
 	u16 control;
-	int pri = pdev->pri_cap;
+	int pos;
 
-	if (pdev->is_virtfn)
-		return 0;
-
-	if (WARN_ON(pdev->pri_enabled))
-		return -EBUSY;
-
-	if (!pri)
+	pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_PRI);
+	if (!pos)
 		return -EINVAL;
 
-	control = PCI_PRI_CTRL_RESET;
-	pci_write_config_word(pdev, pri + PCI_PRI_CTRL, control);
+	pci_read_config_word(pdev, pos + PCI_PRI_CTRL, &control);
+	if (control & PCI_PRI_CTRL_ENABLE)
+		return -EBUSY;
+
+	control |= PCI_PRI_CTRL_RESET;
+
+	pci_write_config_word(pdev, pos + PCI_PRI_CTRL, control);
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(pci_reset_pri);
 
 /**
- * pci_prg_resp_pasid_required - Return PRG Response PASID Required bit
- *				 status.
+ * pci_pri_stopped - Checks whether the PRI capability is stopped
  * @pdev: PCI device structure
  *
- * Returns 1 if PASID is required in PRG Response Message, 0 otherwise.
+ * Returns true if the PRI capability on the device is disabled and the
+ * device has no outstanding PRI requests, false otherwise. The device
+ * indicates this via the STOPPED bit in the status register of the
+ * capability.
+ * The device internal state can be cleared by resetting the PRI state
+ * with pci_reset_pri(). This can force the capability into the STOPPED
+ * state.
  */
-int pci_prg_resp_pasid_required(struct pci_dev *pdev)
+bool pci_pri_stopped(struct pci_dev *pdev)
 {
-	if (pdev->is_virtfn)
-		pdev = pci_physfn(pdev);
+	u16 control, status;
+	int pos;
 
-	return pdev->pasid_required;
-}
-
-/**
- * pci_pri_supported - Check if PRI is supported.
- * @pdev: PCI device structure
- *
- * Returns true if PRI capability is present, false otherwise.
- */
-bool pci_pri_supported(struct pci_dev *pdev)
-{
-	/* VFs share the PF PRI */
-	if (pci_physfn(pdev)->pri_cap)
+	pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_PRI);
+	if (!pos)
 		return true;
-	return false;
+
+	pci_read_config_word(pdev, pos + PCI_PRI_CTRL, &control);
+	pci_read_config_word(pdev, pos + PCI_PRI_STATUS, &status);
+
+	if (control & PCI_PRI_CTRL_ENABLE)
+		return false;
+
+	return (status & PCI_PRI_STATUS_STOPPED) ? true : false;
 }
-EXPORT_SYMBOL_GPL(pci_pri_supported);
+EXPORT_SYMBOL_GPL(pci_pri_stopped);
+
+/**
+ * pci_pri_status - Request PRI status of a device
+ * @pdev: PCI device structure
+ *
+ * Returns negative value on failure, status on success. The status can
+ * be checked against status-bits. Supported bits are currently:
+ * PCI_PRI_STATUS_RF:      Response failure
+ * PCI_PRI_STATUS_UPRGI:   Unexpected Page Request Group Index
+ * PCI_PRI_STATUS_STOPPED: PRI has stopped
+ */
+int pci_pri_status(struct pci_dev *pdev)
+{
+	u16 status, control;
+	int pos;
+
+	pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_PRI);
+	if (!pos)
+		return -EINVAL;
+
+	pci_read_config_word(pdev, pos + PCI_PRI_CTRL, &control);
+	pci_read_config_word(pdev, pos + PCI_PRI_STATUS, &status);
+
+	/* Stopped bit is undefined when enable == 1, so clear it */
+	if (control & PCI_PRI_CTRL_ENABLE)
+		status &= ~PCI_PRI_STATUS_STOPPED;
+
+	return status;
+}
+EXPORT_SYMBOL_GPL(pci_pri_status);
 #endif /* CONFIG_PCI_PRI */
 
 #ifdef CONFIG_PCI_PASID
-void pci_pasid_init(struct pci_dev *pdev)
-{
-	pdev->pasid_cap = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_PASID);
-}
-
 /**
  * pci_enable_pasid - Enable the PASID capability
  * @pdev: PCI device structure
@@ -361,31 +358,18 @@ void pci_pasid_init(struct pci_dev *pdev)
 int pci_enable_pasid(struct pci_dev *pdev, int features)
 {
 	u16 control, supported;
-	int pasid = pdev->pasid_cap;
+	int pos;
 
-	/*
-	 * VFs must not implement the PASID Capability, but if a PF
-	 * supports PASID, its VFs share the PF PASID configuration.
-	 */
-	if (pdev->is_virtfn) {
-		if (pci_physfn(pdev)->pasid_enabled)
-			return 0;
-		return -EINVAL;
-	}
-
-	if (WARN_ON(pdev->pasid_enabled))
-		return -EBUSY;
-
-	if (!pdev->eetlp_prefix_path && !pdev->pasid_no_tlp)
+	pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_PASID);
+	if (!pos)
 		return -EINVAL;
 
-	if (!pasid)
+	pci_read_config_word(pdev, pos + PCI_PASID_CTRL, &control);
+	pci_read_config_word(pdev, pos + PCI_PASID_CAP, &supported);
+
+	if (control & PCI_PASID_CTRL_ENABLE)
 		return -EINVAL;
 
-	if (!pci_acs_path_enabled(pdev, NULL, PCI_ACS_RR | PCI_ACS_UF))
-		return -EINVAL;
-
-	pci_read_config_word(pdev, pasid + PCI_PASID_CAP, &supported);
 	supported &= PCI_PASID_CAP_EXEC | PCI_PASID_CAP_PRIV;
 
 	/* User wants to enable anything unsupported? */
@@ -393,11 +377,8 @@ int pci_enable_pasid(struct pci_dev *pdev, int features)
 		return -EINVAL;
 
 	control = PCI_PASID_CTRL_ENABLE | features;
-	pdev->pasid_features = features;
 
-	pci_write_config_word(pdev, pasid + PCI_PASID_CTRL, control);
-
-	pdev->pasid_enabled = 1;
+	pci_write_config_word(pdev, pos + PCI_PASID_CTRL, control);
 
 	return 0;
 }
@@ -406,49 +387,20 @@ EXPORT_SYMBOL_GPL(pci_enable_pasid);
 /**
  * pci_disable_pasid - Disable the PASID capability
  * @pdev: PCI device structure
+ *
  */
 void pci_disable_pasid(struct pci_dev *pdev)
 {
 	u16 control = 0;
-	int pasid = pdev->pasid_cap;
+	int pos;
 
-	/* VFs share the PF PASID configuration */
-	if (pdev->is_virtfn)
+	pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_PASID);
+	if (!pos)
 		return;
 
-	if (WARN_ON(!pdev->pasid_enabled))
-		return;
-
-	if (!pasid)
-		return;
-
-	pci_write_config_word(pdev, pasid + PCI_PASID_CTRL, control);
-
-	pdev->pasid_enabled = 0;
+	pci_write_config_word(pdev, pos + PCI_PASID_CTRL, control);
 }
 EXPORT_SYMBOL_GPL(pci_disable_pasid);
-
-/**
- * pci_restore_pasid_state - Restore PASID capabilities
- * @pdev: PCI device structure
- */
-void pci_restore_pasid_state(struct pci_dev *pdev)
-{
-	u16 control;
-	int pasid = pdev->pasid_cap;
-
-	if (pdev->is_virtfn)
-		return;
-
-	if (!pdev->pasid_enabled)
-		return;
-
-	if (!pasid)
-		return;
-
-	control = PCI_PASID_CTRL_ENABLE | pdev->pasid_features;
-	pci_write_config_word(pdev, pasid + PCI_PASID_CTRL, control);
-}
 
 /**
  * pci_pasid_features - Check which PASID features are supported
@@ -458,21 +410,18 @@ void pci_restore_pasid_state(struct pci_dev *pdev)
  * Otherwise is returns a bitmask with supported features. Current
  * features reported are:
  * PCI_PASID_CAP_EXEC - Execute permission supported
- * PCI_PASID_CAP_PRIV - Privileged mode supported
+ * PCI_PASID_CAP_PRIV - Priviledged mode supported
  */
 int pci_pasid_features(struct pci_dev *pdev)
 {
 	u16 supported;
-	int pasid;
+	int pos;
 
-	if (pdev->is_virtfn)
-		pdev = pci_physfn(pdev);
-
-	pasid = pdev->pasid_cap;
-	if (!pasid)
+	pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_PASID);
+	if (!pos)
 		return -EINVAL;
 
-	pci_read_config_word(pdev, pasid + PCI_PASID_CAP, &supported);
+	pci_read_config_word(pdev, pos + PCI_PASID_CAP, &supported);
 
 	supported &= PCI_PASID_CAP_EXEC | PCI_PASID_CAP_PRIV;
 
@@ -483,25 +432,22 @@ EXPORT_SYMBOL_GPL(pci_pasid_features);
 #define PASID_NUMBER_SHIFT	8
 #define PASID_NUMBER_MASK	(0x1f << PASID_NUMBER_SHIFT)
 /**
- * pci_max_pasids - Get maximum number of PASIDs supported by device
+ * pci_max_pasid - Get maximum number of PASIDs supported by device
  * @pdev: PCI device structure
  *
  * Returns negative value when PASID capability is not present.
- * Otherwise it returns the number of supported PASIDs.
+ * Otherwise it returns the numer of supported PASIDs.
  */
 int pci_max_pasids(struct pci_dev *pdev)
 {
 	u16 supported;
-	int pasid;
+	int pos;
 
-	if (pdev->is_virtfn)
-		pdev = pci_physfn(pdev);
-
-	pasid = pdev->pasid_cap;
-	if (!pasid)
+	pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_PASID);
+	if (!pos)
 		return -EINVAL;
 
-	pci_read_config_word(pdev, pasid + PCI_PASID_CAP, &supported);
+	pci_read_config_word(pdev, pos + PCI_PASID_CAP, &supported);
 
 	supported = (supported & PASID_NUMBER_MASK) >> PASID_NUMBER_SHIFT;
 

@@ -19,8 +19,6 @@
 #include "ar9002_phy.h"
 
 #define AR9285_CLCAL_REDO_THRESH    1
-/* AGC & I/Q calibrations time limit, ms */
-#define AR9002_CAL_MAX_TIME		30000
 
 enum ar9002_cal_types {
 	ADC_GAIN_CAL = BIT(0),
@@ -35,12 +33,16 @@ static bool ar9002_hw_is_cal_supported(struct ath_hw *ah,
 	bool supported = false;
 	switch (ah->supp_cals & cal_type) {
 	case IQ_MISMATCH_CAL:
-		supported = true;
+		/* Run IQ Mismatch for non-CCK only */
+		if (!IS_CHAN_B(chan))
+			supported = true;
 		break;
 	case ADC_GAIN_CAL:
 	case ADC_DC_CAL:
-		/* Run even/odd ADCs calibrations for HT40 channels only */
-		if (IS_CHAN_HT40(chan))
+		/* Run ADC Gain Cal for non-CCK & non 2GHz-HT20 only */
+		if (!IS_CHAN_B(chan) &&
+		    !((IS_CHAN_2GHZ(chan) || IS_CHAN_A_FAST_CLOCK(ah, chan)) &&
+		      IS_CHAN_HT20(chan)))
 			supported = true;
 		break;
 	}
@@ -106,14 +108,6 @@ static bool ar9002_hw_per_calibration(struct ath_hw *ah,
 			} else {
 				ar9002_hw_setup_calibration(ah, currCal);
 			}
-		} else if (time_after(jiffies, ah->cal_start_time +
-				      msecs_to_jiffies(AR9002_CAL_MAX_TIME))) {
-			REG_CLR_BIT(ah, AR_PHY_TIMING_CTRL4(0),
-				    AR_PHY_TIMING_CTRL4_DO_CAL);
-			ath_dbg(ath9k_hw_common(ah), CALIBRATE,
-				"calibration timeout\n");
-			currCal->calState = CAL_WAITING;	/* Try later */
-			iscaldone = true;
 		}
 	} else if (!(caldata->CalValid & currCal->calData->calType)) {
 		ath9k_hw_reset_calibration(ah, currCal);
@@ -439,43 +433,46 @@ static void ar9271_hw_pa_cal(struct ath_hw *ah, bool is_reset)
 	u32 regVal;
 	unsigned int i;
 	u32 regList[][2] = {
-		{ AR9285_AN_TOP3, 0 },
-		{ AR9285_AN_RXTXBB1, 0 },
-		{ AR9285_AN_RF2G1, 0 },
-		{ AR9285_AN_RF2G2, 0 },
-		{ AR9285_AN_TOP2, 0 },
-		{ AR9285_AN_RF2G8, 0 },
-		{ AR9285_AN_RF2G7, 0 },
-		{ AR9285_AN_RF2G3, 0 },
+		{ 0x786c, 0 },
+		{ 0x7854, 0 },
+		{ 0x7820, 0 },
+		{ 0x7824, 0 },
+		{ 0x7868, 0 },
+		{ 0x783c, 0 },
+		{ 0x7838, 0 } ,
+		{ 0x7828, 0 } ,
 	};
 
-	REG_READ_ARRAY(ah, regList, ARRAY_SIZE(regList));
+	for (i = 0; i < ARRAY_SIZE(regList); i++)
+		regList[i][1] = REG_READ(ah, regList[i][0]);
 
-	ENABLE_REG_RMW_BUFFER(ah);
-	/* 7834, b1=0 */
-	REG_CLR_BIT(ah, AR9285_AN_RF2G6, 1 << 0);
-	/* 9808, b27=1 */
-	REG_SET_BIT(ah, 0x9808, 1 << 27);
+	regVal = REG_READ(ah, 0x7834);
+	regVal &= (~(0x1));
+	REG_WRITE(ah, 0x7834, regVal);
+	regVal = REG_READ(ah, 0x9808);
+	regVal |= (0x1 << 27);
+	REG_WRITE(ah, 0x9808, regVal);
+
 	/* 786c,b23,1, pwddac=1 */
-	REG_SET_BIT(ah, AR9285_AN_TOP3, AR9285_AN_TOP3_PWDDAC);
+	REG_RMW_FIELD(ah, AR9285_AN_TOP3, AR9285_AN_TOP3_PWDDAC, 1);
 	/* 7854, b5,1, pdrxtxbb=1 */
-	REG_SET_BIT(ah, AR9285_AN_RXTXBB1, AR9285_AN_RXTXBB1_PDRXTXBB1);
+	REG_RMW_FIELD(ah, AR9285_AN_RXTXBB1, AR9285_AN_RXTXBB1_PDRXTXBB1, 1);
 	/* 7854, b7,1, pdv2i=1 */
-	REG_SET_BIT(ah, AR9285_AN_RXTXBB1, AR9285_AN_RXTXBB1_PDV2I);
+	REG_RMW_FIELD(ah, AR9285_AN_RXTXBB1, AR9285_AN_RXTXBB1_PDV2I, 1);
 	/* 7854, b8,1, pddacinterface=1 */
-	REG_SET_BIT(ah, AR9285_AN_RXTXBB1, AR9285_AN_RXTXBB1_PDDACIF);
+	REG_RMW_FIELD(ah, AR9285_AN_RXTXBB1, AR9285_AN_RXTXBB1_PDDACIF, 1);
 	/* 7824,b12,0, offcal=0 */
-	REG_CLR_BIT(ah, AR9285_AN_RF2G2, AR9285_AN_RF2G2_OFFCAL);
+	REG_RMW_FIELD(ah, AR9285_AN_RF2G2, AR9285_AN_RF2G2_OFFCAL, 0);
 	/* 7838, b1,0, pwddb=0 */
-	REG_CLR_BIT(ah, AR9285_AN_RF2G7, AR9285_AN_RF2G7_PWDDB);
+	REG_RMW_FIELD(ah, AR9285_AN_RF2G7, AR9285_AN_RF2G7_PWDDB, 0);
 	/* 7820,b11,0, enpacal=0 */
-	REG_CLR_BIT(ah, AR9285_AN_RF2G1, AR9285_AN_RF2G1_ENPACAL);
+	REG_RMW_FIELD(ah, AR9285_AN_RF2G1, AR9285_AN_RF2G1_ENPACAL, 0);
 	/* 7820,b25,1, pdpadrv1=0 */
-	REG_CLR_BIT(ah, AR9285_AN_RF2G1, AR9285_AN_RF2G1_PDPADRV1);
+	REG_RMW_FIELD(ah, AR9285_AN_RF2G1, AR9285_AN_RF2G1_PDPADRV1, 0);
 	/* 7820,b24,0, pdpadrv2=0 */
-	REG_CLR_BIT(ah, AR9285_AN_RF2G1, AR9285_AN_RF2G1_PDPADRV2);
+	REG_RMW_FIELD(ah, AR9285_AN_RF2G1, AR9285_AN_RF2G1_PDPADRV2, 0);
 	/* 7820,b23,0, pdpaout=0 */
-	REG_CLR_BIT(ah, AR9285_AN_RF2G1, AR9285_AN_RF2G1_PDPAOUT);
+	REG_RMW_FIELD(ah, AR9285_AN_RF2G1, AR9285_AN_RF2G1_PDPAOUT, 0);
 	/* 783c,b14-16,7, padrvgn2tab_0=7 */
 	REG_RMW_FIELD(ah, AR9285_AN_RF2G8, AR9285_AN_RF2G8_PADRVGN2TAB0, 7);
 	/*
@@ -483,9 +480,8 @@ static void ar9271_hw_pa_cal(struct ath_hw *ah, bool is_reset)
 	 * does not matter since we turn it off
 	 */
 	REG_RMW_FIELD(ah, AR9285_AN_RF2G7, AR9285_AN_RF2G7_PADRVGN2TAB0, 0);
-	/* 7828, b0-11, ccom=fff */
+
 	REG_RMW_FIELD(ah, AR9285_AN_RF2G3, AR9271_AN_RF2G3_CCOMP, 0xfff);
-	REG_RMW_BUFFER_FLUSH(ah);
 
 	/* Set:
 	 * localmode=1,bmode=1,bmoderxtx=1,synthon=1,
@@ -497,16 +493,15 @@ static void ar9271_hw_pa_cal(struct ath_hw *ah, bool is_reset)
 
 	/* find off_6_1; */
 	for (i = 6; i > 0; i--) {
-		regVal = REG_READ(ah, AR9285_AN_RF2G6);
+		regVal = REG_READ(ah, 0x7834);
 		regVal |= (1 << (20 + i));
-		REG_WRITE(ah, AR9285_AN_RF2G6, regVal);
+		REG_WRITE(ah, 0x7834, regVal);
 		udelay(1);
 		/* regVal = REG_READ(ah, 0x7834); */
 		regVal &= (~(0x1 << (20 + i)));
-		regVal |= (MS(REG_READ(ah, AR9285_AN_RF2G9),
-			      AR9285_AN_RXTXBB1_SPARE9)
+		regVal |= (MS(REG_READ(ah, 0x7840), AR9285_AN_RXTXBB1_SPARE9)
 			    << (20 + i));
-		REG_WRITE(ah, AR9285_AN_RF2G6, regVal);
+		REG_WRITE(ah, 0x7834, regVal);
 	}
 
 	regVal = (regVal >> 20) & 0x7f;
@@ -523,15 +518,15 @@ static void ar9271_hw_pa_cal(struct ath_hw *ah, bool is_reset)
 		ah->pacal_info.prev_offset = regVal;
 	}
 
-
-	ENABLE_REG_RMW_BUFFER(ah);
-	/* 7834, b1=1 */
-	REG_SET_BIT(ah, AR9285_AN_RF2G6, 1 << 0);
-	/* 9808, b27=0 */
-	REG_CLR_BIT(ah, 0x9808, 1 << 27);
-	REG_RMW_BUFFER_FLUSH(ah);
-
 	ENABLE_REGWRITE_BUFFER(ah);
+
+	regVal = REG_READ(ah, 0x7834);
+	regVal |= 0x1;
+	REG_WRITE(ah, 0x7834, regVal);
+	regVal = REG_READ(ah, 0x9808);
+	regVal &= (~(0x1 << 27));
+	REG_WRITE(ah, 0x9808, regVal);
+
 	for (i = 0; i < ARRAY_SIZE(regList); i++)
 		REG_WRITE(ah, regList[i][0], regList[i][1]);
 
@@ -659,56 +654,38 @@ static void ar9002_hw_pa_cal(struct ath_hw *ah, bool is_reset)
 
 static void ar9002_hw_olc_temp_compensation(struct ath_hw *ah)
 {
-	if (OLC_FOR_AR9287_10_LATER(ah))
+	if (OLC_FOR_AR9287_10_LATER)
 		ar9287_hw_olc_temp_compensation(ah);
-	else if (OLC_FOR_AR9280_20_LATER(ah))
+	else if (OLC_FOR_AR9280_20_LATER)
 		ar9280_hw_olc_temp_compensation(ah);
 }
 
-static int ar9002_hw_calibrate(struct ath_hw *ah, struct ath9k_channel *chan,
-			       u8 rxchainmask, bool longcal)
+static bool ar9002_hw_calibrate(struct ath_hw *ah,
+				struct ath9k_channel *chan,
+				u8 rxchainmask,
+				bool longcal)
 {
+	bool iscaldone = true;
 	struct ath9k_cal_list *currCal = ah->cal_list_curr;
-	bool nfcal, nfcal_pending = false, percal_pending;
-	int ret;
+	bool nfcal, nfcal_pending = false;
 
-	nfcal = !!(REG_READ(ah, AR_PHY_AGC_CONTROL(ah)) & AR_PHY_AGC_CONTROL_NF);
-	if (ah->caldata) {
-		nfcal_pending = test_bit(NFCAL_PENDING, &ah->caldata->cal_flags);
-		if (longcal)		/* Remember to not miss */
-			set_bit(LONGCAL_PENDING, &ah->caldata->cal_flags);
-		else if (test_bit(LONGCAL_PENDING, &ah->caldata->cal_flags))
-			longcal = true;	/* Respin a previous one */
-	}
+	nfcal = !!(REG_READ(ah, AR_PHY_AGC_CONTROL) & AR_PHY_AGC_CONTROL_NF);
+	if (ah->caldata)
+		nfcal_pending = ah->caldata->nfcal_pending;
 
-	percal_pending = (currCal &&
-			  (currCal->calState == CAL_RUNNING ||
-			   currCal->calState == CAL_WAITING));
+	if (currCal && !nfcal &&
+	    (currCal->calState == CAL_RUNNING ||
+	     currCal->calState == CAL_WAITING)) {
+		iscaldone = ar9002_hw_per_calibration(ah, chan,
+						      rxchainmask, currCal);
+		if (iscaldone) {
+			ah->cal_list_curr = currCal = currCal->calNext;
 
-	if (percal_pending && !nfcal) {
-		if (!ar9002_hw_per_calibration(ah, chan, rxchainmask, currCal))
-			return 0;
-
-		/* Looking for next waiting calibration if any */
-		for (currCal = currCal->calNext; currCal != ah->cal_list_curr;
-		     currCal = currCal->calNext) {
-			if (currCal->calState == CAL_WAITING)
-				break;
+			if (currCal->calState == CAL_WAITING) {
+				iscaldone = false;
+				ath9k_hw_reset_calibration(ah, currCal);
+			}
 		}
-		if (currCal->calState == CAL_WAITING) {
-			percal_pending = true;
-			ah->cal_list_curr = currCal;
-		} else {
-			percal_pending = false;
-			ah->cal_list_curr = ah->cal_list;
-		}
-	}
-
-	/* Do not start a next calibration if the longcal is in action */
-	if (percal_pending && !nfcal && !longcal) {
-		ath9k_hw_reset_calibration(ah, currCal);
-
-		return 0;
 	}
 
 	/* Do NF cal only at longer intervals */
@@ -724,15 +701,10 @@ static int ar9002_hw_calibrate(struct ath_hw *ah, struct ath9k_channel *chan,
 			 * NF is slow time-variant, so it is OK to use a
 			 * historical value.
 			 */
-			ret = ath9k_hw_loadnf(ah, ah->curchan);
-			if (ret < 0)
-				return ret;
+			ath9k_hw_loadnf(ah, ah->curchan);
 		}
 
 		if (longcal) {
-			if (ah->caldata)
-				clear_bit(LONGCAL_PENDING,
-					  &ah->caldata->cal_flags);
 			ath9k_hw_start_nfcal(ah, false);
 			/* Do periodic PAOffset Cal */
 			ar9002_hw_pa_cal(ah, false);
@@ -740,7 +712,7 @@ static int ar9002_hw_calibrate(struct ath_hw *ah, struct ath9k_channel *chan,
 		}
 	}
 
-	return !percal_pending;
+	return iscaldone;
 }
 
 /* Carrier leakage Calibration fix */
@@ -752,11 +724,11 @@ static bool ar9285_hw_cl_cal(struct ath_hw *ah, struct ath9k_channel *chan)
 	if (IS_CHAN_HT20(chan)) {
 		REG_SET_BIT(ah, AR_PHY_CL_CAL_CTL, AR_PHY_PARALLEL_CAL_ENABLE);
 		REG_SET_BIT(ah, AR_PHY_TURBO, AR_PHY_FC_DYN2040_EN);
-		REG_CLR_BIT(ah, AR_PHY_AGC_CONTROL(ah),
+		REG_CLR_BIT(ah, AR_PHY_AGC_CONTROL,
 			    AR_PHY_AGC_CONTROL_FLTR_CAL);
 		REG_CLR_BIT(ah, AR_PHY_TPCRG1, AR_PHY_TPCRG1_PD_CAL_ENABLE);
-		REG_SET_BIT(ah, AR_PHY_AGC_CONTROL(ah), AR_PHY_AGC_CONTROL_CAL);
-		if (!ath9k_hw_wait(ah, AR_PHY_AGC_CONTROL(ah),
+		REG_SET_BIT(ah, AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_CAL);
+		if (!ath9k_hw_wait(ah, AR_PHY_AGC_CONTROL,
 				  AR_PHY_AGC_CONTROL_CAL, 0, AH_WAIT_TIMEOUT)) {
 			ath_dbg(common, CALIBRATE,
 				"offset calibration failed to complete in %d ms; noisy environment?\n",
@@ -768,10 +740,10 @@ static bool ar9285_hw_cl_cal(struct ath_hw *ah, struct ath9k_channel *chan)
 		REG_CLR_BIT(ah, AR_PHY_CL_CAL_CTL, AR_PHY_CL_CAL_ENABLE);
 	}
 	REG_CLR_BIT(ah, AR_PHY_ADC_CTL, AR_PHY_ADC_CTL_OFF_PWDADC);
-	REG_SET_BIT(ah, AR_PHY_AGC_CONTROL(ah), AR_PHY_AGC_CONTROL_FLTR_CAL);
+	REG_SET_BIT(ah, AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_FLTR_CAL);
 	REG_SET_BIT(ah, AR_PHY_TPCRG1, AR_PHY_TPCRG1_PD_CAL_ENABLE);
-	REG_SET_BIT(ah, AR_PHY_AGC_CONTROL(ah), AR_PHY_AGC_CONTROL_CAL);
-	if (!ath9k_hw_wait(ah, AR_PHY_AGC_CONTROL(ah), AR_PHY_AGC_CONTROL_CAL,
+	REG_SET_BIT(ah, AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_CAL);
+	if (!ath9k_hw_wait(ah, AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_CAL,
 			  0, AH_WAIT_TIMEOUT)) {
 		ath_dbg(common, CALIBRATE,
 			"offset calibration failed to complete in %d ms; noisy environment?\n",
@@ -781,7 +753,7 @@ static bool ar9285_hw_cl_cal(struct ath_hw *ah, struct ath9k_channel *chan)
 
 	REG_SET_BIT(ah, AR_PHY_ADC_CTL, AR_PHY_ADC_CTL_OFF_PWDADC);
 	REG_CLR_BIT(ah, AR_PHY_CL_CAL_CTL, AR_PHY_CL_CAL_ENABLE);
-	REG_CLR_BIT(ah, AR_PHY_AGC_CONTROL(ah), AR_PHY_AGC_CONTROL_FLTR_CAL);
+	REG_CLR_BIT(ah, AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_FLTR_CAL);
 
 	return true;
 }
@@ -857,17 +829,17 @@ static bool ar9002_hw_init_cal(struct ath_hw *ah, struct ath9k_channel *chan)
 			if (!AR_SREV_9287_11_OR_LATER(ah))
 				REG_CLR_BIT(ah, AR_PHY_ADC_CTL,
 					    AR_PHY_ADC_CTL_OFF_PWDADC);
-			REG_SET_BIT(ah, AR_PHY_AGC_CONTROL(ah),
+			REG_SET_BIT(ah, AR_PHY_AGC_CONTROL,
 				    AR_PHY_AGC_CONTROL_FLTR_CAL);
 		}
 
 		/* Calibrate the AGC */
-		REG_WRITE(ah, AR_PHY_AGC_CONTROL(ah),
-			  REG_READ(ah, AR_PHY_AGC_CONTROL(ah)) |
+		REG_WRITE(ah, AR_PHY_AGC_CONTROL,
+			  REG_READ(ah, AR_PHY_AGC_CONTROL) |
 			  AR_PHY_AGC_CONTROL_CAL);
 
 		/* Poll for offset calibration complete */
-		if (!ath9k_hw_wait(ah, AR_PHY_AGC_CONTROL(ah),
+		if (!ath9k_hw_wait(ah, AR_PHY_AGC_CONTROL,
 				   AR_PHY_AGC_CONTROL_CAL,
 				   0, AH_WAIT_TIMEOUT)) {
 			ath_dbg(common, CALIBRATE,
@@ -880,15 +852,16 @@ static bool ar9002_hw_init_cal(struct ath_hw *ah, struct ath9k_channel *chan)
 			if (!AR_SREV_9287_11_OR_LATER(ah))
 				REG_SET_BIT(ah, AR_PHY_ADC_CTL,
 					    AR_PHY_ADC_CTL_OFF_PWDADC);
-			REG_CLR_BIT(ah, AR_PHY_AGC_CONTROL(ah),
+			REG_CLR_BIT(ah, AR_PHY_AGC_CONTROL,
 				    AR_PHY_AGC_CONTROL_FLTR_CAL);
 		}
 	}
 
 	/* Do PA Calibration */
 	ar9002_hw_pa_cal(ah, true);
-	ath9k_hw_loadnf(ah, chan);
-	ath9k_hw_start_nfcal(ah, true);
+
+	if (ah->caldata)
+		ah->caldata->nfcal_pending = true;
 
 	ah->cal_list = ah->cal_list_last = ah->cal_list_curr = NULL;
 

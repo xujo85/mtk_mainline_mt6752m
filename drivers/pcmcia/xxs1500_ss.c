@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * PCMCIA socket code for the MyCable XXS1500 system.
  *
@@ -12,7 +11,6 @@
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/mm.h>
-#include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/resource.h>
@@ -316,6 +314,7 @@ static int xxs1500_pcmcia_remove(struct platform_device *pdev)
 static struct platform_driver xxs1500_pcmcia_socket_driver = {
 	.driver	= {
 		.name	= "xxs1500_pcmcia",
+		.owner	= THIS_MODULE,
 	},
 	.probe		= xxs1500_pcmcia_probe,
 	.remove		= xxs1500_pcmcia_remove,

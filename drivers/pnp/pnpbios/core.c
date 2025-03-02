@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * pnpbios -- PnP BIOS driver
  *
@@ -18,6 +17,20 @@
  *
  * Ported to the PnP Layer and several additional improvements (C) 2002
  * by Adam Belay <ambx1@neo.rr.com>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; either version 2, or (at your option) any
+ * later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
 /* Change Log
@@ -33,6 +46,7 @@
  */
 
 #include <linux/types.h>
+#include <linux/module.h>
 #include <linux/init.h>
 #include <linux/linkage.h>
 #include <linux/kernel.h>
@@ -47,7 +61,6 @@
 #include <linux/delay.h>
 #include <linux/acpi.h>
 #include <linux/freezer.h>
-#include <linux/kmod.h>
 #include <linux/kthread.h>
 
 #include <asm/page.h>
@@ -85,7 +98,6 @@ static struct completion unload_sem;
  */
 static int pnp_dock_event(int dock, struct pnp_docking_station_info *info)
 {
-	static char const sbin_pnpbios[] = "/sbin/pnpbios";
 	char *argv[3], **envp, *buf, *scratch;
 	int i = 0, value;
 
@@ -100,7 +112,7 @@ static int pnp_dock_event(int dock, struct pnp_docking_station_info *info)
 	 * integrated into the driver core and use the usual infrastructure
 	 * like sysfs and uevents
 	 */
-	argv[0] = (char *)sbin_pnpbios;
+	argv[0] = "/sbin/pnpbios";
 	argv[1] = "dock";
 	argv[2] = NULL;
 
@@ -127,7 +139,7 @@ static int pnp_dock_event(int dock, struct pnp_docking_station_info *info)
 			   info->location_id, info->serial, info->capabilities);
 	envp[i] = NULL;
 
-	value = call_usermodehelper(sbin_pnpbios, argv, envp, UMH_WAIT_EXEC);
+	value = call_usermodehelper(argv [0], argv, envp, UMH_WAIT_EXEC);
 	kfree(buf);
 	kfree(envp);
 	return 0;
@@ -160,7 +172,7 @@ static int pnp_dock_thread(void *unused)
 			 * No dock to manage
 			 */
 		case PNP_FUNCTION_NOT_SUPPORTED:
-			kthread_complete_and_exit(&unload_sem, 0);
+			complete_and_exit(&unload_sem, 0);
 		case PNP_SYSTEM_NOT_DOCKED:
 			d = 0;
 			break;
@@ -169,8 +181,7 @@ static int pnp_dock_thread(void *unused)
 			break;
 		default:
 			pnpbios_print_status("pnp_dock_thread", status);
-			printk(KERN_WARNING "PnPBIOS: disabling dock monitoring.\n");
-			kthread_complete_and_exit(&unload_sem, 0);
+			continue;
 		}
 		if (d != docked) {
 			if (pnp_dock_event(d, &now) == 0) {
@@ -183,7 +194,7 @@ static int pnp_dock_thread(void *unused)
 			}
 		}
 	}
-	kthread_complete_and_exit(&unload_sem, 0);
+	complete_and_exit(&unload_sem, 0);
 }
 
 static int pnpbios_get_resources(struct pnp_dev *dev)
@@ -298,20 +309,21 @@ struct pnp_protocol pnpbios_protocol = {
 
 static int __init insert_device(struct pnp_bios_node *node)
 {
+	struct list_head *pos;
 	struct pnp_dev *dev;
 	char id[8];
-	int error;
 
 	/* check if the device is already added */
-	list_for_each_entry(dev, &pnpbios_protocol.devices, protocol_list) {
+	list_for_each(pos, &pnpbios_protocol.devices) {
+		dev = list_entry(pos, struct pnp_dev, protocol_list);
 		if (dev->number == node->handle)
-			return -EEXIST;
+			return -1;
 	}
 
 	pnp_eisa_id_to_string(node->eisa_id & PNP_EISA_ID_MASK, id);
 	dev = pnp_alloc_dev(&pnpbios_protocol, node->handle, id);
 	if (!dev)
-		return -ENOMEM;
+		return -1;
 
 	pnpbios_parse_data_stream(dev, node);
 	dev->active = pnp_is_active(dev);
@@ -330,12 +342,7 @@ static int __init insert_device(struct pnp_bios_node *node)
 	if (!dev->active)
 		pnp_init_resources(dev);
 
-	error = pnp_add_device(dev);
-	if (error) {
-		put_device(&dev->dev);
-		return error;
-	}
-
+	pnp_add_device(dev);
 	pnpbios_interface_attach_device(node);
 
 	return 0;
@@ -480,7 +487,7 @@ static int __init exploding_pnp_bios(const struct dmi_system_id *d)
 	return 0;
 }
 
-static const struct dmi_system_id pnpbios_dmi_table[] __initconst = {
+static struct dmi_system_id pnpbios_dmi_table[] __initdata = {
 	{			/* PnPBIOS GPF on boot */
 	 .callback = exploding_pnp_bios,
 	 .ident = "Higraded P14H",
@@ -507,11 +514,10 @@ static int __init pnpbios_init(void)
 	int ret;
 
 	if (pnpbios_disabled || dmi_check_system(pnpbios_dmi_table) ||
-	    arch_pnpbios_disabled()) {
+	    paravirt_enabled()) {
 		printk(KERN_INFO "PnPBIOS: Disabled\n");
 		return -ENODEV;
 	}
-
 #ifdef CONFIG_PNPACPI
 	if (!acpi_disabled && !pnpacpi_disabled) {
 		pnpbios_disabled = 1;
@@ -566,10 +572,13 @@ static int __init pnpbios_thread_init(void)
 
 	init_completion(&unload_sem);
 	task = kthread_run(pnp_dock_thread, NULL, "kpnpbiosd");
-	return PTR_ERR_OR_ZERO(task);
+	if (IS_ERR(task))
+		return PTR_ERR(task);
+
+	return 0;
 }
 
 /* Start the kernel thread later: */
-device_initcall(pnpbios_thread_init);
+module_init(pnpbios_thread_init);
 
 EXPORT_SYMBOL(pnpbios_protocol);

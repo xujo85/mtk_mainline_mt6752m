@@ -1,24 +1,27 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * lms283gf05.c -- support for Samsung LMS283GF05 LCD
  *
  * Copyright (c) 2009 Marek Vasut <marek.vasut@gmail.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  */
 
 #include <linux/device.h>
 #include <linux/kernel.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
-#include <linux/gpio/consumer.h>
+#include <linux/gpio.h>
 #include <linux/lcd.h>
 
 #include <linux/spi/spi.h>
+#include <linux/spi/lms283gf05.h>
 #include <linux/module.h>
 
 struct lms283gf05_state {
 	struct spi_device	*spi;
 	struct lcd_device	*ld;
-	struct gpio_desc	*reset;
 };
 
 struct lms283gf05_seq {
@@ -90,13 +93,13 @@ static const struct lms283gf05_seq disp_pdwnseq[] = {
 };
 
 
-static void lms283gf05_reset(struct gpio_desc *gpiod)
+static void lms283gf05_reset(unsigned long gpio, bool inverted)
 {
-	gpiod_set_value(gpiod, 0); /* De-asserted */
+	gpio_set_value(gpio, !inverted);
 	mdelay(100);
-	gpiod_set_value(gpiod, 1); /* Asserted */
+	gpio_set_value(gpio, inverted);
 	mdelay(20);
-	gpiod_set_value(gpiod, 0); /* De-asserted */
+	gpio_set_value(gpio, !inverted);
 	mdelay(20);
 }
 
@@ -125,15 +128,18 @@ static int lms283gf05_power_set(struct lcd_device *ld, int power)
 {
 	struct lms283gf05_state *st = lcd_get_data(ld);
 	struct spi_device *spi = st->spi;
+	struct lms283gf05_pdata *pdata = spi->dev.platform_data;
 
 	if (power <= FB_BLANK_NORMAL) {
-		if (st->reset)
-			lms283gf05_reset(st->reset);
+		if (pdata)
+			lms283gf05_reset(pdata->reset_gpio,
+					pdata->reset_inverted);
 		lms283gf05_toggle(spi, disp_initseq, ARRAY_SIZE(disp_initseq));
 	} else {
 		lms283gf05_toggle(spi, disp_pdwnseq, ARRAY_SIZE(disp_pdwnseq));
-		if (st->reset)
-			gpiod_set_value(st->reset, 1); /* Asserted */
+		if (pdata)
+			gpio_set_value(pdata->reset_gpio,
+					pdata->reset_inverted);
 	}
 
 	return 0;
@@ -147,20 +153,27 @@ static struct lcd_ops lms_ops = {
 static int lms283gf05_probe(struct spi_device *spi)
 {
 	struct lms283gf05_state *st;
+	struct lms283gf05_pdata *pdata = spi->dev.platform_data;
 	struct lcd_device *ld;
+	int ret = 0;
+
+	if (pdata != NULL) {
+		ret = devm_gpio_request_one(&spi->dev, pdata->reset_gpio,
+				GPIOF_DIR_OUT | (!pdata->reset_inverted ?
+				GPIOF_INIT_HIGH : GPIOF_INIT_LOW),
+				"LMS285GF05 RESET");
+		if (ret)
+			return ret;
+	}
 
 	st = devm_kzalloc(&spi->dev, sizeof(struct lms283gf05_state),
 				GFP_KERNEL);
-	if (st == NULL)
+	if (st == NULL) {
+		dev_err(&spi->dev, "No memory for device state\n");
 		return -ENOMEM;
+	}
 
-	st->reset = gpiod_get_optional(&spi->dev, "reset", GPIOD_OUT_LOW);
-	if (IS_ERR(st->reset))
-		return PTR_ERR(st->reset);
-	gpiod_set_consumer_name(st->reset, "LMS283GF05 RESET");
-
-	ld = devm_lcd_device_register(&spi->dev, "lms283gf05", &spi->dev, st,
-					&lms_ops);
+	ld = lcd_device_register("lms283gf05", &spi->dev, st, &lms_ops);
 	if (IS_ERR(ld))
 		return PTR_ERR(ld);
 
@@ -170,9 +183,18 @@ static int lms283gf05_probe(struct spi_device *spi)
 	spi_set_drvdata(spi, st);
 
 	/* kick in the LCD */
-	if (st->reset)
-		lms283gf05_reset(st->reset);
+	if (pdata)
+		lms283gf05_reset(pdata->reset_gpio, pdata->reset_inverted);
 	lms283gf05_toggle(spi, disp_initseq, ARRAY_SIZE(disp_initseq));
+
+	return 0;
+}
+
+static int lms283gf05_remove(struct spi_device *spi)
+{
+	struct lms283gf05_state *st = spi_get_drvdata(spi);
+
+	lcd_device_unregister(st->ld);
 
 	return 0;
 }
@@ -180,8 +202,10 @@ static int lms283gf05_probe(struct spi_device *spi)
 static struct spi_driver lms283gf05_driver = {
 	.driver = {
 		.name	= "lms283gf05",
+		.owner	= THIS_MODULE,
 	},
 	.probe		= lms283gf05_probe,
+	.remove		= lms283gf05_remove,
 };
 
 module_spi_driver(lms283gf05_driver);

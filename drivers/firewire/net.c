@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * IPv4 over IEEE 1394, per RFC 2734
  * IPv6 over IEEE 1394, per RFC 3146
@@ -202,6 +201,15 @@ struct fwnet_packet_task {
 };
 
 /*
+ * Get fifo address embedded in hwaddr
+ */
+static __u64 fwnet_hwaddr_fifo(union fwnet_hwaddr *ha)
+{
+	return (u64)get_unaligned_be16(&ha->uc.fifo_hi) << 32
+	       | get_unaligned_be32(&ha->uc.fifo_lo);
+}
+
+/*
  * saddr == NULL means use device source address.
  * daddr == NULL means leave destination address (eg unresolved arp).
  */
@@ -211,7 +219,7 @@ static int fwnet_header_create(struct sk_buff *skb, struct net_device *net,
 {
 	struct fwnet_header *h;
 
-	h = skb_push(skb, sizeof(*h));
+	h = (struct fwnet_header *)skb_push(skb, sizeof(*h));
 	put_unaligned_be16(type, &h->h_proto);
 
 	if (net->flags & (IFF_LOOPBACK | IFF_NOARP)) {
@@ -229,6 +237,18 @@ static int fwnet_header_create(struct sk_buff *skb, struct net_device *net,
 	return -net->hard_header_len;
 }
 
+static int fwnet_header_rebuild(struct sk_buff *skb)
+{
+	struct fwnet_header *h = (struct fwnet_header *)skb->data;
+
+	if (get_unaligned_be16(&h->h_proto) == ETH_P_IP)
+		return arp_find((unsigned char *)&h->h_dest, skb);
+
+	dev_notice(&skb->dev->dev, "unable to resolve type %04x addresses\n",
+		   be16_to_cpu(h->h_proto));
+	return 0;
+}
+
 static int fwnet_header_cache(const struct neighbour *neigh,
 			      struct hh_cache *hh, __be16 type)
 {
@@ -241,11 +261,7 @@ static int fwnet_header_cache(const struct neighbour *neigh,
 	h = (struct fwnet_header *)((u8 *)hh->hh_data + HH_DATA_OFF(sizeof(*h)));
 	h->h_proto = type;
 	memcpy(h->h_dest, neigh->ha, net->addr_len);
-
-	/* Pairs with the READ_ONCE() in neigh_resolve_output(),
-	 * neigh_hh_output() and neigh_update_hhs().
-	 */
-	smp_store_release(&hh->hh_len, FWNET_HLEN);
+	hh->hh_len = FWNET_HLEN;
 
 	return 0;
 }
@@ -266,6 +282,7 @@ static int fwnet_header_parse(const struct sk_buff *skb, unsigned char *haddr)
 
 static const struct header_ops fwnet_header_ops = {
 	.create         = fwnet_header_create,
+	.rebuild        = fwnet_header_rebuild,
 	.cache		= fwnet_header_cache,
 	.cache_update	= fwnet_header_cache_update,
 	.parse          = fwnet_header_parse,
@@ -479,7 +496,9 @@ static int fwnet_finish_incoming_packet(struct net_device *net,
 					struct sk_buff *skb, u16 source_node_id,
 					bool is_broadcast, u16 ether_type)
 {
-	int status, len;
+	struct fwnet_device *dev;
+	int status;
+	__be64 guid;
 
 	switch (ether_type) {
 	case ETH_P_ARP:
@@ -492,6 +511,7 @@ static int fwnet_finish_incoming_packet(struct net_device *net,
 		goto err;
 	}
 
+	dev = netdev_priv(net);
 	/* Write metadata, and then pass to the receive level */
 	skb->dev = net;
 	skb->ip_summed = CHECKSUM_NONE;
@@ -500,6 +520,7 @@ static int fwnet_finish_incoming_packet(struct net_device *net,
 	 * Parse the encapsulation header. This actually does the job of
 	 * converting to an ethernet-like pseudo frame header.
 	 */
+	guid = cpu_to_be64(dev->card->guid);
 	if (dev_hard_header(skb, net, ether_type,
 			   is_broadcast ? net->broadcast : net->dev_addr,
 			   NULL, skb->len) >= 0) {
@@ -533,15 +554,13 @@ static int fwnet_finish_incoming_packet(struct net_device *net,
 		}
 		skb->protocol = protocol;
 	}
-
-	len = skb->len;
 	status = netif_rx(skb);
 	if (status == NET_RX_DROP) {
 		net->stats.rx_errors++;
 		net->stats.rx_dropped++;
 	} else {
 		net->stats.rx_packets++;
-		net->stats.rx_bytes += len;
+		net->stats.rx_bytes += skb->len;
 	}
 
 	return 0;
@@ -594,7 +613,7 @@ static int fwnet_incoming_packet(struct fwnet_device *dev, __be32 *buf, int len,
 			return -ENOMEM;
 		}
 		skb_reserve(skb, LL_RESERVED_SPACE(net));
-		skb_put_data(skb, buf, len);
+		memcpy(skb_put(skb, len), buf, len);
 
 		return fwnet_finish_incoming_packet(net, skb, source_node_id,
 						    is_broadcast, ether_type);
@@ -708,22 +727,21 @@ static void fwnet_receive_packet(struct fw_card *card, struct fw_request *r,
 	int rcode;
 
 	if (destination == IEEE1394_ALL_NODES) {
-		// Although the response to the broadcast packet is not necessarily required, the
-		// fw_send_response() function should still be called to maintain the reference
-		// counting of the object. In the case, the call of function just releases the
-		// object as a result to decrease the reference counting.
-		rcode = RCODE_COMPLETE;
-	} else if (offset != dev->handler.offset) {
+		kfree(r);
+
+		return;
+	}
+
+	if (offset != dev->handler.offset)
 		rcode = RCODE_ADDRESS_ERROR;
-	} else if (tcode != TCODE_WRITE_BLOCK_REQUEST) {
+	else if (tcode != TCODE_WRITE_BLOCK_REQUEST)
 		rcode = RCODE_TYPE_ERROR;
-	} else if (fwnet_incoming_packet(dev, payload, length,
-					 source, generation, false) != 0) {
+	else if (fwnet_incoming_packet(dev, payload, length,
+				       source, generation, false) != 0) {
 		dev_err(&dev->netdev->dev, "incoming packet failure\n");
 		rcode = RCODE_CONFLICT_ERROR;
-	} else {
+	} else
 		rcode = RCODE_COMPLETE;
-	}
 
 	fw_send_response(card, r, rcode);
 }
@@ -956,14 +974,16 @@ static int fwnet_send_packet(struct fwnet_packet_task *ptask)
 	tx_len = ptask->max_payload;
 	switch (fwnet_get_hdr_lf(&ptask->hdr)) {
 	case RFC2374_HDR_UNFRAG:
-		bufhdr = skb_push(ptask->skb, RFC2374_UNFRAG_HDR_SIZE);
+		bufhdr = (struct rfc2734_header *)
+				skb_push(ptask->skb, RFC2374_UNFRAG_HDR_SIZE);
 		put_unaligned_be32(ptask->hdr.w0, &bufhdr->w0);
 		break;
 
 	case RFC2374_HDR_FIRSTFRAG:
 	case RFC2374_HDR_INTFRAG:
 	case RFC2374_HDR_LASTFRAG:
-		bufhdr = skb_push(ptask->skb, RFC2374_FRAG_HDR_SIZE);
+		bufhdr = (struct rfc2734_header *)
+				skb_push(ptask->skb, RFC2374_FRAG_HDR_SIZE);
 		put_unaligned_be32(ptask->hdr.w0, &bufhdr->w0);
 		put_unaligned_be32(ptask->hdr.w1, &bufhdr->w1);
 		break;
@@ -1035,7 +1055,7 @@ static int fwnet_send_packet(struct fwnet_packet_task *ptask)
 
 	spin_unlock_irqrestore(&dev->lock, flags);
 
-	netif_trans_update(dev->netdev);
+	dev->netdev->trans_start = jiffies;
  out:
 	if (free)
 		fwnet_free_ptask(ptask);
@@ -1116,7 +1136,7 @@ static int fwnet_broadcast_start(struct fwnet_device *dev)
 	max_receive = 1U << (dev->card->max_receive + 1);
 	num_packets = (FWNET_ISO_PAGE_COUNT * PAGE_SIZE) / max_receive;
 
-	ptrptr = kmalloc_array(num_packets, sizeof(void *), GFP_KERNEL);
+	ptrptr = kmalloc(sizeof(void *) * num_packets, GFP_KERNEL);
 	if (!ptrptr) {
 		retval = -ENOMEM;
 		goto failed;
@@ -1300,7 +1320,7 @@ static netdev_tx_t fwnet_tx(struct sk_buff *skb, struct net_device *net)
 		max_payload        = peer->max_payload;
 		datagram_label_ptr = &peer->datagram_label;
 
-		ptask->fifo_addr   = get_unaligned_be48(ha->uc.fifo);
+		ptask->fifo_addr   = fwnet_hwaddr_fifo(ha);
 		ptask->generation  = generation;
 		ptask->dest_node   = dest_node;
 		ptask->speed       = peer->speed;
@@ -1361,6 +1381,15 @@ static netdev_tx_t fwnet_tx(struct sk_buff *skb, struct net_device *net)
 	return NETDEV_TX_OK;
 }
 
+static int fwnet_change_mtu(struct net_device *net, int new_mtu)
+{
+	if (new_mtu < 68)
+		return -EINVAL;
+
+	net->mtu = new_mtu;
+	return 0;
+}
+
 static const struct ethtool_ops fwnet_ethtool_ops = {
 	.get_link	= ethtool_op_get_link,
 };
@@ -1369,6 +1398,7 @@ static const struct net_device_ops fwnet_netdev_ops = {
 	.ndo_open       = fwnet_open,
 	.ndo_stop	= fwnet_stop,
 	.ndo_start_xmit = fwnet_tx,
+	.ndo_change_mtu = fwnet_change_mtu,
 };
 
 static void fwnet_init_dev(struct net_device *net)
@@ -1429,16 +1459,17 @@ static int fwnet_add_peer(struct fwnet_device *dev,
 	return 0;
 }
 
-static int fwnet_probe(struct fw_unit *unit,
-		       const struct ieee1394_device_id *id)
+static int fwnet_probe(struct device *_dev)
 {
+	struct fw_unit *unit = fw_unit(_dev);
 	struct fw_device *device = fw_parent_device(unit);
 	struct fw_card *card = device->card;
 	struct net_device *net;
 	bool allocated_netdev = false;
 	struct fwnet_device *dev;
-	union fwnet_hwaddr ha;
+	unsigned max_mtu;
 	int ret;
+	union fwnet_hwaddr *ha;
 
 	mutex_lock(&fwnet_device_mutex);
 
@@ -1448,11 +1479,10 @@ static int fwnet_probe(struct fw_unit *unit,
 		goto have_dev;
 	}
 
-	net = alloc_netdev(sizeof(*dev), "firewire%d", NET_NAME_UNKNOWN,
-			   fwnet_init_dev);
+	net = alloc_netdev(sizeof(*dev), "firewire%d", fwnet_init_dev);
 	if (net == NULL) {
-		mutex_unlock(&fwnet_device_mutex);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out;
 	}
 
 	allocated_netdev = true;
@@ -1476,20 +1506,20 @@ static int fwnet_probe(struct fw_unit *unit,
 	dev->local_fifo = dev->handler.offset;
 
 	/*
-	 * default MTU: RFC 2734 cl. 4, RFC 3146 cl. 4
-	 * maximum MTU: RFC 2734 cl. 4.2, fragment encapsulation header's
-	 *              maximum possible datagram_size + 1 = 0xfff + 1
+	 * Use the RFC 2734 default 1500 octets or the maximum payload
+	 * as initial MTU
 	 */
-	net->mtu = 1500U;
-	net->min_mtu = ETH_MIN_MTU;
-	net->max_mtu = 4096U;
+	max_mtu = (1 << (card->max_receive + 1))
+		  - sizeof(struct rfc2734_header) - IEEE1394_GASP_HDR_SIZE;
+	net->mtu = min(1500U, max_mtu);
 
 	/* Set our hardware address while we're at it */
-	ha.uc.uniq_id = cpu_to_be64(card->guid);
-	ha.uc.max_rec = dev->card->max_receive;
-	ha.uc.sspd = dev->card->link_speed;
-	put_unaligned_be48(dev->local_fifo, ha.uc.fifo);
-	dev_addr_set(net, ha.u);
+	ha = (union fwnet_hwaddr *)net->dev_addr;
+	put_unaligned_be64(card->guid, &ha->uc.uniq_id);
+	ha->uc.max_rec = dev->card->max_receive;
+	ha->uc.sspd = dev->card->link_speed;
+	put_unaligned_be16(dev->local_fifo >> 32, &ha->uc.fifo_hi);
+	put_unaligned_be32(dev->local_fifo & 0xffffffff, &ha->uc.fifo_lo);
 
 	memset(net->broadcast, -1, net->addr_len);
 
@@ -1515,24 +1545,6 @@ static int fwnet_probe(struct fw_unit *unit,
 	return ret;
 }
 
-/*
- * FIXME abort partially sent fragmented datagrams,
- * discard partially received fragmented datagrams
- */
-static void fwnet_update(struct fw_unit *unit)
-{
-	struct fw_device *device = fw_parent_device(unit);
-	struct fwnet_peer *peer = dev_get_drvdata(&unit->device);
-	int generation;
-
-	generation = device->generation;
-
-	spin_lock_irq(&peer->dev->lock);
-	peer->node_id    = device->node_id;
-	peer->generation = generation;
-	spin_unlock_irq(&peer->dev->lock);
-}
-
 static void fwnet_remove_peer(struct fwnet_peer *peer, struct fwnet_device *dev)
 {
 	struct fwnet_partial_datagram *pd, *pd_next;
@@ -1549,9 +1561,9 @@ static void fwnet_remove_peer(struct fwnet_peer *peer, struct fwnet_device *dev)
 	kfree(peer);
 }
 
-static void fwnet_remove(struct fw_unit *unit)
+static int fwnet_remove(struct device *_dev)
 {
-	struct fwnet_peer *peer = dev_get_drvdata(&unit->device);
+	struct fwnet_peer *peer = dev_get_drvdata(_dev);
 	struct fwnet_device *dev = peer->dev;
 	struct net_device *net;
 	int i;
@@ -1576,6 +1588,26 @@ static void fwnet_remove(struct fw_unit *unit)
 	}
 
 	mutex_unlock(&fwnet_device_mutex);
+
+	return 0;
+}
+
+/*
+ * FIXME abort partially sent fragmented datagrams,
+ * discard partially received fragmented datagrams
+ */
+static void fwnet_update(struct fw_unit *unit)
+{
+	struct fw_device *device = fw_parent_device(unit);
+	struct fwnet_peer *peer = dev_get_drvdata(&unit->device);
+	int generation;
+
+	generation = device->generation;
+
+	spin_lock_irq(&peer->dev->lock);
+	peer->node_id    = device->node_id;
+	peer->generation = generation;
+	spin_unlock_irq(&peer->dev->lock);
 }
 
 static const struct ieee1394_device_id fwnet_id_table[] = {
@@ -1601,10 +1633,10 @@ static struct fw_driver fwnet_driver = {
 		.owner  = THIS_MODULE,
 		.name   = KBUILD_MODNAME,
 		.bus    = &fw_bus_type,
+		.probe  = fwnet_probe,
+		.remove = fwnet_remove,
 	},
-	.probe    = fwnet_probe,
 	.update   = fwnet_update,
-	.remove   = fwnet_remove,
 	.id_table = fwnet_id_table,
 };
 

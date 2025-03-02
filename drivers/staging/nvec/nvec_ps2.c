@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * nvec_ps2: mouse driver for a NVIDIA compliant embedded controller
  *
@@ -7,6 +6,11 @@
  * Authors:  Pierre-Hugues Husson <phhusson@free.fr>
  *           Ilya Petrov <ilya.muromec@gmail.com>
  *           Marc Dietrich <marvin24@gmx.de>
+ *
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License.  See the file "COPYING" in the main directory of this archive
+ * for more details.
+ *
  */
 
 #include <linux/module.h>
@@ -28,7 +32,7 @@
 	print_hex_dump(KERN_DEBUG, str, DUMP_PREFIX_NONE, \
 			16, 1, buf, len, false)
 #else
-#define NVEC_PHD(str, buf, len) do { } while (0)
+#define NVEC_PHD(str, buf, len)
 #endif
 
 enum ps2_subcmds {
@@ -49,14 +53,12 @@ static struct nvec_ps2 ps2_dev;
 static int ps2_startstreaming(struct serio *ser_dev)
 {
 	unsigned char buf[] = { NVEC_PS2, AUTO_RECEIVE_N, PACKET_SIZE };
-
 	return nvec_write_async(ps2_dev.nvec, buf, sizeof(buf));
 }
 
 static void ps2_stopstreaming(struct serio *ser_dev)
 {
 	unsigned char buf[] = { NVEC_PS2, CANCEL_AUTO_RECEIVE };
-
 	nvec_write_async(ps2_dev.nvec, buf, sizeof(buf));
 }
 
@@ -74,7 +76,7 @@ static int nvec_ps2_notifier(struct notifier_block *nb,
 			     unsigned long event_type, void *data)
 {
 	int i;
-	unsigned char *msg = data;
+	unsigned char *msg = (unsigned char *)data;
 
 	switch (event_type) {
 	case NVEC_PS2_EVT:
@@ -102,18 +104,19 @@ static int nvec_mouse_probe(struct platform_device *pdev)
 {
 	struct nvec_chip *nvec = dev_get_drvdata(pdev->dev.parent);
 	struct serio *ser_dev;
+	char mouse_reset[] = { NVEC_PS2, SEND_COMMAND, PSMOUSE_RST, 3 };
 
-	ser_dev = kzalloc(sizeof(*ser_dev), GFP_KERNEL);
-	if (!ser_dev)
+	ser_dev = kzalloc(sizeof(struct serio), GFP_KERNEL);
+	if (ser_dev == NULL)
 		return -ENOMEM;
 
-	ser_dev->id.type = SERIO_8042;
+	ser_dev->id.type = SERIO_PS_PSTHRU;
 	ser_dev->write = ps2_sendcommand;
 	ser_dev->start = ps2_startstreaming;
 	ser_dev->stop = ps2_stopstreaming;
 
-	strscpy(ser_dev->name, "nvec mouse", sizeof(ser_dev->name));
-	strscpy(ser_dev->phys, "nvec", sizeof(ser_dev->phys));
+	strlcpy(ser_dev->name, "nvec mouse", sizeof(ser_dev->name));
+	strlcpy(ser_dev->phys, "nvec", sizeof(ser_dev->phys));
 
 	ps2_dev.ser_dev = ser_dev;
 	ps2_dev.notifier.notifier_call = nvec_ps2_notifier;
@@ -122,10 +125,13 @@ static int nvec_mouse_probe(struct platform_device *pdev)
 
 	serio_register_port(ser_dev);
 
+	/* mouse reset */
+	nvec_write_async(nvec, mouse_reset, sizeof(mouse_reset));
+
 	return 0;
 }
 
-static void nvec_mouse_remove(struct platform_device *pdev)
+static int nvec_mouse_remove(struct platform_device *pdev)
 {
 	struct nvec_chip *nvec = dev_get_drvdata(pdev->dev.parent);
 
@@ -133,6 +139,8 @@ static void nvec_mouse_remove(struct platform_device *pdev)
 	ps2_stopstreaming(ps2_dev.ser_dev);
 	nvec_unregister_notifier(nvec, &ps2_dev.notifier);
 	serio_unregister_port(ps2_dev.ser_dev);
+
+	return 0;
 }
 
 #ifdef CONFIG_PM_SLEEP
@@ -159,14 +167,15 @@ static int nvec_mouse_resume(struct device *dev)
 }
 #endif
 
-static SIMPLE_DEV_PM_OPS(nvec_mouse_pm_ops, nvec_mouse_suspend,
-			 nvec_mouse_resume);
+static const SIMPLE_DEV_PM_OPS(nvec_mouse_pm_ops, nvec_mouse_suspend,
+				nvec_mouse_resume);
 
 static struct platform_driver nvec_mouse_driver = {
 	.probe  = nvec_mouse_probe,
-	.remove_new = nvec_mouse_remove,
+	.remove = nvec_mouse_remove,
 	.driver = {
 		.name = "nvec-mouse",
+		.owner = THIS_MODULE,
 		.pm = &nvec_mouse_pm_ops,
 	},
 };

@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Amiga Linux/68k 8390 based PCMCIA Ethernet Driver for the Amiga 1200
  *
@@ -17,6 +16,12 @@
  *
  * cnetdevice: A Sana-II ethernet driver for AmigaOS
  *             Written by Bruce Abbott (bhabbott@inhb.co.nz)
+ *
+ * ----------------------------------------------------------------------------
+ *
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License.  See the file COPYING in the main directory of the Linux
+ * distribution for more details.
  *
  * ----------------------------------------------------------------------------
  *
@@ -70,6 +75,7 @@
 #define NESM_STOP_PG	0x80	/* Last page +1 of RX ring */
 
 
+struct net_device * __init apne_probe(int unit);
 static int apne_probe1(struct net_device *dev, int ioaddr);
 
 static void apne_reset_8390(struct net_device *dev);
@@ -110,15 +116,9 @@ static const char version[] =
 
 static int apne_owned;	/* signal if card already owned */
 
-static u32 apne_msg_enable;
-module_param_named(msg_enable, apne_msg_enable, uint, 0444);
-MODULE_PARM_DESC(msg_enable, "Debug message level (see linux/netdevice.h for bitmap)");
-
-static struct net_device * __init apne_probe(void)
+struct net_device * __init apne_probe(int unit)
 {
 	struct net_device *dev;
-	struct ei_device *ei_local;
-
 #ifndef MANUAL_CONFIG
 	char tuple[8];
 #endif
@@ -133,19 +133,21 @@ static struct net_device * __init apne_probe(void)
 	if ( !(AMIGAHW_PRESENT(PCMCIA)) )
 		return ERR_PTR(-ENODEV);
 
-	pr_info("Looking for PCMCIA ethernet card : ");
+	printk("Looking for PCMCIA ethernet card : ");
 
 	/* check if a card is inserted */
 	if (!(PCMCIA_INSERTED)) {
-		pr_cont("NO PCMCIA card inserted\n");
+		printk("NO PCMCIA card inserted\n");
 		return ERR_PTR(-ENODEV);
 	}
 
 	dev = alloc_ei_netdev();
 	if (!dev)
 		return ERR_PTR(-ENOMEM);
-	ei_local = netdev_priv(dev);
-	ei_local->msg_enable = apne_msg_enable;
+	if (unit >= 0) {
+		sprintf(dev->name, "eth%d", unit);
+		netdev_boot_setup_check(dev);
+	}
 
 	/* disable pcmcia irq for readtuple */
 	pcmcia_disable_irq();
@@ -153,14 +155,14 @@ static struct net_device * __init apne_probe(void)
 #ifndef MANUAL_CONFIG
 	if ((pcmcia_copy_tuple(CISTPL_FUNCID, tuple, 8) < 3) ||
 		(tuple[2] != CISTPL_FUNCID_NETWORK)) {
-		pr_cont("not an ethernet card\n");
+		printk("not an ethernet card\n");
 		/* XXX: shouldn't we re-enable irq here? */
 		free_netdev(dev);
 		return ERR_PTR(-ENODEV);
 	}
 #endif
 
-	pr_cont("ethernet PCMCIA card inserted\n");
+	printk("ethernet PCMCIA card inserted\n");
 
 	if (!init_pcmcia()) {
 		/* XXX: shouldn't we re-enable irq here? */
@@ -203,10 +205,10 @@ static int __init apne_probe1(struct net_device *dev, int ioaddr)
 #endif
     static unsigned version_printed;
 
-    if ((apne_msg_enable & NETIF_MSG_DRV) && (version_printed++ == 0))
-		netdev_info(dev, version);
+    if (ei_debug  &&  version_printed++ == 0)
+	printk(version);
 
-    netdev_info(dev, "PCMCIA NE*000 ethercard probe");
+    printk("PCMCIA NE*000 ethercard probe");
 
     /* Reset card. Who knows what dain-bramaged state it was left in. */
     {	unsigned long reset_start_time = jiffies;
@@ -215,7 +217,7 @@ static int __init apne_probe1(struct net_device *dev, int ioaddr)
 
 	while ((inb(ioaddr + NE_EN0_ISR) & ENISR_RESET) == 0)
 		if (time_after(jiffies, reset_start_time + 2*HZ/100)) {
-			pr_cont(" not found (no reset ack).\n");
+			printk(" not found (no reset ack).\n");
 			return -ENODEV;
 		}
 
@@ -286,7 +288,7 @@ static int __init apne_probe1(struct net_device *dev, int ioaddr)
 	start_page = 0x01;
 	stop_page = (wordlength == 2) ? 0x40 : 0x20;
     } else {
-	pr_cont(" not found.\n");
+	printk(" not found.\n");
 	return -ENXIO;
 
     }
@@ -315,11 +317,12 @@ static int __init apne_probe1(struct net_device *dev, int ioaddr)
     i = request_irq(dev->irq, apne_interrupt, IRQF_SHARED, DRV_NAME, dev);
     if (i) return i;
 
-    eth_hw_addr_set(dev, SA_prom);
+    for (i = 0; i < ETH_ALEN; i++)
+	dev->dev_addr[i] = SA_prom[i];
 
-    pr_cont(" %pM\n", dev->dev_addr);
+    printk(" %pM\n", dev->dev_addr);
 
-    netdev_info(dev, "%s found.\n", name);
+    printk("%s: %s found.\n", dev->name, name);
 
     ei_status.name = name;
     ei_status.tx_start_page = start_page;
@@ -349,11 +352,10 @@ static void
 apne_reset_8390(struct net_device *dev)
 {
     unsigned long reset_start_time = jiffies;
-    struct ei_device *ei_local = netdev_priv(dev);
 
     init_pcmcia();
 
-    netif_dbg(ei_local, hw, dev, "resetting the 8390 t=%ld...\n", jiffies);
+    if (ei_debug > 1) printk("resetting the 8390 t=%ld...", jiffies);
 
     outb(inb(NE_BASE + NE_RESET), NE_BASE + NE_RESET);
 
@@ -363,8 +365,8 @@ apne_reset_8390(struct net_device *dev)
     /* This check _should_not_ be necessary, omit eventually. */
     while ((inb(NE_BASE+NE_EN0_ISR) & ENISR_RESET) == 0)
 	if (time_after(jiffies, reset_start_time + 2*HZ/100)) {
-		netdev_err(dev, "ne_reset_8390() did not complete.\n");
-		break;
+	    printk("%s: ne_reset_8390() did not complete.\n", dev->name);
+	    break;
 	}
     outb(ENISR_RESET, NE_BASE + NE_EN0_ISR);	/* Ack intr. */
 }
@@ -384,9 +386,9 @@ apne_get_8390_hdr(struct net_device *dev, struct e8390_pkt_hdr *hdr, int ring_pa
 
     /* This *shouldn't* happen. If it does, it's the last thing you'll see */
     if (ei_status.dmaing) {
-	netdev_err(dev, "DMAing conflict in ne_get_8390_hdr "
-		   "[DMAstat:%d][irqlock:%d][intr:%d].\n",
-		   ei_status.dmaing, ei_status.irqlock, dev->irq);
+	printk("%s: DMAing conflict in ne_get_8390_hdr "
+	   "[DMAstat:%d][irqlock:%d][intr:%d].\n",
+	   dev->name, ei_status.dmaing, ei_status.irqlock, dev->irq);
 	return;
     }
 
@@ -431,9 +433,9 @@ apne_block_input(struct net_device *dev, int count, struct sk_buff *skb, int rin
 
     /* This *shouldn't* happen. If it does, it's the last thing you'll see */
     if (ei_status.dmaing) {
-		netdev_err(dev, "DMAing conflict in ne_block_input "
-			   "[DMAstat:%d][irqlock:%d][intr:%d].\n",
-			   ei_status.dmaing, ei_status.irqlock, dev->irq);
+	printk("%s: DMAing conflict in ne_block_input "
+	   "[DMAstat:%d][irqlock:%d][intr:%d].\n",
+	   dev->name, ei_status.dmaing, ei_status.irqlock, dev->irq);
 	return;
     }
     ei_status.dmaing |= 0x01;
@@ -479,9 +481,9 @@ apne_block_output(struct net_device *dev, int count,
 
     /* This *shouldn't* happen. If it does, it's the last thing you'll see */
     if (ei_status.dmaing) {
-		netdev_err(dev, "DMAing conflict in ne_block_output."
-			   "[DMAstat:%d][irqlock:%d][intr:%d]\n",
-			   ei_status.dmaing, ei_status.irqlock, dev->irq);
+	printk("%s: DMAing conflict in ne_block_output."
+	   "[DMAstat:%d][irqlock:%d][intr:%d]\n",
+	   dev->name, ei_status.dmaing, ei_status.irqlock, dev->irq);
 	return;
     }
     ei_status.dmaing |= 0x01;
@@ -511,7 +513,7 @@ apne_block_output(struct net_device *dev, int count,
 
     while ((inb(NE_BASE + NE_EN0_ISR) & ENISR_RDC) == 0)
 	if (time_after(jiffies, dma_start + 2*HZ/100)) {	/* 20ms */
-		netdev_warn(dev, "timeout waiting for Tx RDC.\n");
+		printk("%s: timeout waiting for Tx RDC.\n", dev->name);
 		apne_reset_8390(dev);
 		NS8390_init(dev,1);
 		break;
@@ -534,8 +536,8 @@ static irqreturn_t apne_interrupt(int irq, void *dev_id)
         pcmcia_ack_int(pcmcia_intreq);
         return IRQ_NONE;
     }
-    if (apne_msg_enable & NETIF_MSG_INTR)
-	pr_debug("pcmcia intreq = %x\n", pcmcia_intreq);
+    if (ei_debug > 3)
+        printk("pcmcia intreq = %x\n", pcmcia_intreq);
     pcmcia_disable_irq();			/* to get rid of the sti() within ei_interrupt */
     ei_interrupt(irq, dev_id);
     pcmcia_ack_int(pcmcia_get_intreq());
@@ -543,12 +545,15 @@ static irqreturn_t apne_interrupt(int irq, void *dev_id)
     return IRQ_HANDLED;
 }
 
+#ifdef MODULE
 static struct net_device *apne_dev;
 
 static int __init apne_module_init(void)
 {
-	apne_dev = apne_probe();
-	return PTR_ERR_OR_ZERO(apne_dev);
+	apne_dev = apne_probe(-1);
+	if (IS_ERR(apne_dev))
+		return PTR_ERR(apne_dev);
+	return 0;
 }
 
 static void __exit apne_module_exit(void)
@@ -567,6 +572,7 @@ static void __exit apne_module_exit(void)
 }
 module_init(apne_module_init);
 module_exit(apne_module_exit);
+#endif
 
 static int init_pcmcia(void)
 {

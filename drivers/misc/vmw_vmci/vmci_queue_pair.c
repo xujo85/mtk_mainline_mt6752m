@@ -1,8 +1,16 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * VMware VMCI Driver
  *
  * Copyright (C) 2012 VMware, Inc. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation version 2 and no later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * for more details.
  */
 
 #include <linux/vmw_vmci_defs.h>
@@ -13,13 +21,11 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pagemap.h>
-#include <linux/pci.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/uio.h>
 #include <linux/wait.h>
 #include <linux/vmalloc.h>
-#include <linux/skbuff.h>
 
 #include "vmci_handle_array.h"
 #include "vmci_queue_pair.h"
@@ -121,22 +127,33 @@
  * *_MEM state, and vice versa.
  */
 
+/*
+ * VMCIMemcpy{To,From}QueueFunc() prototypes.  Functions of these
+ * types are passed around to enqueue and dequeue routines.  Note that
+ * often the functions passed are simply wrappers around memcpy
+ * itself.
+ *
+ * Note: In order for the memcpy typedefs to be compatible with the VMKernel,
+ * there's an unused last parameter for the hosted side.  In
+ * ESX, that parameter holds a buffer type.
+ */
+typedef int vmci_memcpy_to_queue_func(struct vmci_queue *queue,
+				      u64 queue_offset, const void *src,
+				      size_t src_offset, size_t size);
+typedef int vmci_memcpy_from_queue_func(void *dest, size_t dest_offset,
+					const struct vmci_queue *queue,
+					u64 queue_offset, size_t size);
+
 /* The Kernel specific component of the struct vmci_queue structure. */
 struct vmci_queue_kern_if {
+	struct page **page;
+	struct page **header_page;
+	void *va;
 	struct mutex __mutex;	/* Protects the queue. */
 	struct mutex *mutex;	/* Shared by producer and consumer queues. */
-	size_t num_pages;	/* Number of pages incl. header. */
-	bool host;		/* Host or guest? */
-	union {
-		struct {
-			dma_addr_t *pas;
-			void **vas;
-		} g;		/* Used by the guest. */
-		struct {
-			struct page **page;
-			struct page **header_page;
-		} h;		/* Used by the host. */
-	} u;
+	bool host;
+	size_t num_pages;
+	bool mapped;
 };
 
 /*
@@ -237,9 +254,7 @@ static struct qp_list qp_guest_endpoints = {
 #define QPE_NUM_PAGES(_QPE) ((u32) \
 			     (DIV_ROUND_UP(_QPE.produce_size, PAGE_SIZE) + \
 			      DIV_ROUND_UP(_QPE.consume_size, PAGE_SIZE) + 2))
-#define QP_SIZES_ARE_VALID(_prod_qsize, _cons_qsize) \
-	((_prod_qsize) + (_cons_qsize) >= max(_prod_qsize, _cons_qsize) && \
-	 (_prod_qsize) + (_cons_qsize) <= VMCI_MAX_GUEST_QP_MEMORY)
+
 
 /*
  * Frees kernel VA space for a given queue and its queue header, and
@@ -250,105 +265,105 @@ static void qp_free_queue(void *q, u64 size)
 	struct vmci_queue *queue = q;
 
 	if (queue) {
-		u64 i;
+		u64 i = DIV_ROUND_UP(size, PAGE_SIZE);
 
-		/* Given size does not include header, so add in a page here. */
-		for (i = 0; i < DIV_ROUND_UP(size, PAGE_SIZE) + 1; i++) {
-			dma_free_coherent(&vmci_pdev->dev, PAGE_SIZE,
-					  queue->kernel_if->u.g.vas[i],
-					  queue->kernel_if->u.g.pas[i]);
+		if (queue->kernel_if->mapped) {
+			vunmap(queue->kernel_if->va);
+			queue->kernel_if->va = NULL;
 		}
 
-		vfree(queue);
+		while (i)
+			__free_page(queue->kernel_if->page[--i]);
+
+		vfree(queue->q_header);
 	}
 }
 
 /*
- * Allocates kernel queue pages of specified size with IOMMU mappings,
- * plus space for the queue structure/kernel interface and the queue
- * header.
+ * Allocates kernel VA space of specified size, plus space for the
+ * queue structure/kernel interface and the queue header.  Allocates
+ * physical pages for the queue data pages.
+ *
+ * PAGE m:      struct vmci_queue_header (struct vmci_queue->q_header)
+ * PAGE m+1:    struct vmci_queue
+ * PAGE m+1+q:  struct vmci_queue_kern_if (struct vmci_queue->kernel_if)
+ * PAGE n-size: Data pages (struct vmci_queue->kernel_if->page[])
  */
 static void *qp_alloc_queue(u64 size, u32 flags)
 {
 	u64 i;
 	struct vmci_queue *queue;
-	size_t pas_size;
-	size_t vas_size;
-	size_t queue_size = sizeof(*queue) + sizeof(*queue->kernel_if);
-	u64 num_pages;
+	struct vmci_queue_header *q_header;
+	const u64 num_data_pages = DIV_ROUND_UP(size, PAGE_SIZE);
+	const uint queue_size =
+	    PAGE_SIZE +
+	    sizeof(*queue) + sizeof(*(queue->kernel_if)) +
+	    num_data_pages * sizeof(*(queue->kernel_if->page));
 
-	if (size > SIZE_MAX - PAGE_SIZE)
-		return NULL;
-	num_pages = DIV_ROUND_UP(size, PAGE_SIZE) + 1;
-	if (num_pages >
-		 (SIZE_MAX - queue_size) /
-		 (sizeof(*queue->kernel_if->u.g.pas) +
-		  sizeof(*queue->kernel_if->u.g.vas)))
+	q_header = vmalloc(queue_size);
+	if (!q_header)
 		return NULL;
 
-	pas_size = num_pages * sizeof(*queue->kernel_if->u.g.pas);
-	vas_size = num_pages * sizeof(*queue->kernel_if->u.g.vas);
-	queue_size += pas_size + vas_size;
-
-	queue = vmalloc(queue_size);
-	if (!queue)
-		return NULL;
-
-	queue->q_header = NULL;
+	queue = (void *)q_header + PAGE_SIZE;
+	queue->q_header = q_header;
 	queue->saved_header = NULL;
 	queue->kernel_if = (struct vmci_queue_kern_if *)(queue + 1);
-	queue->kernel_if->mutex = NULL;
-	queue->kernel_if->num_pages = num_pages;
-	queue->kernel_if->u.g.pas = (dma_addr_t *)(queue->kernel_if + 1);
-	queue->kernel_if->u.g.vas =
-		(void **)((u8 *)queue->kernel_if->u.g.pas + pas_size);
+	queue->kernel_if->header_page = NULL;	/* Unused in guest. */
+	queue->kernel_if->page = (struct page **)(queue->kernel_if + 1);
 	queue->kernel_if->host = false;
+	queue->kernel_if->va = NULL;
+	queue->kernel_if->mapped = false;
 
-	for (i = 0; i < num_pages; i++) {
-		queue->kernel_if->u.g.vas[i] =
-			dma_alloc_coherent(&vmci_pdev->dev, PAGE_SIZE,
-					   &queue->kernel_if->u.g.pas[i],
-					   GFP_KERNEL);
-		if (!queue->kernel_if->u.g.vas[i]) {
-			/* Size excl. the header. */
-			qp_free_queue(queue, i * PAGE_SIZE);
-			return NULL;
-		}
+	for (i = 0; i < num_data_pages; i++) {
+		queue->kernel_if->page[i] = alloc_pages(GFP_KERNEL, 0);
+		if (!queue->kernel_if->page[i])
+			goto fail;
 	}
 
-	/* Queue header is the first page. */
-	queue->q_header = queue->kernel_if->u.g.vas[0];
+	if (vmci_qp_pinned(flags)) {
+		queue->kernel_if->va =
+		    vmap(queue->kernel_if->page, num_data_pages, VM_MAP,
+			 PAGE_KERNEL);
+		if (!queue->kernel_if->va)
+			goto fail;
 
-	return queue;
+		queue->kernel_if->mapped = true;
+	}
+
+	return (void *)queue;
+
+ fail:
+	qp_free_queue(queue, i * PAGE_SIZE);
+	return NULL;
 }
 
 /*
  * Copies from a given buffer or iovector to a VMCI Queue.  Uses
- * kmap_local_page() to dynamically map required portions of the queue
+ * kmap()/kunmap() to dynamically map/unmap required portions of the queue
  * by traversing the offset -> page translation structure for the queue.
  * Assumes that offset + size does not wrap around in the queue.
  */
-static int qp_memcpy_to_queue_iter(struct vmci_queue *queue,
-				  u64 queue_offset,
-				  struct iov_iter *from,
-				  size_t size)
+static int __qp_memcpy_to_queue(struct vmci_queue *queue,
+				u64 queue_offset,
+				const void *src,
+				size_t size,
+				bool is_iovec)
 {
 	struct vmci_queue_kern_if *kernel_if = queue->kernel_if;
 	size_t bytes_copied = 0;
 
 	while (bytes_copied < size) {
-		const u64 page_index =
-			(queue_offset + bytes_copied) / PAGE_SIZE;
-		const size_t page_offset =
+		u64 page_index = (queue_offset + bytes_copied) / PAGE_SIZE;
+		size_t page_offset =
 		    (queue_offset + bytes_copied) & (PAGE_SIZE - 1);
 		void *va;
 		size_t to_copy;
 
-		if (kernel_if->host)
-			va = kmap_local_page(kernel_if->u.h.page[page_index]);
+		if (!kernel_if->mapped)
+			va = kmap(kernel_if->page[page_index]);
 		else
-			va = kernel_if->u.g.vas[page_index + 1];
-			/* Skip header. */
+			va = (void *)((u8 *)kernel_if->va +
+				      (page_index * PAGE_SIZE));
 
 		if (size - bytes_copied > PAGE_SIZE - page_offset)
 			/* Enough payload to fill up from this page. */
@@ -356,15 +371,25 @@ static int qp_memcpy_to_queue_iter(struct vmci_queue *queue,
 		else
 			to_copy = size - bytes_copied;
 
-		if (!copy_from_iter_full((u8 *)va + page_offset, to_copy,
-					 from)) {
-			if (kernel_if->host)
-				kunmap_local(va);
-			return VMCI_ERROR_INVALID_ARGS;
+		if (is_iovec) {
+			struct iovec *iov = (struct iovec *)src;
+			int err;
+
+			/* The iovec will track bytes_copied internally. */
+			err = memcpy_fromiovec((u8 *)va + page_offset,
+					       iov, to_copy);
+			if (err != 0) {
+				kunmap(kernel_if->page[page_index]);
+				return VMCI_ERROR_INVALID_ARGS;
+			}
+		} else {
+			memcpy((u8 *)va + page_offset,
+			       (u8 *)src + bytes_copied, to_copy);
 		}
+
 		bytes_copied += to_copy;
-		if (kernel_if->host)
-			kunmap_local(va);
+		if (!kernel_if->mapped)
+			kunmap(kernel_if->page[page_index]);
 	}
 
 	return VMCI_SUCCESS;
@@ -372,31 +397,31 @@ static int qp_memcpy_to_queue_iter(struct vmci_queue *queue,
 
 /*
  * Copies to a given buffer or iovector from a VMCI Queue.  Uses
- * kmap_local_page() to dynamically map required portions of the queue
+ * kmap()/kunmap() to dynamically map/unmap required portions of the queue
  * by traversing the offset -> page translation structure for the queue.
  * Assumes that offset + size does not wrap around in the queue.
  */
-static int qp_memcpy_from_queue_iter(struct iov_iter *to,
-				    const struct vmci_queue *queue,
-				    u64 queue_offset, size_t size)
+static int __qp_memcpy_from_queue(void *dest,
+				  const struct vmci_queue *queue,
+				  u64 queue_offset,
+				  size_t size,
+				  bool is_iovec)
 {
 	struct vmci_queue_kern_if *kernel_if = queue->kernel_if;
 	size_t bytes_copied = 0;
 
 	while (bytes_copied < size) {
-		const u64 page_index =
-			(queue_offset + bytes_copied) / PAGE_SIZE;
-		const size_t page_offset =
+		u64 page_index = (queue_offset + bytes_copied) / PAGE_SIZE;
+		size_t page_offset =
 		    (queue_offset + bytes_copied) & (PAGE_SIZE - 1);
 		void *va;
 		size_t to_copy;
-		int err;
 
-		if (kernel_if->host)
-			va = kmap_local_page(kernel_if->u.h.page[page_index]);
+		if (!kernel_if->mapped)
+			va = kmap(kernel_if->page[page_index]);
 		else
-			va = kernel_if->u.g.vas[page_index + 1];
-			/* Skip header. */
+			va = (void *)((u8 *)kernel_if->va +
+				      (page_index * PAGE_SIZE));
 
 		if (size - bytes_copied > PAGE_SIZE - page_offset)
 			/* Enough payload to fill up this page. */
@@ -404,15 +429,25 @@ static int qp_memcpy_from_queue_iter(struct iov_iter *to,
 		else
 			to_copy = size - bytes_copied;
 
-		err = copy_to_iter((u8 *)va + page_offset, to_copy, to);
-		if (err != to_copy) {
-			if (kernel_if->host)
-				kunmap_local(va);
-			return VMCI_ERROR_INVALID_ARGS;
+		if (is_iovec) {
+			struct iovec *iov = (struct iovec *)dest;
+			int err;
+
+			/* The iovec will track bytes_copied internally. */
+			err = memcpy_toiovec(iov, (u8 *)va + page_offset,
+					     to_copy);
+			if (err != 0) {
+				kunmap(kernel_if->page[page_index]);
+				return VMCI_ERROR_INVALID_ARGS;
+			}
+		} else {
+			memcpy((u8 *)dest + bytes_copied,
+			       (u8 *)va + page_offset, to_copy);
 		}
+
 		bytes_copied += to_copy;
-		if (kernel_if->host)
-			kunmap_local(va);
+		if (!kernel_if->mapped)
+			kunmap(kernel_if->page[page_index]);
 	}
 
 	return VMCI_SUCCESS;
@@ -429,8 +464,8 @@ static int qp_alloc_ppn_set(void *prod_q,
 			    void *cons_q,
 			    u64 num_consume_pages, struct ppn_set *ppn_set)
 {
-	u64 *produce_ppns;
-	u64 *consume_ppns;
+	u32 *produce_ppns;
+	u32 *consume_ppns;
 	struct vmci_queue *produce_q = prod_q;
 	struct vmci_queue *consume_q = cons_q;
 	u64 i;
@@ -443,26 +478,44 @@ static int qp_alloc_ppn_set(void *prod_q,
 		return VMCI_ERROR_ALREADY_EXISTS;
 
 	produce_ppns =
-	    kmalloc_array(num_produce_pages, sizeof(*produce_ppns),
-			  GFP_KERNEL);
+	    kmalloc(num_produce_pages * sizeof(*produce_ppns), GFP_KERNEL);
 	if (!produce_ppns)
 		return VMCI_ERROR_NO_MEM;
 
 	consume_ppns =
-	    kmalloc_array(num_consume_pages, sizeof(*consume_ppns),
-			  GFP_KERNEL);
+	    kmalloc(num_consume_pages * sizeof(*consume_ppns), GFP_KERNEL);
 	if (!consume_ppns) {
 		kfree(produce_ppns);
 		return VMCI_ERROR_NO_MEM;
 	}
 
-	for (i = 0; i < num_produce_pages; i++)
-		produce_ppns[i] =
-			produce_q->kernel_if->u.g.pas[i] >> PAGE_SHIFT;
+	produce_ppns[0] = page_to_pfn(vmalloc_to_page(produce_q->q_header));
+	for (i = 1; i < num_produce_pages; i++) {
+		unsigned long pfn;
 
-	for (i = 0; i < num_consume_pages; i++)
+		produce_ppns[i] =
+		    page_to_pfn(produce_q->kernel_if->page[i - 1]);
+		pfn = produce_ppns[i];
+
+		/* Fail allocation if PFN isn't supported by hypervisor. */
+		if (sizeof(pfn) > sizeof(*produce_ppns)
+		    && pfn != produce_ppns[i])
+			goto ppn_error;
+	}
+
+	consume_ppns[0] = page_to_pfn(vmalloc_to_page(consume_q->q_header));
+	for (i = 1; i < num_consume_pages; i++) {
+		unsigned long pfn;
+
 		consume_ppns[i] =
-			consume_q->kernel_if->u.g.pas[i] >> PAGE_SHIFT;
+		    page_to_pfn(consume_q->kernel_if->page[i - 1]);
+		pfn = consume_ppns[i];
+
+		/* Fail allocation if PFN isn't supported by hypervisor. */
+		if (sizeof(pfn) > sizeof(*consume_ppns)
+		    && pfn != consume_ppns[i])
+			goto ppn_error;
+	}
 
 	ppn_set->num_produce_pages = num_produce_pages;
 	ppn_set->num_consume_pages = num_consume_pages;
@@ -470,6 +523,11 @@ static int qp_alloc_ppn_set(void *prod_q,
 	ppn_set->consume_ppns = consume_ppns;
 	ppn_set->initialized = true;
 	return VMCI_SUCCESS;
+
+ ppn_error:
+	kfree(produce_ppns);
+	kfree(consume_ppns);
+	return VMCI_ERROR_INVALID_ARGS;
 }
 
 /*
@@ -491,30 +549,62 @@ static void qp_free_ppn_set(struct ppn_set *ppn_set)
  */
 static int qp_populate_ppn_set(u8 *call_buf, const struct ppn_set *ppn_set)
 {
-	if (vmci_use_ppn64()) {
-		memcpy(call_buf, ppn_set->produce_ppns,
-		       ppn_set->num_produce_pages *
-		       sizeof(*ppn_set->produce_ppns));
-		memcpy(call_buf +
-		       ppn_set->num_produce_pages *
-		       sizeof(*ppn_set->produce_ppns),
-		       ppn_set->consume_ppns,
-		       ppn_set->num_consume_pages *
-		       sizeof(*ppn_set->consume_ppns));
-	} else {
-		int i;
-		u32 *ppns = (u32 *) call_buf;
-
-		for (i = 0; i < ppn_set->num_produce_pages; i++)
-			ppns[i] = (u32) ppn_set->produce_ppns[i];
-
-		ppns = &ppns[ppn_set->num_produce_pages];
-
-		for (i = 0; i < ppn_set->num_consume_pages; i++)
-			ppns[i] = (u32) ppn_set->consume_ppns[i];
-	}
+	memcpy(call_buf, ppn_set->produce_ppns,
+	       ppn_set->num_produce_pages * sizeof(*ppn_set->produce_ppns));
+	memcpy(call_buf +
+	       ppn_set->num_produce_pages * sizeof(*ppn_set->produce_ppns),
+	       ppn_set->consume_ppns,
+	       ppn_set->num_consume_pages * sizeof(*ppn_set->consume_ppns));
 
 	return VMCI_SUCCESS;
+}
+
+static int qp_memcpy_to_queue(struct vmci_queue *queue,
+			      u64 queue_offset,
+			      const void *src, size_t src_offset, size_t size)
+{
+	return __qp_memcpy_to_queue(queue, queue_offset,
+				    (u8 *)src + src_offset, size, false);
+}
+
+static int qp_memcpy_from_queue(void *dest,
+				size_t dest_offset,
+				const struct vmci_queue *queue,
+				u64 queue_offset, size_t size)
+{
+	return __qp_memcpy_from_queue((u8 *)dest + dest_offset,
+				      queue, queue_offset, size, false);
+}
+
+/*
+ * Copies from a given iovec from a VMCI Queue.
+ */
+static int qp_memcpy_to_queue_iov(struct vmci_queue *queue,
+				  u64 queue_offset,
+				  const void *src,
+				  size_t src_offset, size_t size)
+{
+
+	/*
+	 * We ignore src_offset because src is really a struct iovec * and will
+	 * maintain offset internally.
+	 */
+	return __qp_memcpy_to_queue(queue, queue_offset, src, size, true);
+}
+
+/*
+ * Copies to a given iovec from a VMCI Queue.
+ */
+static int qp_memcpy_from_queue_iov(void *dest,
+				    size_t dest_offset,
+				    const struct vmci_queue *queue,
+				    u64 queue_offset, size_t size)
+{
+	/*
+	 * We ignore dest_offset because dest is really a struct iovec * and
+	 * will maintain offset internally.
+	 */
+	return __qp_memcpy_from_queue(dest, queue, queue_offset, size, true);
 }
 
 /*
@@ -526,34 +616,26 @@ static int qp_populate_ppn_set(u8 *call_buf, const struct ppn_set *ppn_set)
 static struct vmci_queue *qp_host_alloc_queue(u64 size)
 {
 	struct vmci_queue *queue;
-	size_t queue_page_size;
-	u64 num_pages;
+	const size_t num_pages = DIV_ROUND_UP(size, PAGE_SIZE) + 1;
 	const size_t queue_size = sizeof(*queue) + sizeof(*(queue->kernel_if));
-
-	if (size > min_t(size_t, VMCI_MAX_GUEST_QP_MEMORY, SIZE_MAX - PAGE_SIZE))
-		return NULL;
-	num_pages = DIV_ROUND_UP(size, PAGE_SIZE) + 1;
-	if (num_pages > (SIZE_MAX - queue_size) /
-		 sizeof(*queue->kernel_if->u.h.page))
-		return NULL;
-
-	queue_page_size = num_pages * sizeof(*queue->kernel_if->u.h.page);
-
-	if (queue_size + queue_page_size > KMALLOC_MAX_SIZE)
-		return NULL;
+	const size_t queue_page_size =
+	    num_pages * sizeof(*queue->kernel_if->page);
 
 	queue = kzalloc(queue_size + queue_page_size, GFP_KERNEL);
 	if (queue) {
 		queue->q_header = NULL;
 		queue->saved_header = NULL;
-		queue->kernel_if = (struct vmci_queue_kern_if *)(queue + 1);
+		queue->kernel_if =
+		    (struct vmci_queue_kern_if *)((u8 *)queue +
+						  sizeof(*queue));
 		queue->kernel_if->host = true;
 		queue->kernel_if->mutex = NULL;
 		queue->kernel_if->num_pages = num_pages;
-		queue->kernel_if->u.h.header_page =
+		queue->kernel_if->header_page =
 		    (struct page **)((u8 *)queue + queue_size);
-		queue->kernel_if->u.h.page =
-			&queue->kernel_if->u.h.header_page[1];
+		queue->kernel_if->page = &queue->kernel_if->header_page[1];
+		queue->kernel_if->va = NULL;
+		queue->kernel_if->mapped = false;
 	}
 
 	return queue;
@@ -635,9 +717,9 @@ static void qp_release_pages(struct page **pages,
 
 	for (i = 0; i < num_pages; i++) {
 		if (dirty)
-			set_page_dirty_lock(pages[i]);
+			set_page_dirty(pages[i]);
 
-		put_page(pages[i]);
+		page_cache_release(pages[i]);
 		pages[i] = NULL;
 	}
 }
@@ -655,36 +737,37 @@ static int qp_host_get_user_memory(u64 produce_uva,
 	int retval;
 	int err = VMCI_SUCCESS;
 
-	retval = get_user_pages_fast((uintptr_t) produce_uva,
-				     produce_q->kernel_if->num_pages,
-				     FOLL_WRITE,
-				     produce_q->kernel_if->u.h.header_page);
-	if (retval < (int)produce_q->kernel_if->num_pages) {
-		pr_debug("get_user_pages_fast(produce) failed (retval=%d)",
-			retval);
-		if (retval > 0)
-			qp_release_pages(produce_q->kernel_if->u.h.header_page,
-					retval, false);
+	down_write(&current->mm->mmap_sem);
+	retval = get_user_pages(current,
+				current->mm,
+				(uintptr_t) produce_uva,
+				produce_q->kernel_if->num_pages,
+				1, 0, produce_q->kernel_if->header_page, NULL);
+	if (retval < produce_q->kernel_if->num_pages) {
+		pr_warn("get_user_pages(produce) failed (retval=%d)", retval);
+		qp_release_pages(produce_q->kernel_if->header_page, retval,
+				 false);
 		err = VMCI_ERROR_NO_MEM;
 		goto out;
 	}
 
-	retval = get_user_pages_fast((uintptr_t) consume_uva,
-				     consume_q->kernel_if->num_pages,
-				     FOLL_WRITE,
-				     consume_q->kernel_if->u.h.header_page);
-	if (retval < (int)consume_q->kernel_if->num_pages) {
-		pr_debug("get_user_pages_fast(consume) failed (retval=%d)",
-			retval);
-		if (retval > 0)
-			qp_release_pages(consume_q->kernel_if->u.h.header_page,
-					retval, false);
-		qp_release_pages(produce_q->kernel_if->u.h.header_page,
+	retval = get_user_pages(current,
+				current->mm,
+				(uintptr_t) consume_uva,
+				consume_q->kernel_if->num_pages,
+				1, 0, consume_q->kernel_if->header_page, NULL);
+	if (retval < consume_q->kernel_if->num_pages) {
+		pr_warn("get_user_pages(consume) failed (retval=%d)", retval);
+		qp_release_pages(consume_q->kernel_if->header_page, retval,
+				 false);
+		qp_release_pages(produce_q->kernel_if->header_page,
 				 produce_q->kernel_if->num_pages, false);
 		err = VMCI_ERROR_NO_MEM;
 	}
 
  out:
+	up_write(&current->mm->mmap_sem);
+
 	return err;
 }
 
@@ -720,15 +803,15 @@ static int qp_host_register_user_memory(struct vmci_qp_page_store *page_store,
 static void qp_host_unregister_user_memory(struct vmci_queue *produce_q,
 					   struct vmci_queue *consume_q)
 {
-	qp_release_pages(produce_q->kernel_if->u.h.header_page,
+	qp_release_pages(produce_q->kernel_if->header_page,
 			 produce_q->kernel_if->num_pages, true);
-	memset(produce_q->kernel_if->u.h.header_page, 0,
-	       sizeof(*produce_q->kernel_if->u.h.header_page) *
+	memset(produce_q->kernel_if->header_page, 0,
+	       sizeof(*produce_q->kernel_if->header_page) *
 	       produce_q->kernel_if->num_pages);
-	qp_release_pages(consume_q->kernel_if->u.h.header_page,
+	qp_release_pages(consume_q->kernel_if->header_page,
 			 consume_q->kernel_if->num_pages, true);
-	memset(consume_q->kernel_if->u.h.header_page, 0,
-	       sizeof(*consume_q->kernel_if->u.h.header_page) *
+	memset(consume_q->kernel_if->header_page, 0,
+	       sizeof(*consume_q->kernel_if->header_page) *
 	       consume_q->kernel_if->num_pages);
 }
 
@@ -751,12 +834,12 @@ static int qp_host_map_queues(struct vmci_queue *produce_q,
 		if (produce_q->q_header != consume_q->q_header)
 			return VMCI_ERROR_QUEUEPAIR_MISMATCH;
 
-		if (produce_q->kernel_if->u.h.header_page == NULL ||
-		    *produce_q->kernel_if->u.h.header_page == NULL)
+		if (produce_q->kernel_if->header_page == NULL ||
+		    *produce_q->kernel_if->header_page == NULL)
 			return VMCI_ERROR_UNAVAILABLE;
 
-		headers[0] = *produce_q->kernel_if->u.h.header_page;
-		headers[1] = *consume_q->kernel_if->u.h.header_page;
+		headers[0] = *produce_q->kernel_if->header_page;
+		headers[1] = *consume_q->kernel_if->header_page;
 
 		produce_q->q_header = vmap(headers, 2, VM_MAP, PAGE_KERNEL);
 		if (produce_q->q_header != NULL) {
@@ -854,7 +937,6 @@ static int qp_notify_peer_local(bool attach, struct vmci_handle handle)
 	u32 context_id = vmci_get_context_id();
 	struct vmci_event_qp ev;
 
-	memset(&ev, 0, sizeof(ev));
 	ev.msg.hdr.dst = vmci_make_handle(context_id, VMCI_EVENT_HANDLER);
 	ev.msg.hdr.src = vmci_make_handle(VMCI_HYPERVISOR_CONTEXT_ID,
 					  VMCI_CONTEXT_RESOURCE_ID);
@@ -946,15 +1028,13 @@ static int qp_alloc_hypercall(const struct qp_guest_endpoint *entry)
 {
 	struct vmci_qp_alloc_msg *alloc_msg;
 	size_t msg_size;
-	size_t ppn_size;
 	int result;
 
 	if (!entry || entry->num_ppns <= 2)
 		return VMCI_ERROR_INVALID_ARGS;
 
-	ppn_size = vmci_use_ppn64() ? sizeof(u64) : sizeof(u32);
 	msg_size = sizeof(*alloc_msg) +
-	    (size_t) entry->num_ppns * ppn_size;
+	    (size_t) entry->num_ppns * sizeof(u32);
 	alloc_msg = kmalloc(msg_size, GFP_KERNEL);
 	if (!alloc_msg)
 		return VMCI_ERROR_NO_MEM;
@@ -1213,7 +1293,7 @@ static int qp_alloc_guest_work(struct vmci_handle *handle,
 	} else {
 		result = qp_alloc_hypercall(queue_pair_entry);
 		if (result < VMCI_SUCCESS) {
-			pr_devel("qp_alloc_hypercall result = %d\n", result);
+			pr_warn("qp_alloc_hypercall result = %d\n", result);
 			goto error;
 		}
 	}
@@ -1468,7 +1548,6 @@ static int qp_notify_peer(bool attach,
 	 * kernel.
 	 */
 
-	memset(&ev, 0, sizeof(ev));
 	ev.msg.hdr.dst = vmci_make_handle(peer_id, VMCI_EVENT_HANDLER);
 	ev.msg.hdr.src = vmci_make_handle(VMCI_HYPERVISOR_CONTEXT_ID,
 					  VMCI_CONTEXT_RESOURCE_ID);
@@ -1641,6 +1720,21 @@ static int qp_broker_attach(struct qp_broker_entry *entry,
 			if (result < VMCI_SUCCESS)
 				return result;
 
+			/*
+			 * Preemptively load in the headers if non-blocking to
+			 * prevent blocking later.
+			 */
+			if (entry->qp.flags & VMCI_QPFLAG_NONBLOCK) {
+				result = qp_host_map_queues(entry->produce_q,
+							    entry->consume_q);
+				if (result < VMCI_SUCCESS) {
+					qp_host_unregister_user_memory(
+						entry->produce_q,
+						entry->consume_q);
+					return result;
+				}
+			}
+
 			entry->state = VMCIQPB_ATTACHED_MEM;
 		} else {
 			entry->state = VMCIQPB_ATTACHED_NO_MEM;
@@ -1655,6 +1749,24 @@ static int qp_broker_attach(struct qp_broker_entry *entry,
 
 		return VMCI_ERROR_UNAVAILABLE;
 	} else {
+		/*
+		 * For non-blocking queue pairs, we cannot rely on
+		 * enqueue/dequeue to map in the pages on the
+		 * host-side, since it may block, so we make an
+		 * attempt here.
+		 */
+
+		if (flags & VMCI_QPFLAG_NONBLOCK) {
+			result =
+			    qp_host_map_queues(entry->produce_q,
+					       entry->consume_q);
+			if (result < VMCI_SUCCESS)
+				return result;
+
+			entry->qp.flags |= flags &
+			    (VMCI_QPFLAG_NONBLOCK | VMCI_QPFLAG_PINNED);
+		}
+
 		/* The host side has successfully attached to a queue pair. */
 		entry->state = VMCIQPB_ATTACHED_MEM;
 	}
@@ -1936,9 +2048,6 @@ int vmci_qp_broker_alloc(struct vmci_handle handle,
 			 struct vmci_qp_page_store *page_store,
 			 struct vmci_ctx *context)
 {
-	if (!QP_SIZES_ARE_VALID(produce_size, consume_size))
-		return VMCI_ERROR_NO_RESOURCES;
-
 	return qp_broker_alloc(handle, peer, flags, priv_flags,
 			       produce_size, consume_size,
 			       page_store, context, NULL, NULL, NULL, NULL);
@@ -2149,8 +2258,14 @@ int vmci_qp_broker_detach(struct vmci_handle handle, struct vmci_ctx *context)
 					handle.context, handle.resource,
 					result);
 
-			qp_host_unregister_user_memory(entry->produce_q,
-						       entry->consume_q);
+			if (entry->vmci_page_files)
+				qp_host_unregister_user_memory(entry->produce_q,
+							       entry->
+							       consume_q);
+			else
+				qp_host_unregister_user_memory(entry->produce_q,
+							       entry->
+							       consume_q);
 
 		}
 
@@ -2215,6 +2330,7 @@ int vmci_qp_broker_map(struct vmci_handle handle,
 {
 	struct qp_broker_entry *entry;
 	const u32 context_id = vmci_ctx_get_id(context);
+	bool is_local = false;
 	int result;
 
 	if (vmci_handle_is_invalid(handle) || !context ||
@@ -2243,10 +2359,10 @@ int vmci_qp_broker_map(struct vmci_handle handle,
 		goto out;
 	}
 
+	is_local = entry->qp.flags & VMCI_QPFLAG_LOCAL;
 	result = VMCI_SUCCESS;
 
-	if (context_id != VMCI_HOST_CONTEXT_ID &&
-	    !QPBROKERSTATE_HAS_MEM(entry)) {
+	if (context_id != VMCI_HOST_CONTEXT_ID) {
 		struct vmci_qp_page_store page_store;
 
 		page_store.pages = guest_mem;
@@ -2325,6 +2441,7 @@ int vmci_qp_broker_unmap(struct vmci_handle handle,
 {
 	struct qp_broker_entry *entry;
 	const u32 context_id = vmci_ctx_get_id(context);
+	bool is_local = false;
 	int result;
 
 	if (vmci_handle_is_invalid(handle) || !context ||
@@ -2353,8 +2470,9 @@ int vmci_qp_broker_unmap(struct vmci_handle handle,
 		goto out;
 	}
 
-	if (context_id != VMCI_HOST_CONTEXT_ID &&
-	    QPBROKERSTATE_HAS_MEM(entry)) {
+	is_local = entry->qp.flags & VMCI_QPFLAG_LOCAL;
+
+	if (context_id != VMCI_HOST_CONTEXT_ID) {
 		qp_acquire_queue_mutex(entry->produce_q);
 		result = qp_save_headers(entry);
 		if (result < VMCI_SUCCESS)
@@ -2425,19 +2543,24 @@ void vmci_qp_guest_endpoints_exit(void)
  * Since non-blocking isn't yet implemented on the host personality we
  * have no reason to acquire a spin lock.  So to avoid the use of an
  * unnecessary lock only acquire the mutex if we can block.
+ * Note: It is assumed that QPFLAG_PINNED implies QPFLAG_NONBLOCK.  Therefore
+ * we can use the same locking function for access to both the queue
+ * and the queue headers as it is the same logic.  Assert this behvior.
  */
 static void qp_lock(const struct vmci_qp *qpair)
 {
-	qp_acquire_queue_mutex(qpair->produce_q);
+	if (vmci_can_block(qpair->flags))
+		qp_acquire_queue_mutex(qpair->produce_q);
 }
 
 /*
  * Helper routine that unlocks the queue pair after calling
- * qp_lock.
+ * qp_lock.  Respects non-blocking and pinning flags.
  */
 static void qp_unlock(const struct vmci_qp *qpair)
 {
-	qp_release_queue_mutex(qpair->produce_q);
+	if (vmci_can_block(qpair->flags))
+		qp_release_queue_mutex(qpair->produce_q);
 }
 
 /*
@@ -2445,12 +2568,17 @@ static void qp_unlock(const struct vmci_qp *qpair)
  * currently not mapped, it will be attempted to do so.
  */
 static int qp_map_queue_headers(struct vmci_queue *produce_q,
-				struct vmci_queue *consume_q)
+				struct vmci_queue *consume_q,
+				bool can_block)
 {
 	int result;
 
 	if (NULL == produce_q->q_header || NULL == consume_q->q_header) {
-		result = qp_host_map_queues(produce_q, consume_q);
+		if (can_block)
+			result = qp_host_map_queues(produce_q, consume_q);
+		else
+			result = VMCI_ERROR_QUEUEPAIR_NOT_READY;
+
 		if (result < VMCI_SUCCESS)
 			return (produce_q->saved_header &&
 				consume_q->saved_header) ?
@@ -2473,7 +2601,8 @@ static int qp_get_queue_headers(const struct vmci_qp *qpair,
 {
 	int result;
 
-	result = qp_map_queue_headers(qpair->produce_q, qpair->consume_q);
+	result = qp_map_queue_headers(qpair->produce_q, qpair->consume_q,
+				      vmci_can_block(qpair->flags));
 	if (result == VMCI_SUCCESS) {
 		*produce_q_header = qpair->produce_q->q_header;
 		*consume_q_header = qpair->consume_q->q_header;
@@ -2516,6 +2645,9 @@ static bool qp_wait_for_ready_queue(struct vmci_qp *qpair)
 {
 	unsigned int generation;
 
+	if (qpair->flags & VMCI_QPFLAG_NONBLOCK)
+		return false;
+
 	qpair->blocked++;
 	generation = qpair->generation;
 	qp_unlock(qpair);
@@ -2540,15 +2672,17 @@ static bool qp_wait_for_ready_queue(struct vmci_qp *qpair)
 static ssize_t qp_enqueue_locked(struct vmci_queue *produce_q,
 				 struct vmci_queue *consume_q,
 				 const u64 produce_q_size,
-				 struct iov_iter *from)
+				 const void *buf,
+				 size_t buf_size,
+				 vmci_memcpy_to_queue_func memcpy_to_queue,
+				 bool can_block)
 {
 	s64 free_space;
 	u64 tail;
-	size_t buf_size = iov_iter_count(from);
 	size_t written;
 	ssize_t result;
 
-	result = qp_map_queue_headers(produce_q, consume_q);
+	result = qp_map_queue_headers(produce_q, consume_q, can_block);
 	if (unlikely(result != VMCI_SUCCESS))
 		return result;
 
@@ -2564,26 +2698,20 @@ static ssize_t qp_enqueue_locked(struct vmci_queue *produce_q,
 	written = (size_t) (free_space > buf_size ? buf_size : free_space);
 	tail = vmci_q_header_producer_tail(produce_q->q_header);
 	if (likely(tail + written < produce_q_size)) {
-		result = qp_memcpy_to_queue_iter(produce_q, tail, from, written);
+		result = memcpy_to_queue(produce_q, tail, buf, 0, written);
 	} else {
 		/* Tail pointer wraps around. */
 
 		const size_t tmp = (size_t) (produce_q_size - tail);
 
-		result = qp_memcpy_to_queue_iter(produce_q, tail, from, tmp);
+		result = memcpy_to_queue(produce_q, tail, buf, 0, tmp);
 		if (result >= VMCI_SUCCESS)
-			result = qp_memcpy_to_queue_iter(produce_q, 0, from,
+			result = memcpy_to_queue(produce_q, 0, buf, tmp,
 						 written - tmp);
 	}
 
 	if (result < VMCI_SUCCESS)
 		return result;
-
-	/*
-	 * This virt_wmb() ensures that data written to the queue
-	 * is observable before the new producer_tail is.
-	 */
-	virt_wmb();
 
 	vmci_q_header_add_producer_tail(produce_q->q_header, written,
 					produce_q_size);
@@ -2606,16 +2734,18 @@ static ssize_t qp_enqueue_locked(struct vmci_queue *produce_q,
 static ssize_t qp_dequeue_locked(struct vmci_queue *produce_q,
 				 struct vmci_queue *consume_q,
 				 const u64 consume_q_size,
-				 struct iov_iter *to,
-				 bool update_consumer)
+				 void *buf,
+				 size_t buf_size,
+				 vmci_memcpy_from_queue_func memcpy_from_queue,
+				 bool update_consumer,
+				 bool can_block)
 {
-	size_t buf_size = iov_iter_count(to);
 	s64 buf_ready;
 	u64 head;
 	size_t read;
 	ssize_t result;
 
-	result = qp_map_queue_headers(produce_q, consume_q);
+	result = qp_map_queue_headers(produce_q, consume_q, can_block);
 	if (unlikely(result != VMCI_SUCCESS))
 		return result;
 
@@ -2628,24 +2758,18 @@ static ssize_t qp_dequeue_locked(struct vmci_queue *produce_q,
 	if (buf_ready < VMCI_SUCCESS)
 		return (ssize_t) buf_ready;
 
-	/*
-	 * This virt_rmb() ensures that data from the queue will be read
-	 * after we have determined how much is ready to be consumed.
-	 */
-	virt_rmb();
-
 	read = (size_t) (buf_ready > buf_size ? buf_size : buf_ready);
 	head = vmci_q_header_consumer_head(produce_q->q_header);
 	if (likely(head + read < consume_q_size)) {
-		result = qp_memcpy_from_queue_iter(to, consume_q, head, read);
+		result = memcpy_from_queue(buf, 0, consume_q, head, read);
 	} else {
 		/* Head pointer wraps around. */
 
 		const size_t tmp = (size_t) (consume_q_size - head);
 
-		result = qp_memcpy_from_queue_iter(to, consume_q, head, tmp);
+		result = memcpy_from_queue(buf, 0, consume_q, head, tmp);
 		if (result >= VMCI_SUCCESS)
-			result = qp_memcpy_from_queue_iter(to, consume_q, 0,
+			result = memcpy_from_queue(buf, tmp, consume_q, 0,
 						   read - tmp);
 
 	}
@@ -2709,7 +2833,8 @@ int vmci_qpair_alloc(struct vmci_qp **qpair,
 	 * used by the device is NO_RESOURCES, so use that here too.
 	 */
 
-	if (!QP_SIZES_ARE_VALID(produce_qsize, consume_qsize))
+	if (produce_qsize + consume_qsize < max(produce_qsize, consume_qsize) ||
+	    produce_qsize + consume_qsize > VMCI_MAX_GUEST_QP_MEMORY)
 		return VMCI_ERROR_NO_RESOURCES;
 
 	retval = vmci_route(&src, &dst, false, &route);
@@ -2717,9 +2842,30 @@ int vmci_qpair_alloc(struct vmci_qp **qpair,
 		route = vmci_guest_code_active() ?
 		    VMCI_ROUTE_AS_GUEST : VMCI_ROUTE_AS_HOST;
 
-	if (flags & (VMCI_QPFLAG_NONBLOCK | VMCI_QPFLAG_PINNED)) {
-		pr_devel("NONBLOCK OR PINNED set");
+	/* If NONBLOCK or PINNED is set, we better be the guest personality. */
+	if ((!vmci_can_block(flags) || vmci_qp_pinned(flags)) &&
+	    VMCI_ROUTE_AS_GUEST != route) {
+		pr_devel("Not guest personality w/ NONBLOCK OR PINNED set");
 		return VMCI_ERROR_INVALID_ARGS;
+	}
+
+	/*
+	 * Limit the size of pinned QPs and check sanity.
+	 *
+	 * Pinned pages implies non-blocking mode.  Mutexes aren't acquired
+	 * when the NONBLOCK flag is set in qpair code; and also should not be
+	 * acquired when the PINNED flagged is set.  Since pinning pages
+	 * implies we want speed, it makes no sense not to have NONBLOCK
+	 * set if PINNED is set.  Hence enforce this implication.
+	 */
+	if (vmci_qp_pinned(flags)) {
+		if (vmci_can_block(flags)) {
+			pr_err("Attempted to enable pinning w/o non-blocking");
+			return VMCI_ERROR_INVALID_ARGS;
+		}
+
+		if (produce_qsize + consume_qsize > VMCI_MAX_PINNED_QP_MEMORY)
+			return VMCI_ERROR_NO_RESOURCES;
 	}
 
 	my_qpair = kzalloc(sizeof(*my_qpair), GFP_KERNEL);
@@ -2848,7 +2994,7 @@ int vmci_qpair_get_produce_indexes(const struct vmci_qp *qpair,
 EXPORT_SYMBOL_GPL(vmci_qpair_get_produce_indexes);
 
 /*
- * vmci_qpair_get_consume_indexes() - Retrieves the indexes of the consumer.
+ * vmci_qpair_get_consume_indexes() - Retrieves the indexes of the comsumer.
  * @qpair:      Pointer to the queue pair struct.
  * @consumer_tail:      Reference used for storing consumer tail index.
  * @producer_head:      Reference used for storing the producer head index.
@@ -3038,13 +3184,9 @@ ssize_t vmci_qpair_enqueue(struct vmci_qp *qpair,
 			   int buf_type)
 {
 	ssize_t result;
-	struct iov_iter from;
-	struct kvec v = {.iov_base = (void *)buf, .iov_len = buf_size};
 
 	if (!qpair || !buf)
 		return VMCI_ERROR_INVALID_ARGS;
-
-	iov_iter_kvec(&from, ITER_SOURCE, &v, 1, buf_size);
 
 	qp_lock(qpair);
 
@@ -3052,7 +3194,9 @@ ssize_t vmci_qpair_enqueue(struct vmci_qp *qpair,
 		result = qp_enqueue_locked(qpair->produce_q,
 					   qpair->consume_q,
 					   qpair->produce_q_size,
-					   &from);
+					   buf, buf_size,
+					   qp_memcpy_to_queue,
+					   vmci_can_block(qpair->flags));
 
 		if (result == VMCI_ERROR_QUEUEPAIR_NOT_READY &&
 		    !qp_wait_for_ready_queue(qpair))
@@ -3082,13 +3226,9 @@ ssize_t vmci_qpair_dequeue(struct vmci_qp *qpair,
 			   int buf_type)
 {
 	ssize_t result;
-	struct iov_iter to;
-	struct kvec v = {.iov_base = buf, .iov_len = buf_size};
 
 	if (!qpair || !buf)
 		return VMCI_ERROR_INVALID_ARGS;
-
-	iov_iter_kvec(&to, ITER_DEST, &v, 1, buf_size);
 
 	qp_lock(qpair);
 
@@ -3096,7 +3236,9 @@ ssize_t vmci_qpair_dequeue(struct vmci_qp *qpair,
 		result = qp_dequeue_locked(qpair->produce_q,
 					   qpair->consume_q,
 					   qpair->consume_q_size,
-					   &to, true);
+					   buf, buf_size,
+					   qp_memcpy_from_queue, true,
+					   vmci_can_block(qpair->flags));
 
 		if (result == VMCI_ERROR_QUEUEPAIR_NOT_READY &&
 		    !qp_wait_for_ready_queue(qpair))
@@ -3126,14 +3268,10 @@ ssize_t vmci_qpair_peek(struct vmci_qp *qpair,
 			size_t buf_size,
 			int buf_type)
 {
-	struct iov_iter to;
-	struct kvec v = {.iov_base = buf, .iov_len = buf_size};
 	ssize_t result;
 
 	if (!qpair || !buf)
 		return VMCI_ERROR_INVALID_ARGS;
-
-	iov_iter_kvec(&to, ITER_DEST, &v, 1, buf_size);
 
 	qp_lock(qpair);
 
@@ -3141,7 +3279,9 @@ ssize_t vmci_qpair_peek(struct vmci_qp *qpair,
 		result = qp_dequeue_locked(qpair->produce_q,
 					   qpair->consume_q,
 					   qpair->consume_q_size,
-					   &to, false);
+					   buf, buf_size,
+					   qp_memcpy_from_queue, false,
+					   vmci_can_block(qpair->flags));
 
 		if (result == VMCI_ERROR_QUEUEPAIR_NOT_READY &&
 		    !qp_wait_for_ready_queue(qpair))
@@ -3167,13 +3307,13 @@ EXPORT_SYMBOL_GPL(vmci_qpair_peek);
  * of bytes enqueued or < 0 on error.
  */
 ssize_t vmci_qpair_enquev(struct vmci_qp *qpair,
-			  struct msghdr *msg,
+			  void *iov,
 			  size_t iov_size,
 			  int buf_type)
 {
 	ssize_t result;
 
-	if (!qpair)
+	if (!qpair || !iov)
 		return VMCI_ERROR_INVALID_ARGS;
 
 	qp_lock(qpair);
@@ -3182,7 +3322,9 @@ ssize_t vmci_qpair_enquev(struct vmci_qp *qpair,
 		result = qp_enqueue_locked(qpair->produce_q,
 					   qpair->consume_q,
 					   qpair->produce_q_size,
-					   &msg->msg_iter);
+					   iov, iov_size,
+					   qp_memcpy_to_queue_iov,
+					   vmci_can_block(qpair->flags));
 
 		if (result == VMCI_ERROR_QUEUEPAIR_NOT_READY &&
 		    !qp_wait_for_ready_queue(qpair))
@@ -3208,13 +3350,13 @@ EXPORT_SYMBOL_GPL(vmci_qpair_enquev);
  * of bytes dequeued or < 0 on error.
  */
 ssize_t vmci_qpair_dequev(struct vmci_qp *qpair,
-			  struct msghdr *msg,
+			  void *iov,
 			  size_t iov_size,
 			  int buf_type)
 {
 	ssize_t result;
 
-	if (!qpair)
+	if (!qpair || !iov)
 		return VMCI_ERROR_INVALID_ARGS;
 
 	qp_lock(qpair);
@@ -3223,7 +3365,9 @@ ssize_t vmci_qpair_dequev(struct vmci_qp *qpair,
 		result = qp_dequeue_locked(qpair->produce_q,
 					   qpair->consume_q,
 					   qpair->consume_q_size,
-					   &msg->msg_iter, true);
+					   iov, iov_size,
+					   qp_memcpy_from_queue_iov,
+					   true, vmci_can_block(qpair->flags));
 
 		if (result == VMCI_ERROR_QUEUEPAIR_NOT_READY &&
 		    !qp_wait_for_ready_queue(qpair))
@@ -3250,13 +3394,13 @@ EXPORT_SYMBOL_GPL(vmci_qpair_dequev);
  * of bytes peeked or < 0 on error.
  */
 ssize_t vmci_qpair_peekv(struct vmci_qp *qpair,
-			 struct msghdr *msg,
+			 void *iov,
 			 size_t iov_size,
 			 int buf_type)
 {
 	ssize_t result;
 
-	if (!qpair)
+	if (!qpair || !iov)
 		return VMCI_ERROR_INVALID_ARGS;
 
 	qp_lock(qpair);
@@ -3265,7 +3409,9 @@ ssize_t vmci_qpair_peekv(struct vmci_qp *qpair,
 		result = qp_dequeue_locked(qpair->produce_q,
 					   qpair->consume_q,
 					   qpair->consume_q_size,
-					   &msg->msg_iter, false);
+					   iov, iov_size,
+					   qp_memcpy_from_queue_iov,
+					   false, vmci_can_block(qpair->flags));
 
 		if (result == VMCI_ERROR_QUEUEPAIR_NOT_READY &&
 		    !qp_wait_for_ready_queue(qpair))

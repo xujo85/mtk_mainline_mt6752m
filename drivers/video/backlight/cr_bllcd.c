@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Copyright (c) Intel Corp. 2007.
  * All Rights Reserved.
@@ -7,6 +6,21 @@
  * develop this driver.
  *
  * This file is part of the Carillo Ranch video subsystem driver.
+ * The Carillo Ranch video subsystem driver is free software;
+ * you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * The Carillo Ranch video subsystem driver is distributed
+ * in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this driver; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  *
  * Authors:
  *   Thomas Hellstrom <thomas-at-tungstengraphics-dot-com>
@@ -59,18 +73,26 @@ struct cr_panel {
 
 static int cr_backlight_set_intensity(struct backlight_device *bd)
 {
+	int intensity = bd->props.brightness;
 	u32 addr = gpio_bar + CRVML_PANEL_PORT;
 	u32 cur = inl(addr);
 
-	if (backlight_get_brightness(bd) == 0) {
-		/* OFF */
-		cur |= CRVML_BACKLIGHT_OFF;
-		outl(cur, addr);
-	} else {
-		/* FULL ON */
+	if (bd->props.power == FB_BLANK_UNBLANK)
+		intensity = FB_BLANK_UNBLANK;
+	if (bd->props.fb_blank == FB_BLANK_UNBLANK)
+		intensity = FB_BLANK_UNBLANK;
+	if (bd->props.power == FB_BLANK_POWERDOWN)
+		intensity = FB_BLANK_POWERDOWN;
+	if (bd->props.fb_blank == FB_BLANK_POWERDOWN)
+		intensity = FB_BLANK_POWERDOWN;
+
+	if (intensity == FB_BLANK_UNBLANK) { /* FULL ON */
 		cur &= ~CRVML_BACKLIGHT_OFF;
 		outl(cur, addr);
-	}
+	} else if (intensity == FB_BLANK_POWERDOWN) { /* OFF */
+		cur |= CRVML_BACKLIGHT_OFF;
+		outl(cur, addr);
+	} /* anything else, don't bother */
 
 	return 0;
 }
@@ -82,9 +104,9 @@ static int cr_backlight_get_intensity(struct backlight_device *bd)
 	u8 intensity;
 
 	if (cur & CRVML_BACKLIGHT_OFF)
-		intensity = 0;
+		intensity = FB_BLANK_POWERDOWN;
 	else
-		intensity = 1;
+		intensity = FB_BLANK_UNBLANK;
 
 	return intensity;
 }
@@ -173,17 +195,16 @@ static int cr_backlight_probe(struct platform_device *pdev)
 
 	memset(&props, 0, sizeof(struct backlight_properties));
 	props.type = BACKLIGHT_RAW;
-	bdp = devm_backlight_device_register(&pdev->dev, "cr-backlight",
-					&pdev->dev, NULL, &cr_backlight_ops,
-					&props);
+	bdp = backlight_device_register("cr-backlight", &pdev->dev, NULL,
+					&cr_backlight_ops, &props);
 	if (IS_ERR(bdp)) {
 		pci_dev_put(lpc_dev);
 		return PTR_ERR(bdp);
 	}
 
-	ldp = devm_lcd_device_register(&pdev->dev, "cr-lcd", &pdev->dev, NULL,
-					&cr_lcd_ops);
+	ldp = lcd_device_register("cr-lcd", &pdev->dev, NULL, &cr_lcd_ops);
 	if (IS_ERR(ldp)) {
+		backlight_device_unregister(bdp);
 		pci_dev_put(lpc_dev);
 		return PTR_ERR(ldp);
 	}
@@ -194,6 +215,8 @@ static int cr_backlight_probe(struct platform_device *pdev)
 
 	crp = devm_kzalloc(&pdev->dev, sizeof(*crp), GFP_KERNEL);
 	if (!crp) {
+		lcd_device_unregister(ldp);
+		backlight_device_unregister(bdp);
 		pci_dev_put(lpc_dev);
 		return -ENOMEM;
 	}
@@ -210,21 +233,24 @@ static int cr_backlight_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static void cr_backlight_remove(struct platform_device *pdev)
+static int cr_backlight_remove(struct platform_device *pdev)
 {
 	struct cr_panel *crp = platform_get_drvdata(pdev);
-
 	crp->cr_backlight_device->props.power = FB_BLANK_POWERDOWN;
 	crp->cr_backlight_device->props.brightness = 0;
 	crp->cr_backlight_device->props.max_brightness = 0;
 	cr_backlight_set_intensity(crp->cr_backlight_device);
 	cr_lcd_set_power(crp->cr_lcd_device, FB_BLANK_POWERDOWN);
+	backlight_device_unregister(crp->cr_backlight_device);
+	lcd_device_unregister(crp->cr_lcd_device);
 	pci_dev_put(lpc_dev);
+
+	return 0;
 }
 
 static struct platform_driver cr_backlight_driver = {
 	.probe = cr_backlight_probe,
-	.remove_new = cr_backlight_remove,
+	.remove = cr_backlight_remove,
 	.driver = {
 		   .name = "cr_backlight",
 		   },

@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * drivers/net/ethernet/ibm/emac/rgmii.h
  *
@@ -17,6 +16,11 @@
  *
  * Copyright (c) 2004, 2005 Zultys Technologies.
  * Eugene Surovegin <eugene.surovegin@zultys.com> or <ebs@ebshome.net>
+ *
+ * This program is free software; you can redistribute  it and/or modify it
+ * under  the terms of  the GNU General  Public License as published by the
+ * Free Software Foundation;  either version 2 of the  License, or (at your
+ * option) any later version.
  */
 
 #ifndef __IBM_NEWEMAC_RGMII_H
@@ -52,15 +56,15 @@ struct rgmii_instance {
 
 #ifdef CONFIG_IBM_EMAC_RGMII
 
-int rgmii_init(void);
-void rgmii_exit(void);
-int rgmii_attach(struct platform_device *ofdev, int input, int mode);
-void rgmii_detach(struct platform_device *ofdev, int input);
-void rgmii_get_mdio(struct platform_device *ofdev, int input);
-void rgmii_put_mdio(struct platform_device *ofdev, int input);
-void rgmii_set_speed(struct platform_device *ofdev, int input, int speed);
-int rgmii_get_regs_len(struct platform_device *ofdev);
-void *rgmii_dump_regs(struct platform_device *ofdev, void *buf);
+extern int rgmii_init(void);
+extern void rgmii_exit(void);
+extern int rgmii_attach(struct platform_device *ofdev, int input, int mode);
+extern void rgmii_detach(struct platform_device *ofdev, int input);
+extern void rgmii_get_mdio(struct platform_device *ofdev, int input);
+extern void rgmii_put_mdio(struct platform_device *ofdev, int input);
+extern void rgmii_set_speed(struct platform_device *ofdev, int input, int speed);
+extern int rgmii_get_regs_len(struct platform_device *ofdev);
+extern void *rgmii_dump_regs(struct platform_device *ofdev, void *buf);
 
 #else
 

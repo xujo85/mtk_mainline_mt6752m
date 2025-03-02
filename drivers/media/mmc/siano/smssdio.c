@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *  smssdio.c - Siano 1xxx SDIO interface driver
  *
@@ -6,6 +5,12 @@
  *
  * Based on code by Siano Mobile Silicon, Inc.,
  * Copyright (C) 2006-2008, Uri Shkolnik
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or (at
+ * your option) any later version.
+ *
  *
  * This hardware is a bit odd in that all transfers should be done
  * to/from the SMSSDIO_DATA register, yet the "increase address" bit
@@ -27,8 +32,6 @@
  * Fix stop command
  */
 
-#include "smscoreapi.h"
-
 #include <linux/moduleparam.h>
 #include <linux/slab.h>
 #include <linux/firmware.h>
@@ -38,6 +41,7 @@
 #include <linux/mmc/sdio_ids.h>
 #include <linux/module.h>
 
+#include "smscoreapi.h"
 #include "sms-cards.h"
 #include "smsendian.h"
 
@@ -58,15 +62,15 @@ static const struct sdio_device_id smssdio_ids[] = {
 	 .driver_data = SMS1XXX_BOARD_SIANO_VEGA},
 	{SDIO_DEVICE(SDIO_VENDOR_ID_SIANO, SDIO_DEVICE_ID_SIANO_VENICE),
 	 .driver_data = SMS1XXX_BOARD_SIANO_VEGA},
-	{SDIO_DEVICE(SDIO_VENDOR_ID_SIANO, SDIO_DEVICE_ID_SIANO_MING),
+	{SDIO_DEVICE(SDIO_VENDOR_ID_SIANO, 0x302),
 	.driver_data = SMS1XXX_BOARD_SIANO_MING},
-	{SDIO_DEVICE(SDIO_VENDOR_ID_SIANO, SDIO_DEVICE_ID_SIANO_PELE),
+	{SDIO_DEVICE(SDIO_VENDOR_ID_SIANO, 0x500),
 	.driver_data = SMS1XXX_BOARD_SIANO_PELE},
-	{SDIO_DEVICE(SDIO_VENDOR_ID_SIANO, SDIO_DEVICE_ID_SIANO_RIO),
+	{SDIO_DEVICE(SDIO_VENDOR_ID_SIANO, 0x600),
 	.driver_data = SMS1XXX_BOARD_SIANO_RIO},
-	{SDIO_DEVICE(SDIO_VENDOR_ID_SIANO, SDIO_DEVICE_ID_SIANO_DENVER_2160),
+	{SDIO_DEVICE(SDIO_VENDOR_ID_SIANO, 0x700),
 	.driver_data = SMS1XXX_BOARD_SIANO_DENVER_2160},
-	{SDIO_DEVICE(SDIO_VENDOR_ID_SIANO, SDIO_DEVICE_ID_SIANO_DENVER_1530),
+	{SDIO_DEVICE(SDIO_VENDOR_ID_SIANO, 0x800),
 	.driver_data = SMS1XXX_BOARD_SIANO_DENVER_1530},
 	{ /* end: all zeroes */ },
 };
@@ -137,14 +141,14 @@ static void smssdio_interrupt(struct sdio_func *func)
 	 */
 	(void)sdio_readb(func, SMSSDIO_INT, &ret);
 	if (ret) {
-		pr_err("Unable to read interrupt register!\n");
+		sms_err("Unable to read interrupt register!\n");
 		return;
 	}
 
 	if (smsdev->split_cb == NULL) {
 		cb = smscore_getbuffer(smsdev->coredev);
 		if (!cb) {
-			pr_err("Unable to allocate data buffer!\n");
+			sms_err("Unable to allocate data buffer!\n");
 			return;
 		}
 
@@ -153,7 +157,7 @@ static void smssdio_interrupt(struct sdio_func *func)
 					 SMSSDIO_DATA,
 					 SMSSDIO_BLOCK_SIZE);
 		if (ret) {
-			pr_err("Error %d reading initial block!\n", ret);
+			sms_err("Error %d reading initial block!\n", ret);
 			return;
 		}
 
@@ -194,7 +198,7 @@ static void smssdio_interrupt(struct sdio_func *func)
 					 size);
 		if (ret && ret != -EINVAL) {
 			smscore_putbuffer(smsdev->coredev, cb);
-			pr_err("Error %d reading data from card!\n", ret);
+			sms_err("Error %d reading data from card!\n", ret);
 			return;
 		}
 
@@ -212,8 +216,8 @@ static void smssdio_interrupt(struct sdio_func *func)
 						  smsdev->func->cur_blksize);
 				if (ret) {
 					smscore_putbuffer(smsdev->coredev, cb);
-					pr_err("Error %d reading data from card!\n",
-					       ret);
+					sms_err("Error %d reading "
+						"data from card!\n", ret);
 					return;
 				}
 
@@ -274,7 +278,7 @@ static int smssdio_probe(struct sdio_func *func,
 		goto free;
 	}
 
-	ret = smscore_register_device(&params, &smsdev->coredev, GFP_DMA, NULL);
+	ret = smscore_register_device(&params, &smsdev->coredev);
 	if (ret < 0)
 		goto free;
 

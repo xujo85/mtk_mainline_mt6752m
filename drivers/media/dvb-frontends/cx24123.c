@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *   Conexant cx24123/cx24109 - DVB QPSK Satellite demod/tuner driver
  *
@@ -7,6 +6,20 @@
  *   Support for KWorld DVB-S 100 by Vadim Catana <skystar@moldova.cc>
  *
  *   Support for CX24123/CX24113-NIM by Patrick Boettcher <pb@linuxtv.org>
+ *
+ *   This program is free software; you can redistribute it and/or
+ *   modify it under the terms of the GNU General Public License as
+ *   published by the Free Software Foundation; either version 2 of
+ *   the License, or (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ *   General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
 #include <linux/slab.h>
@@ -15,7 +28,7 @@
 #include <linux/init.h>
 #include <asm/div64.h>
 
-#include <media/dvb_frontend.h>
+#include "dvb_frontend.h"
 #include "cx24123.h"
 
 #define XTAL 10111000
@@ -242,8 +255,8 @@ static int cx24123_i2c_writereg(struct cx24123_state *state,
 
 	err = i2c_transfer(state->i2c, &msg, 1);
 	if (err != 1) {
-		printk("%s: writereg error(err == %i, reg == 0x%02x, data == 0x%02x)\n",
-		       __func__, err, reg, data);
+		printk("%s: writereg error(err == %i, reg == 0x%02x,"
+			 " data == 0x%02x)\n", __func__, err, reg, data);
 		return err;
 	}
 
@@ -277,7 +290,7 @@ static int cx24123_i2c_readreg(struct cx24123_state *state, u8 i2c_addr, u8 reg)
 	cx24123_i2c_writereg(state, state->config->demod_address, reg, val)
 
 static int cx24123_set_inversion(struct cx24123_state *state,
-				 enum fe_spectral_inversion inversion)
+	fe_spectral_inversion_t inversion)
 {
 	u8 nom_reg = cx24123_readreg(state, 0x0e);
 	u8 auto_reg = cx24123_readreg(state, 0x10);
@@ -305,7 +318,7 @@ static int cx24123_set_inversion(struct cx24123_state *state,
 }
 
 static int cx24123_get_inversion(struct cx24123_state *state,
-				 enum fe_spectral_inversion *inversion)
+	fe_spectral_inversion_t *inversion)
 {
 	u8 val;
 
@@ -322,7 +335,7 @@ static int cx24123_get_inversion(struct cx24123_state *state,
 	return 0;
 }
 
-static int cx24123_set_fec(struct cx24123_state *state, enum fe_code_rate fec)
+static int cx24123_set_fec(struct cx24123_state *state, fe_code_rate_t fec)
 {
 	u8 nom_reg = cx24123_readreg(state, 0x0e) & ~0x07;
 
@@ -384,7 +397,7 @@ static int cx24123_set_fec(struct cx24123_state *state, enum fe_code_rate fec)
 	return 0;
 }
 
-static int cx24123_get_fec(struct cx24123_state *state, enum fe_code_rate *fec)
+static int cx24123_get_fec(struct cx24123_state *state, fe_code_rate_t *fec)
 {
 	int ret;
 
@@ -431,7 +444,7 @@ static u32 cx24123_int_log2(u32 a, u32 b)
 	u32 div = a / b;
 	if (a % b >= b / 2)
 		++div;
-	if (div < (1UL << 31)) {
+	if (div < (1 << 31)) {
 		for (exp = 1; div > exp; nearest++)
 			exp += exp;
 	}
@@ -640,7 +653,7 @@ static int cx24123_pll_tune(struct dvb_frontend *fe)
 	dprintk("frequency=%i\n", p->frequency);
 
 	if (cx24123_pll_calculate(fe) != 0) {
-		err("%s: cx24123_pll_calculate failed\n", __func__);
+		err("%s: cx24123_pll_calcutate failed\n", __func__);
 		return -EINVAL;
 	}
 
@@ -707,7 +720,7 @@ static int cx24123_initfe(struct dvb_frontend *fe)
 }
 
 static int cx24123_set_voltage(struct dvb_frontend *fe,
-			       enum fe_sec_voltage voltage)
+	fe_sec_voltage_t voltage)
 {
 	struct cx24123_state *state = fe->demodulator_priv;
 	u8 val;
@@ -726,7 +739,7 @@ static int cx24123_set_voltage(struct dvb_frontend *fe,
 		return 0;
 	default:
 		return -EINVAL;
-	}
+	};
 
 	return 0;
 }
@@ -782,7 +795,7 @@ static int cx24123_send_diseqc_msg(struct dvb_frontend *fe,
 }
 
 static int cx24123_diseqc_send_burst(struct dvb_frontend *fe,
-				     enum fe_sec_mini_cmd burst)
+	fe_sec_mini_cmd_t burst)
 {
 	struct cx24123_state *state = fe->demodulator_priv;
 	int val, tone;
@@ -818,7 +831,7 @@ static int cx24123_diseqc_send_burst(struct dvb_frontend *fe,
 	return 0;
 }
 
-static int cx24123_read_status(struct dvb_frontend *fe, enum fe_status *status)
+static int cx24123_read_status(struct dvb_frontend *fe, fe_status_t *status)
 {
 	struct cx24123_state *state = fe->demodulator_priv;
 	int sync = cx24123_readreg(state, 0x14);
@@ -932,9 +945,9 @@ static int cx24123_set_frontend(struct dvb_frontend *fe)
 	return 0;
 }
 
-static int cx24123_get_frontend(struct dvb_frontend *fe,
-				struct dtv_frontend_properties *p)
+static int cx24123_get_frontend(struct dvb_frontend *fe)
 {
+	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
 	struct cx24123_state *state = fe->demodulator_priv;
 
 	dprintk("\n");
@@ -953,7 +966,7 @@ static int cx24123_get_frontend(struct dvb_frontend *fe,
 	return 0;
 }
 
-static int cx24123_set_tone(struct dvb_frontend *fe, enum fe_sec_tone_mode tone)
+static int cx24123_set_tone(struct dvb_frontend *fe, fe_sec_tone_mode_t tone)
 {
 	struct cx24123_state *state = fe->demodulator_priv;
 	u8 val;
@@ -982,7 +995,7 @@ static int cx24123_tune(struct dvb_frontend *fe,
 			bool re_tune,
 			unsigned int mode_flags,
 			unsigned int *delay,
-			enum fe_status *status)
+			fe_status_t *status)
 {
 	int retval = 0;
 
@@ -996,9 +1009,9 @@ static int cx24123_tune(struct dvb_frontend *fe,
 	return retval;
 }
 
-static enum dvbfe_algo cx24123_get_algo(struct dvb_frontend *fe)
+static int cx24123_get_algo(struct dvb_frontend *fe)
 {
-	return DVBFE_ALGO_HW;
+	return 1; /* FE_ALGO_HW */
 }
 
 static void cx24123_release(struct dvb_frontend *fe)
@@ -1023,7 +1036,7 @@ static u32 cx24123_tuner_i2c_func(struct i2c_adapter *adapter)
 	return I2C_FUNC_I2C;
 }
 
-static const struct i2c_algorithm cx24123_tuner_i2c_algo = {
+static struct i2c_algorithm cx24123_tuner_i2c_algo = {
 	.master_xfer   = cx24123_tuner_i2c_tuner_xfer,
 	.functionality = cx24123_tuner_i2c_func,
 };
@@ -1036,7 +1049,7 @@ struct i2c_adapter *
 }
 EXPORT_SYMBOL(cx24123_get_tuner_i2c_adapter);
 
-static const struct dvb_frontend_ops cx24123_ops;
+static struct dvb_frontend_ops cx24123_ops;
 
 struct dvb_frontend *cx24123_attach(const struct cx24123_config *config,
 				    struct i2c_adapter *i2c)
@@ -1078,11 +1091,10 @@ struct dvb_frontend *cx24123_attach(const struct cx24123_config *config,
 	if (config->dont_use_pll)
 		cx24123_repeater_mode(state, 1, 0);
 
-	strscpy(state->tuner_i2c_adapter.name, "CX24123 tuner I2C bus",
+	strlcpy(state->tuner_i2c_adapter.name, "CX24123 tuner I2C bus",
 		sizeof(state->tuner_i2c_adapter.name));
 	state->tuner_i2c_adapter.algo      = &cx24123_tuner_i2c_algo;
 	state->tuner_i2c_adapter.algo_data = NULL;
-	state->tuner_i2c_adapter.dev.parent = i2c->dev.parent;
 	i2c_set_adapdata(&state->tuner_i2c_adapter, state);
 	if (i2c_add_adapter(&state->tuner_i2c_adapter) < 0) {
 		err("tuner i2c bus could not be initialized\n");
@@ -1098,14 +1110,14 @@ error:
 }
 EXPORT_SYMBOL(cx24123_attach);
 
-static const struct dvb_frontend_ops cx24123_ops = {
+static struct dvb_frontend_ops cx24123_ops = {
 	.delsys = { SYS_DVBS },
 	.info = {
 		.name = "Conexant CX24123/CX24109",
-		.frequency_min_hz =  950 * MHz,
-		.frequency_max_hz = 2150 * MHz,
-		.frequency_stepsize_hz = 1011 * kHz,
-		.frequency_tolerance_hz = 5 * MHz,
+		.frequency_min = 950000,
+		.frequency_max = 2150000,
+		.frequency_stepsize = 1011, /* kHz for QPSK frontends */
+		.frequency_tolerance = 5000,
 		.symbol_rate_min = 1000000,
 		.symbol_rate_max = 45000000,
 		.caps = FE_CAN_INVERSION_AUTO |

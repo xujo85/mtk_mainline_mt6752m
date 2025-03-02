@@ -11,16 +11,15 @@
 
 #include <linux/clk.h>
 #include <linux/err.h>
-#include <linux/gpio/driver.h>
+#include <linux/gpio.h>
 #include <linux/io.h>
-#include <linux/init.h>
-#include <linux/mfd/syscon.h>
-#include <linux/of.h>
-#include <linux/of_platform.h>
+#include <linux/irq.h>
+#include <linux/irqdomain.h>
+#include <linux/irqchip/chained_irq.h>
+#include <linux/module.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
-#include <linux/regmap.h>
 #include <linux/spinlock.h>
 
 #define MAX_GPIO_PER_REG		32
@@ -55,6 +54,7 @@ struct plgpio_regs {
  *
  * lock: lock for guarding gpio registers
  * base: base address of plgpio block
+ * irq_base: irq number of plgpio0
  * chip: gpio framework specific chip information structure
  * p2o: function ptr for pin to offset conversion. This is required only for
  *	machines where mapping b/w pin and offset is not 1-to-1.
@@ -66,8 +66,10 @@ struct plgpio_regs {
  */
 struct plgpio {
 	spinlock_t		lock;
-	struct regmap		*regmap;
+	void __iomem		*base;
 	struct clk		*clk;
+	unsigned		irq_base;
+	struct irq_domain	*irq_domain;
 	struct gpio_chip	chip;
 	int			(*p2o)(int pin);	/* pin_to_offset */
 	int			(*o2p)(int offset);	/* offset_to_pin */
@@ -79,42 +81,37 @@ struct plgpio {
 };
 
 /* register manipulation inline functions */
-static inline u32 is_plgpio_set(struct regmap *regmap, u32 pin, u32 reg)
+static inline u32 is_plgpio_set(void __iomem *base, u32 pin, u32 reg)
 {
 	u32 offset = PIN_OFFSET(pin);
-	u32 reg_off = REG_OFFSET(0, reg, pin);
-	u32 val;
-
-	regmap_read(regmap, reg_off, &val);
+	void __iomem *reg_off = REG_OFFSET(base, reg, pin);
+	u32 val = readl_relaxed(reg_off);
 
 	return !!(val & (1 << offset));
 }
 
-static inline void plgpio_reg_set(struct regmap *regmap, u32 pin, u32 reg)
+static inline void plgpio_reg_set(void __iomem *base, u32 pin, u32 reg)
 {
 	u32 offset = PIN_OFFSET(pin);
-	u32 reg_off = REG_OFFSET(0, reg, pin);
-	u32 mask;
+	void __iomem *reg_off = REG_OFFSET(base, reg, pin);
+	u32 val = readl_relaxed(reg_off);
 
-	mask = 1 << offset;
-	regmap_update_bits(regmap, reg_off, mask, mask);
+	writel_relaxed(val | (1 << offset), reg_off);
 }
 
-static inline void plgpio_reg_reset(struct regmap *regmap, u32 pin, u32 reg)
+static inline void plgpio_reg_reset(void __iomem *base, u32 pin, u32 reg)
 {
 	u32 offset = PIN_OFFSET(pin);
-	u32 reg_off = REG_OFFSET(0, reg, pin);
-	u32 mask;
+	void __iomem *reg_off = REG_OFFSET(base, reg, pin);
+	u32 val = readl_relaxed(reg_off);
 
-	mask = 1 << offset;
-	regmap_update_bits(regmap, reg_off, mask, 0);
+	writel_relaxed(val & ~(1 << offset), reg_off);
 }
-
 
 /* gpio framework specific routines */
 static int plgpio_direction_input(struct gpio_chip *chip, unsigned offset)
 {
-	struct plgpio *plgpio = gpiochip_get_data(chip);
+	struct plgpio *plgpio = container_of(chip, struct plgpio, chip);
 	unsigned long flags;
 
 	/* get correct offset for "offset" pin */
@@ -125,7 +122,7 @@ static int plgpio_direction_input(struct gpio_chip *chip, unsigned offset)
 	}
 
 	spin_lock_irqsave(&plgpio->lock, flags);
-	plgpio_reg_set(plgpio->regmap, offset, plgpio->regs.dir);
+	plgpio_reg_set(plgpio->base, offset, plgpio->regs.dir);
 	spin_unlock_irqrestore(&plgpio->lock, flags);
 
 	return 0;
@@ -134,7 +131,7 @@ static int plgpio_direction_input(struct gpio_chip *chip, unsigned offset)
 static int plgpio_direction_output(struct gpio_chip *chip, unsigned offset,
 		int value)
 {
-	struct plgpio *plgpio = gpiochip_get_data(chip);
+	struct plgpio *plgpio = container_of(chip, struct plgpio, chip);
 	unsigned long flags;
 	unsigned dir_offset = offset, wdata_offset = offset, tmp;
 
@@ -152,13 +149,13 @@ static int plgpio_direction_output(struct gpio_chip *chip, unsigned offset,
 
 	spin_lock_irqsave(&plgpio->lock, flags);
 	if (value)
-		plgpio_reg_set(plgpio->regmap, wdata_offset,
+		plgpio_reg_set(plgpio->base, wdata_offset,
 				plgpio->regs.wdata);
 	else
-		plgpio_reg_reset(plgpio->regmap, wdata_offset,
+		plgpio_reg_reset(plgpio->base, wdata_offset,
 				plgpio->regs.wdata);
 
-	plgpio_reg_reset(plgpio->regmap, dir_offset, plgpio->regs.dir);
+	plgpio_reg_reset(plgpio->base, dir_offset, plgpio->regs.dir);
 	spin_unlock_irqrestore(&plgpio->lock, flags);
 
 	return 0;
@@ -166,7 +163,7 @@ static int plgpio_direction_output(struct gpio_chip *chip, unsigned offset,
 
 static int plgpio_get_value(struct gpio_chip *chip, unsigned offset)
 {
-	struct plgpio *plgpio = gpiochip_get_data(chip);
+	struct plgpio *plgpio = container_of(chip, struct plgpio, chip);
 
 	if (offset >= chip->ngpio)
 		return -EINVAL;
@@ -178,12 +175,12 @@ static int plgpio_get_value(struct gpio_chip *chip, unsigned offset)
 			return -EINVAL;
 	}
 
-	return is_plgpio_set(plgpio->regmap, offset, plgpio->regs.rdata);
+	return is_plgpio_set(plgpio->base, offset, plgpio->regs.rdata);
 }
 
 static void plgpio_set_value(struct gpio_chip *chip, unsigned offset, int value)
 {
-	struct plgpio *plgpio = gpiochip_get_data(chip);
+	struct plgpio *plgpio = container_of(chip, struct plgpio, chip);
 
 	if (offset >= chip->ngpio)
 		return;
@@ -196,14 +193,14 @@ static void plgpio_set_value(struct gpio_chip *chip, unsigned offset, int value)
 	}
 
 	if (value)
-		plgpio_reg_set(plgpio->regmap, offset, plgpio->regs.wdata);
+		plgpio_reg_set(plgpio->base, offset, plgpio->regs.wdata);
 	else
-		plgpio_reg_reset(plgpio->regmap, offset, plgpio->regs.wdata);
+		plgpio_reg_reset(plgpio->base, offset, plgpio->regs.wdata);
 }
 
 static int plgpio_request(struct gpio_chip *chip, unsigned offset)
 {
-	struct plgpio *plgpio = gpiochip_get_data(chip);
+	struct plgpio *plgpio = container_of(chip, struct plgpio, chip);
 	int gpio = chip->base + offset;
 	unsigned long flags;
 	int ret = 0;
@@ -211,7 +208,7 @@ static int plgpio_request(struct gpio_chip *chip, unsigned offset)
 	if (offset >= chip->ngpio)
 		return -EINVAL;
 
-	ret = pinctrl_gpio_request(gpio);
+	ret = pinctrl_request_gpio(gpio);
 	if (ret)
 		return ret;
 
@@ -241,7 +238,7 @@ static int plgpio_request(struct gpio_chip *chip, unsigned offset)
 	}
 
 	spin_lock_irqsave(&plgpio->lock, flags);
-	plgpio_reg_set(plgpio->regmap, offset, plgpio->regs.enb);
+	plgpio_reg_set(plgpio->base, offset, plgpio->regs.enb);
 	spin_unlock_irqrestore(&plgpio->lock, flags);
 	return 0;
 
@@ -249,13 +246,13 @@ err1:
 	if (!IS_ERR(plgpio->clk))
 		clk_disable(plgpio->clk);
 err0:
-	pinctrl_gpio_free(gpio);
+	pinctrl_free_gpio(gpio);
 	return ret;
 }
 
 static void plgpio_free(struct gpio_chip *chip, unsigned offset)
 {
-	struct plgpio *plgpio = gpiochip_get_data(chip);
+	struct plgpio *plgpio = container_of(chip, struct plgpio, chip);
 	int gpio = chip->base + offset;
 	unsigned long flags;
 
@@ -273,22 +270,31 @@ static void plgpio_free(struct gpio_chip *chip, unsigned offset)
 	}
 
 	spin_lock_irqsave(&plgpio->lock, flags);
-	plgpio_reg_reset(plgpio->regmap, offset, plgpio->regs.enb);
+	plgpio_reg_reset(plgpio->base, offset, plgpio->regs.enb);
 	spin_unlock_irqrestore(&plgpio->lock, flags);
 
 disable_clk:
 	if (!IS_ERR(plgpio->clk))
 		clk_disable(plgpio->clk);
 
-	pinctrl_gpio_free(gpio);
+	pinctrl_free_gpio(gpio);
+}
+
+static int plgpio_to_irq(struct gpio_chip *chip, unsigned offset)
+{
+	struct plgpio *plgpio = container_of(chip, struct plgpio, chip);
+
+	if (IS_ERR_VALUE(plgpio->irq_base))
+		return -EINVAL;
+
+	return irq_find_mapping(plgpio->irq_domain, offset);
 }
 
 /* PLGPIO IRQ */
 static void plgpio_irq_disable(struct irq_data *d)
 {
-	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
-	struct plgpio *plgpio = gpiochip_get_data(gc);
-	int offset = d->hwirq;
+	struct plgpio *plgpio = irq_data_get_irq_chip_data(d);
+	int offset = d->irq - plgpio->irq_base;
 	unsigned long flags;
 
 	/* get correct offset for "offset" pin */
@@ -299,16 +305,14 @@ static void plgpio_irq_disable(struct irq_data *d)
 	}
 
 	spin_lock_irqsave(&plgpio->lock, flags);
-	plgpio_reg_set(plgpio->regmap, offset, plgpio->regs.ie);
+	plgpio_reg_set(plgpio->base, offset, plgpio->regs.ie);
 	spin_unlock_irqrestore(&plgpio->lock, flags);
-	gpiochip_disable_irq(gc, irqd_to_hwirq(d));
 }
 
 static void plgpio_irq_enable(struct irq_data *d)
 {
-	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
-	struct plgpio *plgpio = gpiochip_get_data(gc);
-	int offset = d->hwirq;
+	struct plgpio *plgpio = irq_data_get_irq_chip_data(d);
+	int offset = d->irq - plgpio->irq_base;
 	unsigned long flags;
 
 	/* get correct offset for "offset" pin */
@@ -318,18 +322,16 @@ static void plgpio_irq_enable(struct irq_data *d)
 			return;
 	}
 
-	gpiochip_enable_irq(gc, irqd_to_hwirq(d));
 	spin_lock_irqsave(&plgpio->lock, flags);
-	plgpio_reg_reset(plgpio->regmap, offset, plgpio->regs.ie);
+	plgpio_reg_reset(plgpio->base, offset, plgpio->regs.ie);
 	spin_unlock_irqrestore(&plgpio->lock, flags);
 }
 
 static int plgpio_irq_set_type(struct irq_data *d, unsigned trigger)
 {
-	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
-	struct plgpio *plgpio = gpiochip_get_data(gc);
-	int offset = d->hwirq;
-	u32 reg_off;
+	struct plgpio *plgpio = irq_data_get_irq_chip_data(d);
+	int offset = d->irq - plgpio->irq_base;
+	void __iomem *reg_off;
 	unsigned int supported_type = 0, val;
 
 	if (offset >= plgpio->chip.ngpio)
@@ -346,35 +348,31 @@ static int plgpio_irq_set_type(struct irq_data *d, unsigned trigger)
 	if (plgpio->regs.eit == -1)
 		return 0;
 
-	reg_off = REG_OFFSET(0, plgpio->regs.eit, offset);
-	regmap_read(plgpio->regmap, reg_off, &val);
+	reg_off = REG_OFFSET(plgpio->base, plgpio->regs.eit, offset);
+	val = readl_relaxed(reg_off);
 
 	offset = PIN_OFFSET(offset);
 	if (trigger & IRQ_TYPE_EDGE_RISING)
-		regmap_write(plgpio->regmap, reg_off, val | (1 << offset));
+		writel_relaxed(val | (1 << offset), reg_off);
 	else
-		regmap_write(plgpio->regmap, reg_off, val & ~(1 << offset));
+		writel_relaxed(val & ~(1 << offset), reg_off);
 
 	return 0;
 }
 
-static const struct irq_chip plgpio_irqchip = {
+static struct irq_chip plgpio_irqchip = {
 	.name		= "PLGPIO",
 	.irq_enable	= plgpio_irq_enable,
 	.irq_disable	= plgpio_irq_disable,
 	.irq_set_type	= plgpio_irq_set_type,
-	.flags		= IRQCHIP_IMMUTABLE,
-	GPIOCHIP_IRQ_RESOURCE_HELPERS,
 };
 
-static void plgpio_irq_handler(struct irq_desc *desc)
+static void plgpio_irq_handler(unsigned irq, struct irq_desc *desc)
 {
-	struct gpio_chip *gc = irq_desc_get_handler_data(desc);
-	struct plgpio *plgpio = gpiochip_get_data(gc);
+	struct plgpio *plgpio = irq_get_handler_data(irq);
 	struct irq_chip *irqchip = irq_desc_get_chip(desc);
 	int regs_count, count, pin, offset, i = 0;
-	u32 pending;
-	unsigned long pendingl;
+	unsigned long pending;
 
 	count = plgpio->chip.ngpio;
 	regs_count = DIV_ROUND_UP(count, MAX_GPIO_PER_REG);
@@ -382,14 +380,14 @@ static void plgpio_irq_handler(struct irq_desc *desc)
 	chained_irq_enter(irqchip, desc);
 	/* check all plgpio MIS registers for a possible interrupt */
 	for (; i < regs_count; i++) {
-		regmap_read(plgpio->regmap, plgpio->regs.mis +
-			i * sizeof(int *), &pending);
+		pending = readl_relaxed(plgpio->base + plgpio->regs.mis +
+				i * sizeof(int *));
 		if (!pending)
 			continue;
 
 		/* clear interrupts */
-		regmap_write(plgpio->regmap, plgpio->regs.mis +
-			i * sizeof(int *), ~pending);
+		writel_relaxed(~pending, plgpio->base + plgpio->regs.mis +
+				i * sizeof(int *));
 		/*
 		 * clear extra bits in last register having gpios < MAX/REG
 		 * ex: Suppose there are max 102 plgpios. then last register
@@ -401,8 +399,7 @@ static void plgpio_irq_handler(struct irq_desc *desc)
 		if (count < MAX_GPIO_PER_REG)
 			pending &= (1 << count) - 1;
 
-		pendingl = pending;
-		for_each_set_bit(offset, &pendingl, MAX_GPIO_PER_REG) {
+		for_each_set_bit(offset, &pending, MAX_GPIO_PER_REG) {
 			/* get correct pin for "offset" */
 			if (plgpio->o2p && (plgpio->p2o_regs & PTO_MIS_REG)) {
 				pin = plgpio->o2p(offset);
@@ -413,7 +410,7 @@ static void plgpio_irq_handler(struct irq_desc *desc)
 
 			/* get correct irq line number */
 			pin = i * MAX_GPIO_PER_REG + pin;
-			generic_handle_domain_irq(gc->irq.domain, pin);
+			generic_handle_irq(plgpio_to_irq(&plgpio->chip, pin));
 		}
 	}
 	chained_irq_exit(irqchip, desc);
@@ -444,7 +441,7 @@ static int spear310_p2o(int pin)
 	return offset;
 }
 
-static int spear310_o2p(int offset)
+int spear310_o2p(int offset)
 {
 	if (offset <= 3)
 		return 101 - offset;
@@ -524,34 +521,28 @@ static int plgpio_probe_dt(struct platform_device *pdev, struct plgpio *plgpio)
 end:
 	return ret;
 }
-
 static int plgpio_probe(struct platform_device *pdev)
 {
-	struct device_node *regmap_np;
+	struct device_node *np = pdev->dev.of_node;
 	struct plgpio *plgpio;
-	int ret, irq;
+	struct resource *res;
+	int ret, irq, i;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res) {
+		dev_err(&pdev->dev, "invalid IORESOURCE_MEM\n");
+		return -EBUSY;
+	}
 
 	plgpio = devm_kzalloc(&pdev->dev, sizeof(*plgpio), GFP_KERNEL);
-	if (!plgpio)
+	if (!plgpio) {
+		dev_err(&pdev->dev, "memory allocation fail\n");
 		return -ENOMEM;
-
-	regmap_np = of_parse_phandle(pdev->dev.of_node, "regmap", 0);
-	if (regmap_np) {
-		plgpio->regmap = device_node_to_regmap(regmap_np);
-		of_node_put(regmap_np);
-		if (IS_ERR(plgpio->regmap)) {
-			dev_err(&pdev->dev, "Retrieve regmap failed (%pe)\n",
-				plgpio->regmap);
-			return PTR_ERR(plgpio->regmap);
-		}
-	} else {
-		plgpio->regmap = device_node_to_regmap(pdev->dev.of_node);
-		if (IS_ERR(plgpio->regmap)) {
-			dev_err(&pdev->dev, "Init regmap failed (%pe)\n",
-				plgpio->regmap);
-			return PTR_ERR(plgpio->regmap);
-		}
 	}
+
+	plgpio->base = devm_ioremap_resource(&pdev->dev, res);
+	if (IS_ERR(plgpio->base))
+		return PTR_ERR(plgpio->base);
 
 	ret = plgpio_probe_dt(pdev, plgpio);
 	if (ret) {
@@ -564,17 +555,20 @@ static int plgpio_probe(struct platform_device *pdev)
 		dev_warn(&pdev->dev, "clk_get() failed, work without it\n");
 
 #ifdef CONFIG_PM_SLEEP
-	plgpio->csave_regs = devm_kcalloc(&pdev->dev,
+	plgpio->csave_regs = devm_kzalloc(&pdev->dev,
+			sizeof(*plgpio->csave_regs) *
 			DIV_ROUND_UP(plgpio->chip.ngpio, MAX_GPIO_PER_REG),
-			sizeof(*plgpio->csave_regs),
 			GFP_KERNEL);
-	if (!plgpio->csave_regs)
+	if (!plgpio->csave_regs) {
+		dev_err(&pdev->dev, "csave registers memory allocation fail\n");
 		return -ENOMEM;
+	}
 #endif
 
 	platform_set_drvdata(pdev, plgpio);
 	spin_lock_init(&plgpio->lock);
 
+	plgpio->irq_base = -1;
 	plgpio->chip.base = -1;
 	plgpio->chip.request = plgpio_request;
 	plgpio->chip.free = plgpio_free;
@@ -582,8 +576,9 @@ static int plgpio_probe(struct platform_device *pdev)
 	plgpio->chip.direction_output = plgpio_direction_output;
 	plgpio->chip.get = plgpio_get_value;
 	plgpio->chip.set = plgpio_set_value;
+	plgpio->chip.to_irq = plgpio_to_irq;
 	plgpio->chip.label = dev_name(&pdev->dev);
-	plgpio->chip.parent = &pdev->dev;
+	plgpio->chip.dev = &pdev->dev;
 	plgpio->chip.owner = THIS_MODULE;
 
 	if (!IS_ERR(plgpio->clk)) {
@@ -594,35 +589,51 @@ static int plgpio_probe(struct platform_device *pdev)
 		}
 	}
 
-	irq = platform_get_irq(pdev, 0);
-	if (irq > 0) {
-		struct gpio_irq_chip *girq;
-
-		girq = &plgpio->chip.irq;
-		gpio_irq_chip_set_chip(girq, &plgpio_irqchip);
-		girq->parent_handler = plgpio_irq_handler;
-		girq->num_parents = 1;
-		girq->parents = devm_kcalloc(&pdev->dev, 1,
-					     sizeof(*girq->parents),
-					     GFP_KERNEL);
-		if (!girq->parents)
-			return -ENOMEM;
-		girq->parents[0] = irq;
-		girq->default_type = IRQ_TYPE_NONE;
-		girq->handler = handle_simple_irq;
-		dev_info(&pdev->dev, "PLGPIO registering with IRQs\n");
-	} else {
-		dev_info(&pdev->dev, "PLGPIO registering without IRQs\n");
-	}
-
-	ret = gpiochip_add_data(&plgpio->chip, plgpio);
+	ret = gpiochip_add(&plgpio->chip);
 	if (ret) {
 		dev_err(&pdev->dev, "unable to add gpio chip\n");
 		goto unprepare_clk;
 	}
 
+	irq = platform_get_irq(pdev, 0);
+	if (irq < 0) {
+		dev_info(&pdev->dev, "irqs not supported\n");
+		return 0;
+	}
+
+	plgpio->irq_base = irq_alloc_descs(-1, 0, plgpio->chip.ngpio, 0);
+	if (IS_ERR_VALUE(plgpio->irq_base)) {
+		/* we would not support irq for gpio */
+		dev_warn(&pdev->dev, "couldn't allocate irq base\n");
+		return 0;
+	}
+
+	plgpio->irq_domain = irq_domain_add_legacy(np, plgpio->chip.ngpio,
+			plgpio->irq_base, 0, &irq_domain_simple_ops, NULL);
+	if (WARN_ON(!plgpio->irq_domain)) {
+		dev_err(&pdev->dev, "irq domain init failed\n");
+		irq_free_descs(plgpio->irq_base, plgpio->chip.ngpio);
+		ret = -ENXIO;
+		goto remove_gpiochip;
+	}
+
+	irq_set_chained_handler(irq, plgpio_irq_handler);
+	for (i = 0; i < plgpio->chip.ngpio; i++) {
+		irq_set_chip_and_handler(i + plgpio->irq_base, &plgpio_irqchip,
+				handle_simple_irq);
+		set_irq_flags(i + plgpio->irq_base, IRQF_VALID);
+		irq_set_chip_data(i + plgpio->irq_base, plgpio);
+	}
+
+	irq_set_handler_data(irq, plgpio);
+	dev_info(&pdev->dev, "PLGPIO registered with IRQs\n");
+
 	return 0;
 
+remove_gpiochip:
+	dev_info(&pdev->dev, "Remove gpiochip\n");
+	if (gpiochip_remove(&plgpio->chip))
+		dev_err(&pdev->dev, "unable to remove gpiochip\n");
 unprepare_clk:
 	if (!IS_ERR(plgpio->clk))
 		clk_unprepare(plgpio->clk);
@@ -635,23 +646,22 @@ static int plgpio_suspend(struct device *dev)
 {
 	struct plgpio *plgpio = dev_get_drvdata(dev);
 	int i, reg_count = DIV_ROUND_UP(plgpio->chip.ngpio, MAX_GPIO_PER_REG);
-	u32 off;
+	void __iomem *off;
 
 	for (i = 0; i < reg_count; i++) {
-		off = i * sizeof(int *);
+		off = plgpio->base + i * sizeof(int *);
 
 		if (plgpio->regs.enb != -1)
-			regmap_read(plgpio->regmap, plgpio->regs.enb + off,
-				&plgpio->csave_regs[i].enb);
+			plgpio->csave_regs[i].enb =
+				readl_relaxed(plgpio->regs.enb + off);
 		if (plgpio->regs.eit != -1)
-			regmap_read(plgpio->regmap, plgpio->regs.eit + off,
-				&plgpio->csave_regs[i].eit);
-		regmap_read(plgpio->regmap, plgpio->regs.wdata + off,
-				&plgpio->csave_regs[i].wdata);
-		regmap_read(plgpio->regmap, plgpio->regs.dir + off,
-				&plgpio->csave_regs[i].dir);
-		regmap_read(plgpio->regmap, plgpio->regs.ie + off,
-				&plgpio->csave_regs[i].ie);
+			plgpio->csave_regs[i].eit =
+				readl_relaxed(plgpio->regs.eit + off);
+		plgpio->csave_regs[i].wdata = readl_relaxed(plgpio->regs.wdata +
+				off);
+		plgpio->csave_regs[i].dir = readl_relaxed(plgpio->regs.dir +
+				off);
+		plgpio->csave_regs[i].ie = readl_relaxed(plgpio->regs.ie + off);
 	}
 
 	return 0;
@@ -665,7 +675,7 @@ static int plgpio_suspend(struct device *dev)
  */
 #define plgpio_prepare_reg(__reg, _off, _mask, _tmp)		\
 {								\
-	regmap_read(plgpio->regmap, plgpio->regs.__reg + _off, &_tmp); \
+	_tmp = readl_relaxed(plgpio->regs.__reg + _off);		\
 	_tmp &= ~_mask;						\
 	plgpio->csave_regs[i].__reg =				\
 		_tmp | (plgpio->csave_regs[i].__reg & _mask);	\
@@ -675,11 +685,11 @@ static int plgpio_resume(struct device *dev)
 {
 	struct plgpio *plgpio = dev_get_drvdata(dev);
 	int i, reg_count = DIV_ROUND_UP(plgpio->chip.ngpio, MAX_GPIO_PER_REG);
-	u32 off;
+	void __iomem *off;
 	u32 mask, tmp;
 
 	for (i = 0; i < reg_count; i++) {
-		off = i * sizeof(int *);
+		off = plgpio->base + i * sizeof(int *);
 
 		if (i == reg_count - 1) {
 			mask = (1 << (plgpio->chip.ngpio - i *
@@ -696,22 +706,20 @@ static int plgpio_resume(struct device *dev)
 			plgpio_prepare_reg(ie, off, mask, tmp);
 		}
 
-		regmap_write(plgpio->regmap, plgpio->regs.wdata + off,
-			plgpio->csave_regs[i].wdata);
-
-		regmap_write(plgpio->regmap, plgpio->regs.dir + off,
-			plgpio->csave_regs[i].dir);
+		writel_relaxed(plgpio->csave_regs[i].wdata, plgpio->regs.wdata +
+				off);
+		writel_relaxed(plgpio->csave_regs[i].dir, plgpio->regs.dir +
+				off);
 
 		if (plgpio->regs.eit != -1)
-			regmap_write(plgpio->regmap, plgpio->regs.eit + off,
-				plgpio->csave_regs[i].eit);
+			writel_relaxed(plgpio->csave_regs[i].eit,
+					plgpio->regs.eit + off);
 
-		regmap_write(plgpio->regmap, plgpio->regs.ie + off,
-			plgpio->csave_regs[i].ie);
+		writel_relaxed(plgpio->csave_regs[i].ie, plgpio->regs.ie + off);
 
 		if (plgpio->regs.enb != -1)
-			regmap_write(plgpio->regmap, plgpio->regs.enb + off,
-				plgpio->csave_regs[i].enb);
+			writel_relaxed(plgpio->csave_regs[i].enb,
+					plgpio->regs.enb + off);
 	}
 
 	return 0;
@@ -724,13 +732,15 @@ static const struct of_device_id plgpio_of_match[] = {
 	{ .compatible = "st,spear-plgpio" },
 	{}
 };
+MODULE_DEVICE_TABLE(of, plgpio_of_match);
 
 static struct platform_driver plgpio_driver = {
 	.probe = plgpio_probe,
 	.driver = {
+		.owner = THIS_MODULE,
 		.name = "spear-plgpio",
 		.pm = &plgpio_dev_pm_ops,
-		.of_match_table = plgpio_of_match,
+		.of_match_table = of_match_ptr(plgpio_of_match),
 	},
 };
 
@@ -739,3 +749,7 @@ static int __init plgpio_init(void)
 	return platform_driver_register(&plgpio_driver);
 }
 subsys_initcall(plgpio_init);
+
+MODULE_AUTHOR("Viresh Kumar <viresh.kumar@linaro.org>");
+MODULE_DESCRIPTION("ST Microlectronics SPEAr PLGPIO driver");
+MODULE_LICENSE("GPL");

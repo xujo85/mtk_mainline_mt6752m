@@ -1,8 +1,11 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Driver for the TXx9 SoC DMA Controller
  *
  * Copyright (C) 2009 Atsushi Nemoto
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  */
 #include <linux/dma-mapping.h>
 #include <linux/init.h>
@@ -73,7 +76,7 @@ static void channel64_write_CHAR(const struct txx9dmac_chan *dc, dma_addr_t val)
 
 static void channel64_clear_CHAR(const struct txx9dmac_chan *dc)
 {
-#if defined(CONFIG_32BIT) && !defined(CONFIG_PHYS_ADDR_T_64BIT)
+#if defined(CONFIG_32BIT) && !defined(CONFIG_64BIT_PHYS_ADDR)
 	channel64_writel(dc, CHAR, 0);
 	channel64_writel(dc, __pad_CHAR, 0);
 #else
@@ -324,6 +327,7 @@ static void txx9dmac_reset_chan(struct txx9dmac_chan *dc)
 	channel_writel(dc, SAIR, 0);
 	channel_writel(dc, DAIR, 0);
 	channel_writel(dc, CCR, 0);
+	mmiowb();
 }
 
 /* Called with dc->lock held and bh disabled */
@@ -399,25 +403,52 @@ static void
 txx9dmac_descriptor_complete(struct txx9dmac_chan *dc,
 			     struct txx9dmac_desc *desc)
 {
-	struct dmaengine_desc_callback cb;
+	dma_async_tx_callback callback;
+	void *param;
 	struct dma_async_tx_descriptor *txd = &desc->txd;
+	struct txx9dmac_slave *ds = dc->chan.private;
 
 	dev_vdbg(chan2dev(&dc->chan), "descriptor %u %p complete\n",
 		 txd->cookie, desc);
 
 	dma_cookie_complete(txd);
-	dmaengine_desc_get_callback(txd, &cb);
+	callback = txd->callback;
+	param = txd->callback_param;
 
 	txx9dmac_sync_desc_for_cpu(dc, desc);
 	list_splice_init(&desc->tx_list, &dc->free_list);
 	list_move(&desc->desc_node, &dc->free_list);
 
-	dma_descriptor_unmap(txd);
+	if (!ds) {
+		dma_addr_t dmaaddr;
+		if (!(txd->flags & DMA_COMPL_SKIP_DEST_UNMAP)) {
+			dmaaddr = is_dmac64(dc) ?
+				desc->hwdesc.DAR : desc->hwdesc32.DAR;
+			if (txd->flags & DMA_COMPL_DEST_UNMAP_SINGLE)
+				dma_unmap_single(chan2parent(&dc->chan),
+					dmaaddr, desc->len, DMA_FROM_DEVICE);
+			else
+				dma_unmap_page(chan2parent(&dc->chan),
+					dmaaddr, desc->len, DMA_FROM_DEVICE);
+		}
+		if (!(txd->flags & DMA_COMPL_SKIP_SRC_UNMAP)) {
+			dmaaddr = is_dmac64(dc) ?
+				desc->hwdesc.SAR : desc->hwdesc32.SAR;
+			if (txd->flags & DMA_COMPL_SRC_UNMAP_SINGLE)
+				dma_unmap_single(chan2parent(&dc->chan),
+					dmaaddr, desc->len, DMA_TO_DEVICE);
+			else
+				dma_unmap_page(chan2parent(&dc->chan),
+					dmaaddr, desc->len, DMA_TO_DEVICE);
+		}
+	}
+
 	/*
 	 * The API requires that no submissions are done from a
 	 * callback, so we don't need to drop the lock here
 	 */
-	dmaengine_desc_callback_invoke(&cb, NULL);
+	if (callback)
+		callback(param);
 	dma_run_dependencies(txd);
 }
 
@@ -601,13 +632,13 @@ scan_done:
 	}
 }
 
-static void txx9dmac_chan_tasklet(struct tasklet_struct *t)
+static void txx9dmac_chan_tasklet(unsigned long data)
 {
 	int irq;
 	u32 csr;
 	struct txx9dmac_chan *dc;
 
-	dc = from_tasklet(dc, t, tasklet);
+	dc = (struct txx9dmac_chan *)data;
 	csr = channel_readl(dc, CSR);
 	dev_vdbg(chan2dev(&dc->chan), "tasklet: status=%x\n", csr);
 
@@ -638,13 +669,13 @@ static irqreturn_t txx9dmac_chan_interrupt(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-static void txx9dmac_tasklet(struct tasklet_struct *t)
+static void txx9dmac_tasklet(unsigned long data)
 {
 	int irq;
 	u32 csr;
 	struct txx9dmac_chan *dc;
 
-	struct txx9dmac_dev *ddev = from_tasklet(ddev, t, tasklet);
+	struct txx9dmac_dev *ddev = (struct txx9dmac_dev *)data;
 	u32 mcr;
 	int i;
 
@@ -894,11 +925,16 @@ txx9dmac_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
 	return &first->txd;
 }
 
-static int txx9dmac_terminate_all(struct dma_chan *chan)
+static int txx9dmac_control(struct dma_chan *chan, enum dma_ctrl_cmd cmd,
+			    unsigned long arg)
 {
 	struct txx9dmac_chan *dc = to_txx9dmac_chan(chan);
 	struct txx9dmac_desc *desc, *_desc;
 	LIST_HEAD(list);
+
+	/* Only supports DMA_TERMINATE_ALL */
+	if (cmd != DMA_TERMINATE_ALL)
+		return -EINVAL;
 
 	dev_vdbg(chan2dev(chan), "terminate_all\n");
 	spin_lock_bh(&dc->lock);
@@ -926,14 +962,15 @@ txx9dmac_tx_status(struct dma_chan *chan, dma_cookie_t cookie,
 	enum dma_status ret;
 
 	ret = dma_cookie_status(chan, cookie, txstate);
-	if (ret == DMA_COMPLETE)
-		return DMA_COMPLETE;
+	if (ret != DMA_SUCCESS) {
+		spin_lock_bh(&dc->lock);
+		txx9dmac_scan_descriptors(dc);
+		spin_unlock_bh(&dc->lock);
 
-	spin_lock_bh(&dc->lock);
-	txx9dmac_scan_descriptors(dc);
-	spin_unlock_bh(&dc->lock);
+		ret = dma_cookie_status(chan, cookie, txstate);
+	}
 
-	return dma_cookie_status(chan, cookie, txstate);
+	return ret;
 }
 
 static void txx9dmac_chain_dynamic(struct txx9dmac_chan *dc,
@@ -950,6 +987,7 @@ static void txx9dmac_chain_dynamic(struct txx9dmac_chan *dc,
 	dma_sync_single_for_device(chan2parent(&dc->chan),
 				   prev->txd.phys, ddev->descsize,
 				   DMA_TO_DEVICE);
+	mmiowb();
 	if (!(channel_readl(dc, CSR) & TXX9_DMA_CSR_CHNEN) &&
 	    channel_read_CHAR(dc) == prev->txd.phys)
 		/* Restart chain DMA */
@@ -1075,14 +1113,14 @@ static void txx9dmac_free_chan_resources(struct dma_chan *chan)
 static void txx9dmac_off(struct txx9dmac_dev *ddev)
 {
 	dma_writel(ddev, MCR, 0);
+	mmiowb();
 }
 
 static int __init txx9dmac_chan_probe(struct platform_device *pdev)
 {
-	struct txx9dmac_chan_platform_data *cpdata =
-			dev_get_platdata(&pdev->dev);
+	struct txx9dmac_chan_platform_data *cpdata = pdev->dev.platform_data;
 	struct platform_device *dmac_dev = cpdata->dmac_dev;
-	struct txx9dmac_platform_data *pdata = dev_get_platdata(&dmac_dev->dev);
+	struct txx9dmac_platform_data *pdata = dmac_dev->dev.platform_data;
 	struct txx9dmac_chan *dc;
 	int err;
 	int ch = pdev->id % TXX9_DMA_MAX_NR_CHANNELS;
@@ -1095,7 +1133,7 @@ static int __init txx9dmac_chan_probe(struct platform_device *pdev)
 	dc->dma.dev = &pdev->dev;
 	dc->dma.device_alloc_chan_resources = txx9dmac_alloc_chan_resources;
 	dc->dma.device_free_chan_resources = txx9dmac_free_chan_resources;
-	dc->dma.device_terminate_all = txx9dmac_terminate_all;
+	dc->dma.device_control = txx9dmac_control;
 	dc->dma.device_tx_status = txx9dmac_tx_status;
 	dc->dma.device_issue_pending = txx9dmac_issue_pending;
 	if (pdata && pdata->memcpy_chan == ch) {
@@ -1113,7 +1151,8 @@ static int __init txx9dmac_chan_probe(struct platform_device *pdev)
 		irq = platform_get_irq(pdev, 0);
 		if (irq < 0)
 			return irq;
-		tasklet_setup(&dc->tasklet, txx9dmac_chan_tasklet);
+		tasklet_init(&dc->tasklet, txx9dmac_chan_tasklet,
+				(unsigned long)dc);
 		dc->irq = irq;
 		err = devm_request_irq(&pdev->dev, dc->irq,
 			txx9dmac_chan_interrupt, 0, dev_name(&pdev->dev), dc);
@@ -1155,19 +1194,16 @@ static int txx9dmac_chan_remove(struct platform_device *pdev)
 {
 	struct txx9dmac_chan *dc = platform_get_drvdata(pdev);
 
-
 	dma_async_device_unregister(&dc->dma);
-	if (dc->irq >= 0) {
-		devm_free_irq(&pdev->dev, dc->irq, dc);
+	if (dc->irq >= 0)
 		tasklet_kill(&dc->tasklet);
-	}
 	dc->ddev->chan[pdev->id % TXX9_DMA_MAX_NR_CHANNELS] = NULL;
 	return 0;
 }
 
 static int __init txx9dmac_probe(struct platform_device *pdev)
 {
-	struct txx9dmac_platform_data *pdata = dev_get_platdata(&pdev->dev);
+	struct txx9dmac_platform_data *pdata = pdev->dev.platform_data;
 	struct resource *io;
 	struct txx9dmac_dev *ddev;
 	u32 mcr;
@@ -1199,7 +1235,8 @@ static int __init txx9dmac_probe(struct platform_device *pdev)
 
 	ddev->irq = platform_get_irq(pdev, 0);
 	if (ddev->irq >= 0) {
-		tasklet_setup(&ddev->tasklet, txx9dmac_tasklet);
+		tasklet_init(&ddev->tasklet, txx9dmac_tasklet,
+				(unsigned long)ddev);
 		err = devm_request_irq(&pdev->dev, ddev->irq,
 			txx9dmac_interrupt, 0, dev_name(&pdev->dev), ddev);
 		if (err)
@@ -1220,10 +1257,8 @@ static int txx9dmac_remove(struct platform_device *pdev)
 	struct txx9dmac_dev *ddev = platform_get_drvdata(pdev);
 
 	txx9dmac_off(ddev);
-	if (ddev->irq >= 0) {
-		devm_free_irq(&pdev->dev, ddev->irq, ddev);
+	if (ddev->irq >= 0)
 		tasklet_kill(&ddev->tasklet);
-	}
 	return 0;
 }
 
@@ -1236,7 +1271,8 @@ static void txx9dmac_shutdown(struct platform_device *pdev)
 
 static int txx9dmac_suspend_noirq(struct device *dev)
 {
-	struct txx9dmac_dev *ddev = dev_get_drvdata(dev);
+	struct platform_device *pdev = to_platform_device(dev);
+	struct txx9dmac_dev *ddev = platform_get_drvdata(pdev);
 
 	txx9dmac_off(ddev);
 	return 0;
@@ -1244,8 +1280,9 @@ static int txx9dmac_suspend_noirq(struct device *dev)
 
 static int txx9dmac_resume_noirq(struct device *dev)
 {
-	struct txx9dmac_dev *ddev = dev_get_drvdata(dev);
-	struct txx9dmac_platform_data *pdata = dev_get_platdata(dev);
+	struct platform_device *pdev = to_platform_device(dev);
+	struct txx9dmac_dev *ddev = platform_get_drvdata(pdev);
+	struct txx9dmac_platform_data *pdata = pdev->dev.platform_data;
 	u32 mcr;
 
 	mcr = TXX9_DMA_MCR_MSTEN | MCR_LE;

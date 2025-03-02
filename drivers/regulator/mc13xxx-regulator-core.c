@@ -1,15 +1,19 @@
-// SPDX-License-Identifier: GPL-2.0
-//
-// Regulator Driver for Freescale MC13xxx PMIC
-//
-// Copyright 2010 Yong Shen <yong.shen@linaro.org>
-//
-// Based on mc13783 regulator driver :
-// Copyright (C) 2008 Sascha Hauer, Pengutronix <s.hauer@pengutronix.de>
-// Copyright 2009 Alberto Panizzo <maramaopercheseimorto@gmail.com>
-//
-// Regs infos taken from mc13xxx drivers from freescale and mc13xxx.pdf file
-// from freescale
+/*
+ * Regulator Driver for Freescale MC13xxx PMIC
+ *
+ * Copyright 2010 Yong Shen <yong.shen@linaro.org>
+ *
+ * Based on mc13783 regulator driver :
+ * Copyright (C) 2008 Sascha Hauer, Pengutronix <s.hauer@pengutronix.de>
+ * Copyright 2009 Alberto Panizzo <maramaopercheseimorto@gmail.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ * Regs infos taken from mc13xxx drivers from freescale and mc13xxx.pdf file
+ * from freescale
+ */
 
 #include <linux/mfd/mc13xxx.h>
 #include <linux/regulator/machine.h>
@@ -29,12 +33,17 @@ static int mc13xxx_regulator_enable(struct regulator_dev *rdev)
 	struct mc13xxx_regulator_priv *priv = rdev_get_drvdata(rdev);
 	struct mc13xxx_regulator *mc13xxx_regulators = priv->mc13xxx_regulators;
 	int id = rdev_get_id(rdev);
+	int ret;
 
 	dev_dbg(rdev_get_dev(rdev), "%s id: %d\n", __func__, id);
 
-	return mc13xxx_reg_rmw(priv->mc13xxx, mc13xxx_regulators[id].reg,
-			       mc13xxx_regulators[id].enable_bit,
-			       mc13xxx_regulators[id].enable_bit);
+	mc13xxx_lock(priv->mc13xxx);
+	ret = mc13xxx_reg_rmw(priv->mc13xxx, mc13xxx_regulators[id].reg,
+			mc13xxx_regulators[id].enable_bit,
+			mc13xxx_regulators[id].enable_bit);
+	mc13xxx_unlock(priv->mc13xxx);
+
+	return ret;
 }
 
 static int mc13xxx_regulator_disable(struct regulator_dev *rdev)
@@ -42,11 +51,16 @@ static int mc13xxx_regulator_disable(struct regulator_dev *rdev)
 	struct mc13xxx_regulator_priv *priv = rdev_get_drvdata(rdev);
 	struct mc13xxx_regulator *mc13xxx_regulators = priv->mc13xxx_regulators;
 	int id = rdev_get_id(rdev);
+	int ret;
 
 	dev_dbg(rdev_get_dev(rdev), "%s id: %d\n", __func__, id);
 
-	return mc13xxx_reg_rmw(priv->mc13xxx, mc13xxx_regulators[id].reg,
-			       mc13xxx_regulators[id].enable_bit, 0);
+	mc13xxx_lock(priv->mc13xxx);
+	ret = mc13xxx_reg_rmw(priv->mc13xxx, mc13xxx_regulators[id].reg,
+			mc13xxx_regulators[id].enable_bit, 0);
+	mc13xxx_unlock(priv->mc13xxx);
+
+	return ret;
 }
 
 static int mc13xxx_regulator_is_enabled(struct regulator_dev *rdev)
@@ -56,7 +70,10 @@ static int mc13xxx_regulator_is_enabled(struct regulator_dev *rdev)
 	int ret, id = rdev_get_id(rdev);
 	unsigned int val;
 
+	mc13xxx_lock(priv->mc13xxx);
 	ret = mc13xxx_reg_read(priv->mc13xxx, mc13xxx_regulators[id].reg, &val);
+	mc13xxx_unlock(priv->mc13xxx);
+
 	if (ret)
 		return ret;
 
@@ -69,10 +86,15 @@ static int mc13xxx_regulator_set_voltage_sel(struct regulator_dev *rdev,
 	struct mc13xxx_regulator_priv *priv = rdev_get_drvdata(rdev);
 	struct mc13xxx_regulator *mc13xxx_regulators = priv->mc13xxx_regulators;
 	int id = rdev_get_id(rdev);
+	int ret;
 
-	return mc13xxx_reg_rmw(priv->mc13xxx, mc13xxx_regulators[id].vsel_reg,
-			       mc13xxx_regulators[id].vsel_mask,
-			       selector << mc13xxx_regulators[id].vsel_shift);
+	mc13xxx_lock(priv->mc13xxx);
+	ret = mc13xxx_reg_rmw(priv->mc13xxx, mc13xxx_regulators[id].vsel_reg,
+			mc13xxx_regulators[id].vsel_mask,
+			selector << mc13xxx_regulators[id].vsel_shift);
+	mc13xxx_unlock(priv->mc13xxx);
+
+	return ret;
 }
 
 static int mc13xxx_regulator_get_voltage(struct regulator_dev *rdev)
@@ -84,8 +106,11 @@ static int mc13xxx_regulator_get_voltage(struct regulator_dev *rdev)
 
 	dev_dbg(rdev_get_dev(rdev), "%s id: %d\n", __func__, id);
 
+	mc13xxx_lock(priv->mc13xxx);
 	ret = mc13xxx_reg_read(priv->mc13xxx,
 				mc13xxx_regulators[id].vsel_reg, &val);
+	mc13xxx_unlock(priv->mc13xxx);
+
 	if (ret)
 		return ret;
 
@@ -99,7 +124,7 @@ static int mc13xxx_regulator_get_voltage(struct regulator_dev *rdev)
 	return rdev->desc->volt_table[val];
 }
 
-const struct regulator_ops mc13xxx_regulator_ops = {
+struct regulator_ops mc13xxx_regulator_ops = {
 	.enable = mc13xxx_regulator_enable,
 	.disable = mc13xxx_regulator_disable,
 	.is_enabled = mc13xxx_regulator_is_enabled,
@@ -127,7 +152,7 @@ int mc13xxx_fixed_regulator_set_voltage(struct regulator_dev *rdev, int min_uV,
 }
 EXPORT_SYMBOL_GPL(mc13xxx_fixed_regulator_set_voltage);
 
-const struct regulator_ops mc13xxx_fixed_regulator_ops = {
+struct regulator_ops mc13xxx_fixed_regulator_ops = {
 	.enable = mc13xxx_regulator_enable,
 	.disable = mc13xxx_regulator_disable,
 	.is_enabled = mc13xxx_regulator_is_enabled,
@@ -142,10 +167,8 @@ int mc13xxx_get_num_regulators_dt(struct platform_device *pdev)
 	struct device_node *parent;
 	int num;
 
-	if (!pdev->dev.parent->of_node)
-		return -ENODEV;
-
-	parent = of_get_child_by_name(pdev->dev.parent->of_node, "regulators");
+	of_node_get(pdev->dev.parent->of_node);
+	parent = of_find_node_by_name(pdev->dev.parent->of_node, "regulators");
 	if (!parent)
 		return -ENODEV;
 
@@ -164,14 +187,12 @@ struct mc13xxx_regulator_init_data *mc13xxx_parse_regulators_dt(
 	struct device_node *parent, *child;
 	int i, parsed = 0;
 
-	if (!pdev->dev.parent->of_node)
-		return NULL;
-
-	parent = of_get_child_by_name(pdev->dev.parent->of_node, "regulators");
+	of_node_get(pdev->dev.parent->of_node);
+	parent = of_find_node_by_name(pdev->dev.parent->of_node, "regulators");
 	if (!parent)
 		return NULL;
 
-	data = devm_kcalloc(&pdev->dev, priv->num_regulators, sizeof(*data),
+	data = devm_kzalloc(&pdev->dev, sizeof(*data) * priv->num_regulators,
 			    GFP_KERNEL);
 	if (!data) {
 		of_node_put(parent);
@@ -186,12 +207,11 @@ struct mc13xxx_regulator_init_data *mc13xxx_parse_regulators_dt(
 		for (i = 0; i < num_regulators; i++) {
 			if (!regulators[i].desc.name)
 				continue;
-			if (of_node_name_eq(child,
+			if (!of_node_cmp(child->name,
 					 regulators[i].desc.name)) {
 				p->id = i;
 				p->init_data = of_get_regulator_init_data(
-							&pdev->dev, child,
-							&regulators[i].desc);
+							&pdev->dev, child);
 				p->node = child;
 				p++;
 
@@ -203,7 +223,7 @@ struct mc13xxx_regulator_init_data *mc13xxx_parse_regulators_dt(
 
 		if (!found)
 			dev_warn(&pdev->dev,
-				 "Unknown regulator: %pOFn\n", child);
+				 "Unknown regulator: %s\n", child->name);
 	}
 	of_node_put(parent);
 

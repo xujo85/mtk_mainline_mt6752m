@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * card.c - contains functions for managing groups of PnP devices
  *
@@ -6,7 +5,6 @@
  */
 
 #include <linux/module.h>
-#include <linux/mutex.h>
 #include <linux/ctype.h>
 #include <linux/slab.h>
 #include <linux/pnp.h>
@@ -80,7 +78,7 @@ static int card_probe(struct pnp_card *card, struct pnp_card_driver *drv)
 	if (!id)
 		return 0;
 
-	clink = kzalloc(sizeof(*clink), GFP_KERNEL);
+	clink = pnp_alloc(sizeof(*clink));
 	if (!clink)
 		return 0;
 	clink->card = card;
@@ -181,8 +179,8 @@ struct pnp_card *pnp_alloc_card(struct pnp_protocol *protocol, int id, char *pnp
 	return card;
 }
 
-static ssize_t name_show(struct device *dmdev,
-			 struct device_attribute *attr, char *buf)
+static ssize_t pnp_show_card_name(struct device *dmdev,
+				  struct device_attribute *attr, char *buf)
 {
 	char *str = buf;
 	struct pnp_card *card = to_pnp_card(dmdev);
@@ -191,10 +189,10 @@ static ssize_t name_show(struct device *dmdev,
 	return (str - buf);
 }
 
-static DEVICE_ATTR_RO(name);
+static DEVICE_ATTR(name, S_IRUGO, pnp_show_card_name, NULL);
 
-static ssize_t card_id_show(struct device *dmdev,
-			    struct device_attribute *attr, char *buf)
+static ssize_t pnp_show_card_ids(struct device *dmdev,
+				 struct device_attribute *attr, char *buf)
 {
 	char *str = buf;
 	struct pnp_card *card = to_pnp_card(dmdev);
@@ -207,7 +205,7 @@ static ssize_t card_id_show(struct device *dmdev,
 	return (str - buf);
 }
 
-static DEVICE_ATTR_RO(card_id);
+static DEVICE_ATTR(card_id, S_IRUGO, pnp_show_card_ids, NULL);
 
 static int pnp_interface_attach_card(struct pnp_card *card)
 {
@@ -241,15 +239,14 @@ int pnp_add_card(struct pnp_card *card)
 	error = device_register(&card->dev);
 	if (error) {
 		dev_err(&card->dev, "could not register (err=%d)\n", error);
-		put_device(&card->dev);
 		return error;
 	}
 
 	pnp_interface_attach_card(card);
-	mutex_lock(&pnp_lock);
+	spin_lock(&pnp_lock);
 	list_add_tail(&card->global_list, &pnp_cards);
 	list_add_tail(&card->protocol_list, &card->protocol->cards);
-	mutex_unlock(&pnp_lock);
+	spin_unlock(&pnp_lock);
 
 	/* we wait until now to add devices in order to ensure the drivers
 	 * will be able to use all of the related devices on the card
@@ -278,10 +275,10 @@ void pnp_remove_card(struct pnp_card *card)
 	struct list_head *pos, *temp;
 
 	device_unregister(&card->dev);
-	mutex_lock(&pnp_lock);
+	spin_lock(&pnp_lock);
 	list_del(&card->global_list);
 	list_del(&card->protocol_list);
-	mutex_unlock(&pnp_lock);
+	spin_unlock(&pnp_lock);
 	list_for_each_safe(pos, temp, &card->devices) {
 		struct pnp_dev *dev = card_to_pnp_dev(pos);
 		pnp_remove_card_device(dev);
@@ -299,10 +296,10 @@ int pnp_add_card_device(struct pnp_card *card, struct pnp_dev *dev)
 	dev->card_link = NULL;
 	dev_set_name(&dev->dev, "%02x:%02x.%02x",
 		     dev->protocol->number, card->number, dev->number);
-	mutex_lock(&pnp_lock);
+	spin_lock(&pnp_lock);
 	dev->card = card;
 	list_add_tail(&dev->card_list, &card->devices);
-	mutex_unlock(&pnp_lock);
+	spin_unlock(&pnp_lock);
 	return 0;
 }
 
@@ -312,10 +309,10 @@ int pnp_add_card_device(struct pnp_card *card, struct pnp_dev *dev)
  */
 void pnp_remove_card_device(struct pnp_dev *dev)
 {
-	mutex_lock(&pnp_lock);
+	spin_lock(&pnp_lock);
 	dev->card = NULL;
 	list_del(&dev->card_list);
-	mutex_unlock(&pnp_lock);
+	spin_unlock(&pnp_lock);
 	__pnp_remove_device(dev);
 }
 
@@ -369,7 +366,6 @@ err_out:
 	dev->card_link = NULL;
 	return NULL;
 }
-EXPORT_SYMBOL(pnp_request_card_device);
 
 /**
  * pnp_release_card_device - call this when the driver no longer needs the device
@@ -383,7 +379,6 @@ void pnp_release_card_device(struct pnp_dev *dev)
 	device_release_driver(&dev->dev);
 	drv->link.remove = &card_remove_first;
 }
-EXPORT_SYMBOL(pnp_release_card_device);
 
 /*
  * suspend/resume callbacks
@@ -430,9 +425,9 @@ int pnp_register_card_driver(struct pnp_card_driver *drv)
 	if (error < 0)
 		return error;
 
-	mutex_lock(&pnp_lock);
+	spin_lock(&pnp_lock);
 	list_add_tail(&drv->global_list, &pnp_card_drivers);
-	mutex_unlock(&pnp_lock);
+	spin_unlock(&pnp_lock);
 
 	list_for_each_safe(pos, temp, &pnp_cards) {
 		struct pnp_card *card =
@@ -441,7 +436,6 @@ int pnp_register_card_driver(struct pnp_card_driver *drv)
 	}
 	return 0;
 }
-EXPORT_SYMBOL(pnp_register_card_driver);
 
 /**
  * pnp_unregister_card_driver - unregisters a PnP card driver from the PnP Layer
@@ -449,9 +443,13 @@ EXPORT_SYMBOL(pnp_register_card_driver);
  */
 void pnp_unregister_card_driver(struct pnp_card_driver *drv)
 {
-	mutex_lock(&pnp_lock);
+	spin_lock(&pnp_lock);
 	list_del(&drv->global_list);
-	mutex_unlock(&pnp_lock);
+	spin_unlock(&pnp_lock);
 	pnp_unregister_driver(&drv->link);
 }
+
+EXPORT_SYMBOL(pnp_request_card_device);
+EXPORT_SYMBOL(pnp_release_card_device);
+EXPORT_SYMBOL(pnp_register_card_driver);
 EXPORT_SYMBOL(pnp_unregister_card_driver);

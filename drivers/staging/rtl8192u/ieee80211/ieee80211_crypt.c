@@ -1,16 +1,22 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Host AP crypto routines
  *
  * Copyright (c) 2002-2003, Jouni Malinen <jkmaline@cc.hut.fi>
  * Portions Copyright (C) 2004, Intel Corporation <jketreno@linux.intel.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation. See README and COPYING for
+ * more details.
+ *
  */
 
+//#include <linux/config.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/slab.h>
-#include <linux/string.h>
-#include <linux/errno.h>
+#include <asm/string.h>
+#include <asm/errno.h>
 
 #include "ieee80211.h"
 
@@ -52,16 +58,16 @@ void ieee80211_crypt_deinit_entries(struct ieee80211_device *ieee,
 	}
 }
 
-void ieee80211_crypt_deinit_handler(struct timer_list *t)
+void ieee80211_crypt_deinit_handler(unsigned long data)
 {
-	struct ieee80211_device *ieee = from_timer(ieee, t, crypt_deinit_timer);
+	struct ieee80211_device *ieee = (struct ieee80211_device *)data;
 	unsigned long flags;
 
 	spin_lock_irqsave(&ieee->lock, flags);
 	ieee80211_crypt_deinit_entries(ieee, 0);
 	if (!list_empty(&ieee->crypt_deinit_list)) {
-		netdev_dbg(ieee->dev, "%s: entries remaining in delayed crypt deletion list\n",
-				ieee->dev->name);
+		printk(KERN_DEBUG "%s: entries remaining in delayed crypt "
+		       "deletion list\n", ieee->dev->name);
 		ieee->crypt_deinit_timer.expires = jiffies + HZ;
 		add_timer(&ieee->crypt_deinit_timer);
 	}
@@ -75,7 +81,7 @@ void ieee80211_crypt_delayed_deinit(struct ieee80211_device *ieee,
 	struct ieee80211_crypt_data *tmp;
 	unsigned long flags;
 
-	if (!(*crypt))
+	if (*crypt == NULL)
 		return;
 
 	tmp = *crypt;
@@ -83,8 +89,7 @@ void ieee80211_crypt_delayed_deinit(struct ieee80211_device *ieee,
 
 	/* must not run ops->deinit() while there may be pending encrypt or
 	 * decrypt operations. Use a list of delayed deinits to avoid needing
-	 * locking.
-	 */
+	 * locking. */
 
 	spin_lock_irqsave(&ieee->lock, flags);
 	list_add(&tmp->list, &ieee->crypt_deinit_list);
@@ -100,11 +105,11 @@ int ieee80211_register_crypto_ops(struct ieee80211_crypto_ops *ops)
 	unsigned long flags;
 	struct ieee80211_crypto_alg *alg;
 
-	if (!hcrypt)
+	if (hcrypt == NULL)
 		return -1;
 
 	alg = kzalloc(sizeof(*alg), GFP_KERNEL);
-	if (!alg)
+	if (alg == NULL)
 		return -ENOMEM;
 
 	alg->ops = ops;
@@ -113,7 +118,7 @@ int ieee80211_register_crypto_ops(struct ieee80211_crypto_ops *ops)
 	list_add(&alg->list, &hcrypt->algs);
 	spin_unlock_irqrestore(&hcrypt->lock, flags);
 
-	pr_debug("ieee80211_crypt: registered algorithm '%s'\n",
+	printk(KERN_DEBUG "ieee80211_crypt: registered algorithm '%s'\n",
 	       ops->name);
 
 	return 0;
@@ -125,13 +130,13 @@ int ieee80211_unregister_crypto_ops(struct ieee80211_crypto_ops *ops)
 	struct list_head *ptr;
 	struct ieee80211_crypto_alg *del_alg = NULL;
 
-	if (!hcrypt)
+	if (hcrypt == NULL)
 		return -1;
 
 	spin_lock_irqsave(&hcrypt->lock, flags);
 	for (ptr = hcrypt->algs.next; ptr != &hcrypt->algs; ptr = ptr->next) {
 		struct ieee80211_crypto_alg *alg =
-			(struct ieee80211_crypto_alg *)ptr;
+			(struct ieee80211_crypto_alg *) ptr;
 		if (alg->ops == ops) {
 			list_del(&alg->list);
 			del_alg = alg;
@@ -141,8 +146,8 @@ int ieee80211_unregister_crypto_ops(struct ieee80211_crypto_ops *ops)
 	spin_unlock_irqrestore(&hcrypt->lock, flags);
 
 	if (del_alg) {
-		pr_debug("ieee80211_crypt: unregistered algorithm '%s'\n",
-				ops->name);
+		printk(KERN_DEBUG "ieee80211_crypt: unregistered algorithm "
+		       "'%s'\n", ops->name);
 		kfree(del_alg);
 	}
 
@@ -150,19 +155,19 @@ int ieee80211_unregister_crypto_ops(struct ieee80211_crypto_ops *ops)
 }
 
 
-struct ieee80211_crypto_ops *ieee80211_get_crypto_ops(const char *name)
+struct ieee80211_crypto_ops * ieee80211_get_crypto_ops(const char *name)
 {
 	unsigned long flags;
 	struct list_head *ptr;
 	struct ieee80211_crypto_alg *found_alg = NULL;
 
-	if (!hcrypt)
+	if (hcrypt == NULL)
 		return NULL;
 
 	spin_lock_irqsave(&hcrypt->lock, flags);
 	for (ptr = hcrypt->algs.next; ptr != &hcrypt->algs; ptr = ptr->next) {
 		struct ieee80211_crypto_alg *alg =
-			(struct ieee80211_crypto_alg *)ptr;
+			(struct ieee80211_crypto_alg *) ptr;
 		if (strcmp(alg->ops->name, name) == 0) {
 			found_alg = alg;
 			break;
@@ -172,11 +177,12 @@ struct ieee80211_crypto_ops *ieee80211_get_crypto_ops(const char *name)
 
 	if (found_alg)
 		return found_alg->ops;
-	return NULL;
+	else
+		return NULL;
 }
 
 
-static void *ieee80211_crypt_null_init(int keyidx) { return (void *)1; }
+static void * ieee80211_crypt_null_init(int keyidx) { return (void *) 1; }
 static void ieee80211_crypt_null_deinit(void *priv) {}
 
 static struct ieee80211_crypto_ops ieee80211_crypt_null = {
@@ -214,20 +220,20 @@ out:
 	return ret;
 }
 
-void ieee80211_crypto_deinit(void)
+void __exit ieee80211_crypto_deinit(void)
 {
 	struct list_head *ptr, *n;
 
-	if (!hcrypt)
+	if (hcrypt == NULL)
 		return;
 
 	for (ptr = hcrypt->algs.next, n = ptr->next; ptr != &hcrypt->algs;
 	     ptr = n, n = ptr->next) {
 		struct ieee80211_crypto_alg *alg =
-			(struct ieee80211_crypto_alg *)ptr;
+			(struct ieee80211_crypto_alg *) ptr;
 		list_del(ptr);
-		pr_debug("ieee80211_crypt: unregistered algorithm '%s' (deinit)\n",
-				alg->ops->name);
+		printk(KERN_DEBUG "ieee80211_crypt: unregistered algorithm "
+		       "'%s' (deinit)\n", alg->ops->name);
 		kfree(alg);
 	}
 

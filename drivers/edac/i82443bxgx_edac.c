@@ -29,7 +29,9 @@
 
 
 #include <linux/edac.h>
-#include "edac_module.h"
+#include "edac_core.h"
+
+#define I82443_REVISION	"0.1"
 
 #define EDAC_MOD_STR    "i82443bxgx_edac"
 
@@ -176,6 +178,7 @@ static void i82443bxgx_edacmc_check(struct mem_ctl_info *mci)
 {
 	struct i82443bxgx_edacmc_error_info info;
 
+	edac_dbg(1, "MC%d\n", mci->mc_idx);
 	i82443bxgx_edacmc_get_error_info(mci, &info);
 	i82443bxgx_edacmc_process_error_info(mci, &info, 1);
 }
@@ -317,6 +320,7 @@ static int i82443bxgx_edacmc_probe1(struct pci_dev *pdev, int dev_idx)
 				I82443BXGX_EAP_OFFSET_MBE));
 
 	mci->mod_name = EDAC_MOD_STR;
+	mci->mod_ver = I82443_REVISION;
 	mci->ctl_name = "I82443BXGX";
 	mci->dev_name = pci_name(pdev);
 	mci->edac_check = i82443bxgx_edacmc_check;
@@ -345,6 +349,8 @@ fail:
 	edac_mc_free(mci);
 	return -ENODEV;
 }
+
+EXPORT_SYMBOL_GPL(i82443bxgx_edacmc_probe1);
 
 /* returns count (>= 0), or negative on error */
 static int i82443bxgx_edacmc_init_one(struct pci_dev *pdev,
@@ -378,7 +384,9 @@ static void i82443bxgx_edacmc_remove_one(struct pci_dev *pdev)
 	edac_mc_free(mci);
 }
 
-static const struct pci_device_id i82443bxgx_pci_tbl[] = {
+EXPORT_SYMBOL_GPL(i82443bxgx_edacmc_remove_one);
+
+static DEFINE_PCI_DEVICE_TABLE(i82443bxgx_pci_tbl) = {
 	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_82443BX_0)},
 	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_82443BX_2)},
 	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_82443GX_0)},
@@ -437,7 +445,9 @@ fail1:
 	pci_unregister_driver(&i82443bxgx_edacmc_driver);
 
 fail0:
-	pci_dev_put(mci_pdev);
+	if (mci_pdev != NULL)
+		pci_dev_put(mci_pdev);
+
 	return pci_rc;
 }
 
@@ -448,7 +458,8 @@ static void __exit i82443bxgx_edacmc_exit(void)
 	if (!i82443bxgx_registered)
 		i82443bxgx_edacmc_remove_one(mci_pdev);
 
-	pci_dev_put(mci_pdev);
+	if (mci_pdev)
+		pci_dev_put(mci_pdev);
 }
 
 module_init(i82443bxgx_edacmc_init);

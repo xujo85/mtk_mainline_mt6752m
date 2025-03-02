@@ -16,6 +16,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/init.h>
 #include <linux/blkdev.h>
 #include <linux/delay.h>
 #include <scsi/scsi_host.h>
@@ -136,7 +137,7 @@ static int hpt3x3_atapi_dma(struct ata_queued_cmd *qc)
 
 #endif /* CONFIG_PATA_HPT3X3_DMA */
 
-static const struct scsi_host_template hpt3x3_sht = {
+static struct scsi_host_template hpt3x3_sht = {
 	ATA_BMDMA_SHT(DRV_NAME),
 };
 
@@ -221,7 +222,10 @@ static int hpt3x3_init_one(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (rc)
 		return rc;
 	host->iomap = pcim_iomap_table(pdev);
-	rc = dma_set_mask_and_coherent(&pdev->dev, ATA_DMA_MASK);
+	rc = pci_set_dma_mask(pdev, ATA_DMA_MASK);
+	if (rc)
+		return rc;
+	rc = pci_set_consistent_dma_mask(pdev, ATA_DMA_MASK);
 	if (rc)
 		return rc;
 
@@ -246,10 +250,10 @@ static int hpt3x3_init_one(struct pci_dev *pdev, const struct pci_device_id *id)
 				 IRQF_SHARED, &hpt3x3_sht);
 }
 
-#ifdef CONFIG_PM_SLEEP
+#ifdef CONFIG_PM
 static int hpt3x3_reinit_one(struct pci_dev *dev)
 {
-	struct ata_host *host = pci_get_drvdata(dev);
+	struct ata_host *host = dev_get_drvdata(&dev->dev);
 	int rc;
 
 	rc = ata_pci_device_do_resume(dev);
@@ -274,7 +278,7 @@ static struct pci_driver hpt3x3_pci_driver = {
 	.id_table	= hpt3x3,
 	.probe 		= hpt3x3_init_one,
 	.remove		= ata_pci_remove_one,
-#ifdef CONFIG_PM_SLEEP
+#ifdef CONFIG_PM
 	.suspend	= ata_pci_device_suspend,
 	.resume		= hpt3x3_reinit_one,
 #endif

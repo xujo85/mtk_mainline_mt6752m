@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * This file is part of wl1271
  *
@@ -6,6 +5,21 @@
  * Copyright (C) 2008-2010 Nokia Corporation
  *
  * Contact: Luciano Coelho <luciano.coelho@nokia.com>
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
+ * 02110-1301 USA
+ *
  */
 
 #ifndef __IO_H__
@@ -22,8 +36,7 @@
 #define HW_PART1_START_ADDR             (HW_PARTITION_REGISTERS_ADDR + 12)
 #define HW_PART2_SIZE_ADDR              (HW_PARTITION_REGISTERS_ADDR + 16)
 #define HW_PART2_START_ADDR             (HW_PARTITION_REGISTERS_ADDR + 20)
-#define HW_PART3_SIZE_ADDR              (HW_PARTITION_REGISTERS_ADDR + 24)
-#define HW_PART3_START_ADDR             (HW_PARTITION_REGISTERS_ADDR + 28)
+#define HW_PART3_START_ADDR             (HW_PARTITION_REGISTERS_ADDR + 24)
 
 #define HW_ACCESS_REGISTER_SIZE         4
 
@@ -47,9 +60,7 @@ static inline int __must_check wlcore_raw_write(struct wl1271 *wl, int addr,
 {
 	int ret;
 
-	if (test_bit(WL1271_FLAG_IO_FAILED, &wl->flags) ||
-	    WARN_ON((test_bit(WL1271_FLAG_IN_ELP, &wl->flags) &&
-		     addr != HW_ACCESS_ELP_CTRL_REG)))
+	if (test_bit(WL1271_FLAG_IO_FAILED, &wl->flags))
 		return -EIO;
 
 	ret = wl->if_ops->write(wl->dev, addr, buf, len, fixed);
@@ -65,9 +76,7 @@ static inline int __must_check wlcore_raw_read(struct wl1271 *wl, int addr,
 {
 	int ret;
 
-	if (test_bit(WL1271_FLAG_IO_FAILED, &wl->flags) ||
-	    WARN_ON((test_bit(WL1271_FLAG_IN_ELP, &wl->flags) &&
-		     addr != HW_ACCESS_ELP_CTRL_REG)))
+	if (test_bit(WL1271_FLAG_IO_FAILED, &wl->flags))
 		return -EIO;
 
 	ret = wl->if_ops->read(wl->dev, addr, buf, len, fixed);
@@ -156,8 +165,8 @@ static inline int __must_check wlcore_read_hwaddr(struct wl1271 *wl, int hwaddr,
 	int physical;
 	int addr;
 
-	/* Convert from FW internal address which is chip arch dependent */
-	addr = wl->ops->convert_hwaddr(wl, hwaddr);
+	/* Addresses are stored internally as addresses to 32 bytes blocks */
+	addr = hwaddr << 5;
 
 	physical = wlcore_translate_addr(wl, addr);
 

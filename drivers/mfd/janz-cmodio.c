@@ -1,14 +1,19 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Janz CMOD-IO MODULbus Carrier Board PCI Driver
  *
  * Copyright (c) 2010 Ira W. Snyder <iws@ovro.caltech.edu>
  *
  * Lots of inspiration and code was copied from drivers/mfd/sm501.c
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; either version 2 of the License, or (at your
+ * option) any later version.
  */
 
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/init.h>
 #include <linux/pci.h>
 #include <linux/interrupt.h>
 #include <linux/delay.h>
@@ -149,15 +154,15 @@ static int cmodio_probe_submodules(struct cmodio_device *priv)
  * SYSFS Attributes
  */
 
-static ssize_t modulbus_number_show(struct device *dev,
-				    struct device_attribute *attr, char *buf)
+static ssize_t mbus_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
 {
 	struct cmodio_device *priv = dev_get_drvdata(dev);
 
-	return sysfs_emit(buf, "%x\n", priv->hex);
+	return snprintf(buf, PAGE_SIZE, "%x\n", priv->hex);
 }
 
-static DEVICE_ATTR_RO(modulbus_number);
+static DEVICE_ATTR(modulbus_number, S_IRUGO, mbus_show, NULL);
 
 static struct attribute *cmodio_sysfs_attrs[] = {
 	&dev_attr_modulbus_number.attr,
@@ -178,9 +183,12 @@ static int cmodio_pci_probe(struct pci_dev *dev,
 	struct cmodio_device *priv;
 	int ret;
 
-	priv = devm_kzalloc(&dev->dev, sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
+	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	if (!priv) {
+		dev_err(&dev->dev, "unable to allocate private data\n");
+		ret = -ENOMEM;
+		goto out_return;
+	}
 
 	pci_set_drvdata(dev, priv);
 	priv->pdev = dev;
@@ -189,7 +197,7 @@ static int cmodio_pci_probe(struct pci_dev *dev,
 	ret = pci_enable_device(dev);
 	if (ret) {
 		dev_err(&dev->dev, "unable to enable device\n");
-		return ret;
+		goto out_free_priv;
 	}
 
 	pci_set_master(dev);
@@ -240,7 +248,9 @@ out_pci_release_regions:
 	pci_release_regions(dev);
 out_pci_disable_device:
 	pci_disable_device(dev);
-
+out_free_priv:
+	kfree(priv);
+out_return:
 	return ret;
 }
 
@@ -253,18 +263,15 @@ static void cmodio_pci_remove(struct pci_dev *dev)
 	iounmap(priv->ctrl);
 	pci_release_regions(dev);
 	pci_disable_device(dev);
+	kfree(priv);
 }
 
 #define PCI_VENDOR_ID_JANZ		0x13c3
 
 /* The list of devices that this module will support */
-static const struct pci_device_id cmodio_pci_ids[] = {
+static DEFINE_PCI_DEVICE_TABLE(cmodio_pci_ids) = {
 	{ PCI_VENDOR_ID_PLX, PCI_DEVICE_ID_PLX_9030, PCI_VENDOR_ID_JANZ, 0x0101 },
 	{ PCI_VENDOR_ID_PLX, PCI_DEVICE_ID_PLX_9050, PCI_VENDOR_ID_JANZ, 0x0100 },
-	{ PCI_VENDOR_ID_PLX, PCI_DEVICE_ID_PLX_9030, PCI_VENDOR_ID_JANZ, 0x0201 },
-	{ PCI_VENDOR_ID_PLX, PCI_DEVICE_ID_PLX_9030, PCI_VENDOR_ID_JANZ, 0x0202 },
-	{ PCI_VENDOR_ID_PLX, PCI_DEVICE_ID_PLX_9050, PCI_VENDOR_ID_JANZ, 0x0201 },
-	{ PCI_VENDOR_ID_PLX, PCI_DEVICE_ID_PLX_9050, PCI_VENDOR_ID_JANZ, 0x0202 },
 	{ 0, }
 };
 MODULE_DEVICE_TABLE(pci, cmodio_pci_ids);

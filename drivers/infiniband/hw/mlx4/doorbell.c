@@ -31,7 +31,6 @@
  */
 
 #include <linux/slab.h>
-#include <rdma/uverbs_ioctl.h>
 
 #include "mlx4_ib.h"
 
@@ -42,13 +41,12 @@ struct mlx4_ib_user_db_page {
 	int			refcnt;
 };
 
-int mlx4_ib_db_map_user(struct ib_udata *udata, unsigned long virt,
+int mlx4_ib_db_map_user(struct mlx4_ib_ucontext *context, unsigned long virt,
 			struct mlx4_db *db)
 {
 	struct mlx4_ib_user_db_page *page;
+	struct ib_umem_chunk *chunk;
 	int err = 0;
-	struct mlx4_ib_ucontext *context = rdma_udata_to_drv_context(
-		udata, struct mlx4_ib_ucontext, ibucontext);
 
 	mutex_lock(&context->db_page_mutex);
 
@@ -64,8 +62,8 @@ int mlx4_ib_db_map_user(struct ib_udata *udata, unsigned long virt,
 
 	page->user_virt = (virt & PAGE_MASK);
 	page->refcnt    = 0;
-	page->umem = ib_umem_get(context->ibucontext.device, virt & PAGE_MASK,
-				 PAGE_SIZE, 0);
+	page->umem      = ib_umem_get(&context->ibucontext, virt & PAGE_MASK,
+				      PAGE_SIZE, 0, 0);
 	if (IS_ERR(page->umem)) {
 		err = PTR_ERR(page->umem);
 		kfree(page);
@@ -75,8 +73,8 @@ int mlx4_ib_db_map_user(struct ib_udata *udata, unsigned long virt,
 	list_add(&page->list, &context->db_page_list);
 
 found:
-	db->dma = sg_dma_address(page->umem->sgt_append.sgt.sgl) +
-		  (virt & ~PAGE_MASK);
+	chunk = list_entry(page->umem->chunk_list.next, struct ib_umem_chunk, list);
+	db->dma		= sg_dma_address(chunk->page_list) + (virt & ~PAGE_MASK);
 	db->u.user_page = page;
 	++page->refcnt;
 

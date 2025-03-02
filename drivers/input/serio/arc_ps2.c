@@ -1,6 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (C) 2004, 2007-2010, 2011-2012 Synopsys, Inc. (www.synopsys.com)
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  *
  * Driver is originally developed by Pavel Sokolov <psokolov@synopsys.com>
  */
@@ -182,12 +185,21 @@ static int arc_ps2_create_port(struct platform_device *pdev,
 static int arc_ps2_probe(struct platform_device *pdev)
 {
 	struct arc_ps2_data *arc_ps2;
+	struct resource *res;
 	int irq;
 	int error, id, i;
 
-	irq = platform_get_irq_byname(pdev, "arc_ps2_irq");
-	if (irq < 0)
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res) {
+		dev_err(&pdev->dev, "no IO memory defined\n");
 		return -EINVAL;
+	}
+
+	irq = platform_get_irq_byname(pdev, "arc_ps2_irq");
+	if (irq < 0) {
+		dev_err(&pdev->dev, "no IRQ defined\n");
+		return -EINVAL;
+	}
 
 	arc_ps2 = devm_kzalloc(&pdev->dev, sizeof(struct arc_ps2_data),
 				GFP_KERNEL);
@@ -196,7 +208,7 @@ static int arc_ps2_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
-	arc_ps2->addr = devm_platform_get_and_ioremap_resource(pdev, 0, NULL);
+	arc_ps2->addr = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(arc_ps2->addr))
 		return PTR_ERR(arc_ps2->addr);
 
@@ -259,6 +271,7 @@ MODULE_DEVICE_TABLE(of, arc_ps2_match);
 static struct platform_driver arc_ps2_driver = {
 	.driver	= {
 		.name		= "arc_ps2",
+		.owner		= THIS_MODULE,
 		.of_match_table	= of_match_ptr(arc_ps2_match),
 	},
 	.probe	= arc_ps2_probe,

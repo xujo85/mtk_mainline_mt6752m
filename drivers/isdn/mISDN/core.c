@@ -1,6 +1,15 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright 2008  by Karsten Keil <kkeil@novell.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
  */
 
 #include <linux/slab.h>
@@ -28,8 +37,8 @@ static void mISDN_dev_release(struct device *dev)
 	/* nothing to do: the device is part of its parent's data structure */
 }
 
-static ssize_t id_show(struct device *dev,
-		       struct device_attribute *attr, char *buf)
+static ssize_t _show_id(struct device *dev,
+			struct device_attribute *attr, char *buf)
 {
 	struct mISDNdevice *mdev = dev_to_mISDN(dev);
 
@@ -37,10 +46,9 @@ static ssize_t id_show(struct device *dev,
 		return -ENODEV;
 	return sprintf(buf, "%d\n", mdev->id);
 }
-static DEVICE_ATTR_RO(id);
 
-static ssize_t nrbchan_show(struct device *dev,
-			    struct device_attribute *attr, char *buf)
+static ssize_t _show_nrbchan(struct device *dev,
+			     struct device_attribute *attr, char *buf)
 {
 	struct mISDNdevice *mdev = dev_to_mISDN(dev);
 
@@ -48,10 +56,9 @@ static ssize_t nrbchan_show(struct device *dev,
 		return -ENODEV;
 	return sprintf(buf, "%d\n", mdev->nrbchan);
 }
-static DEVICE_ATTR_RO(nrbchan);
 
-static ssize_t d_protocols_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
+static ssize_t _show_d_protocols(struct device *dev,
+				 struct device_attribute *attr, char *buf)
 {
 	struct mISDNdevice *mdev = dev_to_mISDN(dev);
 
@@ -59,10 +66,9 @@ static ssize_t d_protocols_show(struct device *dev,
 		return -ENODEV;
 	return sprintf(buf, "%d\n", mdev->Dprotocols);
 }
-static DEVICE_ATTR_RO(d_protocols);
 
-static ssize_t b_protocols_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
+static ssize_t _show_b_protocols(struct device *dev,
+				 struct device_attribute *attr, char *buf)
 {
 	struct mISDNdevice *mdev = dev_to_mISDN(dev);
 
@@ -70,10 +76,9 @@ static ssize_t b_protocols_show(struct device *dev,
 		return -ENODEV;
 	return sprintf(buf, "%d\n", mdev->Bprotocols | get_all_Bprotocols());
 }
-static DEVICE_ATTR_RO(b_protocols);
 
-static ssize_t protocol_show(struct device *dev,
-			     struct device_attribute *attr, char *buf)
+static ssize_t _show_protocol(struct device *dev,
+			      struct device_attribute *attr, char *buf)
 {
 	struct mISDNdevice *mdev = dev_to_mISDN(dev);
 
@@ -81,19 +86,17 @@ static ssize_t protocol_show(struct device *dev,
 		return -ENODEV;
 	return sprintf(buf, "%d\n", mdev->D.protocol);
 }
-static DEVICE_ATTR_RO(protocol);
 
-static ssize_t name_show(struct device *dev,
-			 struct device_attribute *attr, char *buf)
+static ssize_t _show_name(struct device *dev,
+			  struct device_attribute *attr, char *buf)
 {
 	strcpy(buf, dev_name(dev));
 	return strlen(buf);
 }
-static DEVICE_ATTR_RO(name);
 
 #if 0 /* hangs */
-static ssize_t name_set(struct device *dev, struct device_attribute *attr,
-			const char *buf, size_t count)
+static ssize_t _set_name(struct device *dev, struct device_attribute *attr,
+			 const char *buf, size_t count)
 {
 	int err = 0;
 	char *out = kmalloc(count + 1, GFP_KERNEL);
@@ -110,11 +113,10 @@ static ssize_t name_set(struct device *dev, struct device_attribute *attr,
 
 	return (err < 0) ? err : count;
 }
-static DEVICE_ATTR_RW(name);
 #endif
 
-static ssize_t channelmap_show(struct device *dev,
-			       struct device_attribute *attr, char *buf)
+static ssize_t _show_channelmap(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
 	struct mISDNdevice *mdev = dev_to_mISDN(dev);
 	char *bp = buf;
@@ -125,23 +127,22 @@ static ssize_t channelmap_show(struct device *dev,
 
 	return bp - buf;
 }
-static DEVICE_ATTR_RO(channelmap);
 
-static struct attribute *mISDN_attrs[] = {
-	&dev_attr_id.attr,
-	&dev_attr_d_protocols.attr,
-	&dev_attr_b_protocols.attr,
-	&dev_attr_protocol.attr,
-	&dev_attr_channelmap.attr,
-	&dev_attr_nrbchan.attr,
-	&dev_attr_name.attr,
-	NULL,
+static struct device_attribute mISDN_dev_attrs[] = {
+	__ATTR(id,          S_IRUGO,         _show_id,          NULL),
+	__ATTR(d_protocols, S_IRUGO,         _show_d_protocols, NULL),
+	__ATTR(b_protocols, S_IRUGO,         _show_b_protocols, NULL),
+	__ATTR(protocol,    S_IRUGO,         _show_protocol,    NULL),
+	__ATTR(channelmap,  S_IRUGO,         _show_channelmap,  NULL),
+	__ATTR(nrbchan,     S_IRUGO,         _show_nrbchan,     NULL),
+	__ATTR(name,        S_IRUGO,         _show_name,        NULL),
+/*	__ATTR(name,        S_IRUGO | S_IWUSR, _show_name,      _set_name), */
+	{}
 };
-ATTRIBUTE_GROUPS(mISDN);
 
-static int mISDN_uevent(const struct device *dev, struct kobj_uevent_env *env)
+static int mISDN_uevent(struct device *dev, struct kobj_uevent_env *env)
 {
-	const struct mISDNdevice *mdev = dev_to_mISDN(dev);
+	struct mISDNdevice *mdev = dev_to_mISDN(dev);
 
 	if (!mdev)
 		return 0;
@@ -152,11 +153,18 @@ static int mISDN_uevent(const struct device *dev, struct kobj_uevent_env *env)
 	return 0;
 }
 
+static void mISDN_class_release(struct class *cls)
+{
+	/* do nothing, it's static */
+}
+
 static struct class mISDN_class = {
 	.name = "mISDN",
+	.owner = THIS_MODULE,
 	.dev_uevent = mISDN_uevent,
-	.dev_groups = mISDN_groups,
+	.dev_attrs = mISDN_dev_attrs,
 	.dev_release = mISDN_dev_release,
+	.class_release = mISDN_class_release,
 };
 
 static int
@@ -215,7 +223,7 @@ mISDN_register_device(struct mISDNdevice *dev,
 
 	err = get_free_devid();
 	if (err < 0)
-		return err;
+		goto error1;
 	dev->id = err;
 
 	device_initialize(&dev->dev);
@@ -226,12 +234,11 @@ mISDN_register_device(struct mISDNdevice *dev,
 	if (debug & DEBUG_CORE)
 		printk(KERN_DEBUG "mISDN_register %s %d\n",
 		       dev_name(&dev->dev), dev->id);
-	dev->dev.class = &mISDN_class;
-
 	err = create_stack(dev);
 	if (err)
 		goto error1;
 
+	dev->dev.class = &mISDN_class;
 	dev->dev.platform_data = dev;
 	dev->dev.parent = parent;
 	dev_set_drvdata(&dev->dev, dev);
@@ -243,8 +250,8 @@ mISDN_register_device(struct mISDNdevice *dev,
 
 error3:
 	delete_stack(dev);
+	return err;
 error1:
-	put_device(&dev->dev);
 	return err;
 
 }
@@ -375,7 +382,7 @@ mISDNInit(void)
 	err = mISDN_inittimer(&debug);
 	if (err)
 		goto error2;
-	err = Isdnl1_Init(&debug);
+	err = l1_init(&debug);
 	if (err)
 		goto error3;
 	err = Isdnl2_Init(&debug);
@@ -389,7 +396,7 @@ mISDNInit(void)
 error5:
 	Isdnl2_cleanup();
 error4:
-	Isdnl1_cleanup();
+	l1_cleanup();
 error3:
 	mISDN_timer_cleanup();
 error2:
@@ -402,7 +409,7 @@ static void mISDN_cleanup(void)
 {
 	misdn_sock_cleanup();
 	Isdnl2_cleanup();
-	Isdnl1_cleanup();
+	l1_cleanup();
 	mISDN_timer_cleanup();
 	class_unregister(&mISDN_class);
 

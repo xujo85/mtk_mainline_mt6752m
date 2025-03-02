@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
 #ifndef __IBMPHP_H
 #define __IBMPHP_H
 
@@ -11,6 +10,21 @@
  * Copyright (C) 2001-2003 IBM Corp.
  *
  * All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or (at
+ * your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE, GOOD TITLE or
+ * NON INFRINGEMENT.  See the GNU General Public License for more
+ * details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  *
  * Send feedback to <gregkh@us.ibm.com>
  *
@@ -25,11 +39,11 @@ extern int ibmphp_debug;
 #else
 	#define MY_NAME THIS_MODULE->name
 #endif
-#define debug(fmt, arg...) do { if (ibmphp_debug == 1) printk(KERN_DEBUG "%s: " fmt, MY_NAME, ## arg); } while (0)
-#define debug_pci(fmt, arg...) do { if (ibmphp_debug) printk(KERN_DEBUG "%s: " fmt, MY_NAME, ## arg); } while (0)
-#define err(format, arg...) printk(KERN_ERR "%s: " format, MY_NAME, ## arg)
-#define info(format, arg...) printk(KERN_INFO "%s: " format, MY_NAME, ## arg)
-#define warn(format, arg...) printk(KERN_WARNING "%s: " format, MY_NAME, ## arg)
+#define debug(fmt, arg...) do { if (ibmphp_debug == 1) printk(KERN_DEBUG "%s: " fmt , MY_NAME , ## arg); } while (0)
+#define debug_pci(fmt, arg...) do { if (ibmphp_debug) printk(KERN_DEBUG "%s: " fmt , MY_NAME , ## arg); } while (0)
+#define err(format, arg...) printk(KERN_ERR "%s: " format , MY_NAME , ## arg)
+#define info(format, arg...) printk(KERN_INFO "%s: " format , MY_NAME , ## arg)
+#define warn(format, arg...) printk(KERN_WARNING "%s: " format , MY_NAME , ## arg)
 
 
 /* EBDA stuff */
@@ -45,7 +59,7 @@ extern int ibmphp_debug;
 
 
 /************************************************************
-*  RESOURCE TYPE                                             *
+*  RESOURE TYPE                                             *
 ************************************************************/
 
 #define EBDA_RSRC_TYPE_MASK		0x03
@@ -89,7 +103,7 @@ extern int ibmphp_debug;
 //--------------------------------------------------------------
 
 struct rio_table_hdr {
-	u8 ver_num;
+	u8 ver_num; 
 	u8 scal_count;
 	u8 riodev_count;
 	u16 offset;
@@ -113,7 +127,7 @@ struct scal_detail {
 };
 
 //--------------------------------------------------------------
-// RIO DETAIL
+// RIO DETAIL 
 //--------------------------------------------------------------
 
 struct rio_detail {
@@ -138,7 +152,7 @@ struct opt_rio {
 	u8 first_slot_num;
 	u8 middle_num;
 	struct list_head opt_rio_list;
-};
+};	
 
 struct opt_rio_lo {
 	u8 rio_type;
@@ -147,7 +161,7 @@ struct opt_rio_lo {
 	u8 middle_num;
 	u8 pack_count;
 	struct list_head opt_rio_lo_list;
-};
+};	
 
 /****************************************************************
 *  HPC DESCRIPTOR NODE                                          *
@@ -352,7 +366,7 @@ struct resource_node {
 	u32 len;
 	int type;		/* MEM, IO, PFMEM */
 	u8 fromMem;		/* this is to indicate that the range is from
-				 * the Memory bucket rather than from PFMem */
+				 * from the Memory bucket rather than from PFMem */
 	struct resource_node *next;
 	struct resource_node *nextRange;	/* for the other mem range on bus */
 };
@@ -378,6 +392,7 @@ int ibmphp_add_pfmem_from_mem(struct resource_node *);
 struct bus_node *ibmphp_find_res_bus(u8);
 void ibmphp_print_test(void);	/* for debugging purposes */
 
+void ibmphp_hpc_initvars(void);
 int ibmphp_hpc_readslot(struct slot *, u8, u8 *);
 int ibmphp_hpc_writeslot(struct slot *, u8);
 void ibmphp_lock_operations(void);
@@ -559,7 +574,7 @@ void ibmphp_hpc_stop_poll_thread(void);
 #define HPC_CTLR_IRQ_PENDG	0x80
 
 //----------------------------------------------------------------------------
-// HPC_CTLR_WORKING status return codes
+// HPC_CTLR_WROKING status return codes
 //----------------------------------------------------------------------------
 #define HPC_CTLR_WORKING_NO	0x00
 #define HPC_CTLR_WORKING_YES	0x01
@@ -588,7 +603,7 @@ void ibmphp_hpc_stop_poll_thread(void);
 #define SLOT_CONNECT(s)	((u8) ((s & HPC_SLOT_CONNECT) \
 	? HPC_SLOT_DISCONNECTED : HPC_SLOT_CONNECTED))
 
-#define SLOT_ATTN(s, es)	((u8) ((es & HPC_SLOT_BLINK_ATTN) \
+#define SLOT_ATTN(s,es)	((u8) ((es & HPC_SLOT_BLINK_ATTN) \
 	? HPC_SLOT_ATTN_BLINK \
 	: ((s & HPC_SLOT_ATTN) ? HPC_SLOT_ATTN_ON : HPC_SLOT_ATTN_OFF)))
 
@@ -697,7 +712,7 @@ struct slot {
 	u8 supported_bus_mode;
 	u8 flag;		/* this is for disable slot and polling */
 	u8 ctlr_index;
-	struct hotplug_slot hotplug_slot;
+	struct hotplug_slot *hotplug_slot;
 	struct controller *ctrl;
 	struct pci_func *func;
 	u8 irq[4];
@@ -736,15 +751,10 @@ struct controller {
 
 int ibmphp_init_devno(struct slot **);	/* This function is called from EBDA, so we need it not be static */
 int ibmphp_do_disable_slot(struct slot *slot_cur);
-int ibmphp_update_slot_info(struct slot *);	/* This function is called from HPC, so we need it to not be static */
+int ibmphp_update_slot_info(struct slot *);	/* This function is called from HPC, so we need it to not be be static */
 int ibmphp_configure_card(struct pci_func *, u8);
 int ibmphp_unconfigure_card(struct slot **, int);
-extern const struct hotplug_slot_ops ibmphp_hotplug_slot_ops;
-
-static inline struct slot *to_slot(struct hotplug_slot *hotplug_slot)
-{
-	return container_of(hotplug_slot, struct slot, hotplug_slot);
-}
+extern struct hotplug_slot_ops ibmphp_hotplug_slot_ops;
 
 #endif				//__IBMPHP_H
 

@@ -1,7 +1,19 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright 2008 Cisco Systems, Inc.  All rights reserved.
  * Copyright 2007 Nuova Systems, Inc.  All rights reserved.
+ *
+ * This program is free software; you may redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; version 2 of the License.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 #ifndef _FNIC_H_
 #define _FNIC_H_
@@ -15,7 +27,6 @@
 #include "fnic_io.h"
 #include "fnic_res.h"
 #include "fnic_trace.h"
-#include "fnic_stats.h"
 #include "vnic_dev.h"
 #include "vnic_wq.h"
 #include "vnic_rq.h"
@@ -27,17 +38,14 @@
 
 #define DRV_NAME		"fnic"
 #define DRV_DESCRIPTION		"Cisco FCoE HBA Driver"
-#define DRV_VERSION		"1.6.0.54"
+#define DRV_VERSION		"1.5.0.22"
 #define PFX			DRV_NAME ": "
 #define DFX                     DRV_NAME "%d: "
 
 #define DESC_CLEAN_LOW_WATERMARK 8
-#define FNIC_UCSM_DFLT_THROTTLE_CNT_BLD	16 /* UCSM default throttle count */
-#define FNIC_MIN_IO_REQ			256 /* Min IO throttle count */
-#define FNIC_MAX_IO_REQ		1024 /* scsi_cmnd tag map entries */
-#define FNIC_DFLT_IO_REQ        256 /* Default scsi_cmnd tag map entries */
+#define FNIC_MAX_IO_REQ		2048 /* scsi_cmnd tag map entries */
 #define	FNIC_IO_LOCKS		64 /* IO locks: power of 2 */
-#define FNIC_DFLT_QUEUE_DEPTH	256
+#define FNIC_DFLT_QUEUE_DEPTH	32
 #define	FNIC_STATS_RATE_LIMIT	4 /* limit rate at which stats are pulled up */
 
 /*
@@ -77,28 +85,15 @@
 #define FNIC_DEV_RST_ABTS_PENDING       BIT(21)
 
 /*
- * fnic private data per SCSI command.
+ * Usage of the scsi_cmnd scratchpad.
  * These fields are locked by the hashed io_req_lock.
  */
-struct fnic_cmd_priv {
-	struct fnic_io_req *io_req;
-	enum fnic_ioreq_state state;
-	u32 flags;
-	u16 abts_status;
-	u16 lr_status;
-};
-
-static inline struct fnic_cmd_priv *fnic_priv(struct scsi_cmnd *cmd)
-{
-	return scsi_cmd_priv(cmd);
-}
-
-static inline u64 fnic_flags_and_state(struct scsi_cmnd *cmd)
-{
-	struct fnic_cmd_priv *fcmd = fnic_priv(cmd);
-
-	return ((u64)fcmd->flags << 32) | fcmd->state;
-}
+#define CMD_SP(Cmnd)		((Cmnd)->SCp.ptr)
+#define CMD_STATE(Cmnd)		((Cmnd)->SCp.phase)
+#define CMD_ABTS_STATUS(Cmnd)	((Cmnd)->SCp.Message)
+#define CMD_LR_STATUS(Cmnd)	((Cmnd)->SCp.have_data_in)
+#define CMD_TAG(Cmnd)           ((Cmnd)->SCp.sent_command)
+#define CMD_FLAGS(Cmnd)         ((Cmnd)->SCp.Status)
 
 #define FCPIO_INVALID_CODE 0x100 /* hdr_status value unused by firmware */
 
@@ -129,7 +124,6 @@ static inline u64 fnic_flags_and_state(struct scsi_cmnd *cmd)
 	__fnic_set_state_flags(fnicp, st_flags, 1)
 
 extern unsigned int fnic_log_level;
-extern unsigned int io_completions;
 
 #define FNIC_MAIN_LOGGING 0x01
 #define FNIC_FCS_LOGGING 0x02
@@ -160,9 +154,6 @@ do {								\
 	FNIC_CHECK_LOGGING(FNIC_ISR_LOGGING,			\
 			 shost_printk(kern_level, host, fmt, ##args);)
 
-#define FNIC_MAIN_NOTE(kern_level, host, fmt, args...)          \
-	shost_printk(kern_level, host, fmt, ##args)
-
 extern const char *fnic_state_str[];
 
 enum fnic_intx_intr_index {
@@ -182,7 +173,7 @@ enum fnic_msix_intr_index {
 
 struct fnic_msix_entry {
 	int requested;
-	char devname[IFNAMSIZ + 11];
+	char devname[IFNAMSIZ];
 	irqreturn_t (*isr)(int, void *);
 	void *devid;
 };
@@ -198,7 +189,6 @@ enum fnic_state {
 #define FNIC_WQ_MAX 1
 #define FNIC_RQ_MAX 1
 #define FNIC_CQ_MAX (FNIC_WQ_COPY_MAX + FNIC_WQ_MAX + FNIC_RQ_MAX)
-#define FNIC_DFLT_IO_COMPLETIONS 256
 
 struct mempool;
 
@@ -220,38 +210,28 @@ struct fnic {
 	struct fcoe_ctlr ctlr;		/* FIP FCoE controller structure */
 	struct vnic_dev_bar bar0;
 
+	struct msix_entry msix_entry[FNIC_MSIX_INTR_MAX];
 	struct fnic_msix_entry msix[FNIC_MSIX_INTR_MAX];
 
 	struct vnic_stats *stats;
 	unsigned long stats_time;	/* time of stats update */
-	unsigned long stats_reset_time; /* time of stats reset */
 	struct vnic_nic_cfg *nic_cfg;
 	char name[IFNAMSIZ];
 	struct timer_list notify_timer; /* used for MSI interrupts */
 
-	unsigned int fnic_max_tag_id;
 	unsigned int err_intr_offset;
 	unsigned int link_intr_offset;
 
 	unsigned int wq_count;
 	unsigned int cq_count;
 
-	struct dentry *fnic_stats_debugfs_host;
-	struct dentry *fnic_stats_debugfs_file;
-	struct dentry *fnic_reset_debugfs_file;
-	unsigned int reset_stats;
-	atomic64_t io_cmpl_skip;
-	struct fnic_stats fnic_stats;
-
 	u32 vlan_hw_insert:1;	        /* let hw insert the tag */
 	u32 in_remove:1;                /* fnic device in removal */
 	u32 stop_rx_link_events:1;      /* stop proc. rx frames, link events */
-	u32 link_events:1;              /* set when we get any link event*/
 
 	struct completion *remove_wait; /* device remove thread blocks */
 
 	atomic_t in_flight;		/* io counter */
-	bool internal_reset_inprogress;
 	u32 _reserved;			/* fill hole */
 	unsigned long state_flags;	/* protected by host lock */
 	enum fnic_state state;
@@ -323,7 +303,7 @@ static inline struct fnic *fnic_from_ctlr(struct fcoe_ctlr *fip)
 
 extern struct workqueue_struct *fnic_event_queue;
 extern struct workqueue_struct *fnic_fip_queue;
-extern const struct attribute_group *fnic_host_groups[];
+extern struct device_attribute *fnic_attrs[];
 
 void fnic_clear_intr_mode(struct fnic *fnic);
 int fnic_set_intr_mode(struct fnic *fnic);
@@ -379,5 +359,4 @@ fnic_chk_state_flags_locked(struct fnic *fnic, unsigned long st_flags)
 	return ((fnic->state_flags & st_flags) == st_flags);
 }
 void __fnic_set_state_flags(struct fnic *, unsigned long, unsigned long);
-void fnic_dump_fchost_stats(struct Scsi_Host *, struct fc_host_statistics *);
 #endif /* _FNIC_H_ */

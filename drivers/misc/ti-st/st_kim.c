@@ -1,10 +1,23 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  Shared Transport Line discipline driver Core
  *	Init Manager module responsible for GPIO control
  *	and firmware download
  *  Copyright (C) 2009-2010 Texas Instruments
  *  Author: Pavan Savoy <pavan_savoy@ti.com>
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License version 2 as
+ *  published by the Free Software Foundation.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *
  */
 
 #define pr_fmt(fmt) "(stk) :" fmt
@@ -24,13 +37,14 @@
 #include <linux/ti_wilink_st.h>
 #include <linux/module.h>
 
+
 #define MAX_ST_DEVICES	3	/* Imagine 1 on each UART for now */
 static struct platform_device *st_kim_devices[MAX_ST_DEVICES];
 
 /**********************************************************************/
 /* internal functions */
 
-/*
+/**
  * st_get_plat_device -
  *	function which returns the reference to the platform device
  *	requested by id. As of now only 1 such device exists (id=0)
@@ -43,7 +57,7 @@ static struct platform_device *st_get_plat_device(int id)
 	return st_kim_devices[id];
 }
 
-/*
+/**
  * validate_firmware_response -
  *	function to return whether the firmware response was proper
  *	in case of error don't complete so that waiting for proper
@@ -55,8 +69,7 @@ static void validate_firmware_response(struct kim_data_s *kim_gdata)
 	if (!skb)
 		return;
 
-	/*
-	 * these magic numbers are the position in the response buffer which
+	/* these magic numbers are the position in the response buffer which
 	 * allows us to distinguish whether the response is for the read
 	 * version info. command
 	 */
@@ -66,6 +79,7 @@ static void validate_firmware_response(struct kim_data_s *kim_gdata)
 		memcpy(kim_gdata->resp_buffer,
 				kim_gdata->rx_skb->data,
 				kim_gdata->rx_skb->len);
+		complete_all(&kim_gdata->kim_rcvd);
 		kim_gdata->rx_state = ST_W4_PACKET_TYPE;
 		kim_gdata->rx_skb = NULL;
 		kim_gdata->rx_count = 0;
@@ -80,8 +94,7 @@ static void validate_firmware_response(struct kim_data_s *kim_gdata)
 	kfree_skb(skb);
 }
 
-/*
- * check for data len received inside kim_int_recv
+/* check for data len received inside kim_int_recv
  * most often hit the last case to update state to waiting for data
  */
 static inline int kim_check_data_len(struct kim_data_s *kim_gdata, int len)
@@ -93,16 +106,14 @@ static inline int kim_check_data_len(struct kim_data_s *kim_gdata, int len)
 	if (!len) {
 		validate_firmware_response(kim_gdata);
 	} else if (len > room) {
-		/*
-		 * Received packet's payload length is larger.
+		/* Received packet's payload length is larger.
 		 * We can't accommodate it in created skb.
 		 */
 		pr_err("Data length is too large len %d room %d", len,
 			   room);
 		kfree_skb(kim_gdata->rx_skb);
 	} else {
-		/*
-		 * Packet header has non-zero payload length and
+		/* Packet header has non-zero payload length and
 		 * we have enough space in created skb. Lets read
 		 * payload data */
 		kim_gdata->rx_state = ST_W4_DATA;
@@ -110,10 +121,8 @@ static inline int kim_check_data_len(struct kim_data_s *kim_gdata, int len)
 		return len;
 	}
 
-	/*
-	 * Change ST LL state to continue to process next
-	 * packet
-	 */
+	/* Change ST LL state to continue to process next
+	 * packet */
 	kim_gdata->rx_state = ST_W4_PACKET_TYPE;
 	kim_gdata->rx_skb = NULL;
 	kim_gdata->rx_count = 0;
@@ -121,7 +130,7 @@ static inline int kim_check_data_len(struct kim_data_s *kim_gdata, int len)
 	return 0;
 }
 
-/*
+/**
  * kim_int_recv - receive function called during firmware download
  *	firmware download responses on different UART drivers
  *	have been observed to come in bursts of different
@@ -131,7 +140,7 @@ static void kim_int_recv(struct kim_data_s *kim_gdata,
 	const unsigned char *data, long count)
 {
 	const unsigned char *ptr;
-	int len = 0;
+	int len = 0, type = 0;
 	unsigned char *plen;
 
 	pr_debug("%s", __func__);
@@ -145,7 +154,7 @@ static void kim_int_recv(struct kim_data_s *kim_gdata,
 	while (count) {
 		if (kim_gdata->rx_count) {
 			len = min_t(unsigned int, kim_gdata->rx_count, count);
-			skb_put_data(kim_gdata->rx_skb, ptr, len);
+			memcpy(skb_put(kim_gdata->rx_skb, len), ptr, len);
 			kim_gdata->rx_count -= len;
 			count -= len;
 			ptr += len;
@@ -176,6 +185,7 @@ static void kim_int_recv(struct kim_data_s *kim_gdata,
 		case 0x04:
 			kim_gdata->rx_state = ST_W4_HEADER;
 			kim_gdata->rx_count = 2;
+			type = *ptr;
 			break;
 		default:
 			pr_info("unknown packet");
@@ -204,26 +214,23 @@ static void kim_int_recv(struct kim_data_s *kim_gdata,
 static long read_local_version(struct kim_data_s *kim_gdata, char *bts_scr_name)
 {
 	unsigned short version = 0, chip = 0, min_ver = 0, maj_ver = 0;
-	static const char read_ver_cmd[] = { 0x01, 0x01, 0x10, 0x00 };
-	long timeout;
+	const char read_ver_cmd[] = { 0x01, 0x01, 0x10, 0x00 };
 
 	pr_debug("%s", __func__);
 
-	reinit_completion(&kim_gdata->kim_rcvd);
+	INIT_COMPLETION(kim_gdata->kim_rcvd);
 	if (4 != st_int_write(kim_gdata->core_data, read_ver_cmd, 4)) {
 		pr_err("kim: couldn't write 4 bytes");
 		return -EIO;
 	}
 
-	timeout = wait_for_completion_interruptible_timeout(
-		&kim_gdata->kim_rcvd, msecs_to_jiffies(CMD_RESP_TIME));
-	if (timeout <= 0) {
-		pr_err(" waiting for ver info- timed out or received signal");
-		return timeout ? -ERESTARTSYS : -ETIMEDOUT;
+	if (!wait_for_completion_interruptible_timeout(
+		&kim_gdata->kim_rcvd, msecs_to_jiffies(CMD_RESP_TIME))) {
+		pr_err(" waiting for ver info- timed out ");
+		return -ETIMEDOUT;
 	}
-	reinit_completion(&kim_gdata->kim_rcvd);
-	/*
-	 * the positions 12 & 13 in the response buffer provide with the
+	INIT_COMPLETION(kim_gdata->kim_rcvd);
+	/* the positions 12 & 13 in the response buffer provide with the
 	 * chip, major & minor numbers
 	 */
 
@@ -237,8 +244,7 @@ static long read_local_version(struct kim_data_s *kim_gdata, char *bts_scr_name)
 	if (version & 0x8000)
 		maj_ver |= 0x0008;
 
-	sprintf(bts_scr_name, "ti-connectivity/TIInit_%d.%d.%d.bts",
-		chip, maj_ver, min_ver);
+	sprintf(bts_scr_name, "TIInit_%d.%d.%d.bts", chip, maj_ver, min_ver);
 
 	/* to be accessed later via sysfs entry */
 	kim_gdata->version.full = version;
@@ -270,7 +276,7 @@ static void skip_change_remote_baud(unsigned char **ptr, long *len)
 	}
 }
 
-/*
+/**
  * download_firmware -
  *	internal function which parses through the .bts firmware
  *	script file intreprets SEND, DELAY actions only as of now
@@ -281,7 +287,7 @@ static long download_firmware(struct kim_data_s *kim_gdata)
 	long len = 0;
 	unsigned char *ptr = NULL;
 	unsigned char *action_ptr = NULL;
-	unsigned char bts_scr_name[40] = { 0 };	/* 40 char long bts scr name? */
+	unsigned char bts_scr_name[30] = { 0 };	/* 30 char long bts scr name? */
 	int wr_room_space;
 	int cmd_size;
 	unsigned long timeout;
@@ -302,8 +308,7 @@ static long download_firmware(struct kim_data_s *kim_gdata)
 	}
 	ptr = (void *)kim_gdata->fw_entry->data;
 	len = kim_gdata->fw_entry->size;
-	/*
-	 * bts_header to remove out magic number and
+	/* bts_header to remove out magic number and
 	 * version
 	 */
 	ptr += sizeof(struct bts_header);
@@ -321,10 +326,8 @@ static long download_firmware(struct kim_data_s *kim_gdata)
 			if (unlikely
 			    (((struct hci_command *)action_ptr)->opcode ==
 			     0xFF36)) {
-				/*
-				 * ignore remote change
-				 * baud rate HCI VS command
-				 */
+				/* ignore remote change
+				 * baud rate HCI VS command */
 				pr_warn("change remote baud"
 				    " rate command in firmware");
 				skip_change_remote_baud(&ptr, &len);
@@ -356,11 +359,10 @@ static long download_firmware(struct kim_data_s *kim_gdata)
 				release_firmware(kim_gdata->fw_entry);
 				return -ETIMEDOUT;
 			}
-			/*
-			 * reinit completion before sending for the
+			/* reinit completion before sending for the
 			 * relevant wait
 			 */
-			reinit_completion(&kim_gdata->kim_rcvd);
+			INIT_COMPLETION(kim_gdata->kim_rcvd);
 
 			/*
 			 * Free space found in uart buffer, call st_int_write
@@ -388,16 +390,15 @@ static long download_firmware(struct kim_data_s *kim_gdata)
 			break;
 		case ACTION_WAIT_EVENT:  /* wait */
 			pr_debug("W");
-			err = wait_for_completion_interruptible_timeout(
+			if (!wait_for_completion_interruptible_timeout(
 					&kim_gdata->kim_rcvd,
-					msecs_to_jiffies(CMD_RESP_TIME));
-			if (err <= 0) {
-				pr_err("response timeout/signaled during fw download ");
+					msecs_to_jiffies(CMD_RESP_TIME))) {
+				pr_err("response timeout during fw download ");
 				/* timed out */
 				release_firmware(kim_gdata->fw_entry);
-				return err ? -ERESTARTSYS : -ETIMEDOUT;
+				return -ETIMEDOUT;
 			}
-			reinit_completion(&kim_gdata->kim_rcvd);
+			INIT_COMPLETION(kim_gdata->kim_rcvd);
 			break;
 		case ACTION_DELAY:	/* sleep */
 			pr_info("sleep command in scr");
@@ -429,16 +430,14 @@ void st_kim_recv(void *disc_data, const unsigned char *data, long count)
 	struct st_data_s	*st_gdata = (struct st_data_s *)disc_data;
 	struct kim_data_s	*kim_gdata = st_gdata->kim_data;
 
-	/*
-	 * proceed to gather all data and distinguish read fw version response
+	/* proceed to gather all data and distinguish read fw version response
 	 * from other fw responses when data gathering is complete
 	 */
 	kim_int_recv(kim_gdata, data, count);
 	return;
 }
 
-/*
- * to signal completion of line discipline installation
+/* to signal completion of line discipline installation
  * called from ST Core, upon tty_open
  */
 void st_kim_complete(void *kim_data)
@@ -447,7 +446,7 @@ void st_kim_complete(void *kim_data)
 	complete(&kim_gdata->ldisc_installed);
 }
 
-/*
+/**
  * st_kim_start - called from ST Core upon 1st registration
  *	This involves toggling the chip enable gpio, reading
  *	the firmware version from chip, forming the fw file name
@@ -470,12 +469,12 @@ long st_kim_start(void *kim_data)
 			pdata->chip_enable(kim_gdata);
 
 		/* Configure BT nShutdown to HIGH state */
-		gpio_set_value_cansleep(kim_gdata->nshutdown, GPIO_LOW);
+		gpio_set_value(kim_gdata->nshutdown, GPIO_LOW);
 		mdelay(5);	/* FIXME: a proper toggle */
-		gpio_set_value_cansleep(kim_gdata->nshutdown, GPIO_HIGH);
+		gpio_set_value(kim_gdata->nshutdown, GPIO_HIGH);
 		mdelay(100);
 		/* re-initialize the completion */
-		reinit_completion(&kim_gdata->ldisc_installed);
+		INIT_COMPLETION(kim_gdata->ldisc_installed);
 		/* send notification to UIM */
 		kim_gdata->ldisc_install = 1;
 		pr_info("ldisc_install = 1");
@@ -485,10 +484,8 @@ long st_kim_start(void *kim_data)
 		err = wait_for_completion_interruptible_timeout(
 			&kim_gdata->ldisc_installed, msecs_to_jiffies(LDISC_TIME));
 		if (!err) {
-			/*
-			 * ldisc installation timeout,
-			 * flush uart, power cycle BT_EN
-			 */
+			/* ldisc installation timeout,
+			 * flush uart, power cycle BT_EN */
 			pr_err("ldisc installation timeout");
 			err = st_kim_stop(kim_gdata);
 			continue;
@@ -497,10 +494,8 @@ long st_kim_start(void *kim_data)
 			pr_info("line discipline installed");
 			err = download_firmware(kim_gdata);
 			if (err != 0) {
-				/*
-				 * ldisc installed but fw download failed,
-				 * flush uart & power cycle BT_EN
-				 */
+				/* ldisc installed but fw download failed,
+				 * flush uart & power cycle BT_EN */
 				pr_err("download firmware failed");
 				err = st_kim_stop(kim_gdata);
 				continue;
@@ -512,7 +507,7 @@ long st_kim_start(void *kim_data)
 	return err;
 }
 
-/*
+/**
  * st_kim_stop - stop communication with chip.
  *	This can be called from ST Core/KIM, on the-
  *	(a) last un-register when chip need not be powered there-after,
@@ -530,12 +525,13 @@ long st_kim_stop(void *kim_data)
 		kim_gdata->kim_pdev->dev.platform_data;
 	struct tty_struct	*tty = kim_gdata->core_data->tty;
 
-	reinit_completion(&kim_gdata->ldisc_installed);
+	INIT_COMPLETION(kim_gdata->ldisc_installed);
 
 	if (tty) {	/* can be called before ldisc is installed */
 		/* Flush any pending characters in the driver and discipline. */
 		tty_ldisc_flush(tty);
 		tty_driver_flush_buffer(tty);
+		tty->ops->flush_buffer(tty);
 	}
 
 	/* send uninstall notification to UIM */
@@ -552,11 +548,11 @@ long st_kim_stop(void *kim_data)
 	}
 
 	/* By default configure BT nShutdown to LOW state */
-	gpio_set_value_cansleep(kim_gdata->nshutdown, GPIO_LOW);
+	gpio_set_value(kim_gdata->nshutdown, GPIO_LOW);
 	mdelay(1);
-	gpio_set_value_cansleep(kim_gdata->nshutdown, GPIO_HIGH);
+	gpio_set_value(kim_gdata->nshutdown, GPIO_HIGH);
 	mdelay(1);
-	gpio_set_value_cansleep(kim_gdata->nshutdown, GPIO_LOW);
+	gpio_set_value(kim_gdata->nshutdown, GPIO_LOW);
 
 	/* platform specific disable */
 	if (pdata->chip_disable)
@@ -568,7 +564,7 @@ long st_kim_stop(void *kim_data)
 /* functions called from subsystems */
 /* called when debugfs entry is read from */
 
-static int version_show(struct seq_file *s, void *unused)
+static int show_version(struct seq_file *s, void *unused)
 {
 	struct kim_data_s *kim_gdata = (struct kim_data_s *)s->private;
 	seq_printf(s, "%04X %d.%d.%d\n", kim_gdata->version.full,
@@ -577,7 +573,7 @@ static int version_show(struct seq_file *s, void *unused)
 	return 0;
 }
 
-static int list_show(struct seq_file *s, void *unused)
+static int show_list(struct seq_file *s, void *unused)
 {
 	struct kim_data_s *kim_gdata = (struct kim_data_s *)s->private;
 	kim_st_list_protocols(kim_gdata->core_data, s);
@@ -624,7 +620,7 @@ static ssize_t show_baud_rate(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
 	struct kim_data_s *kim_data = dev_get_drvdata(dev);
-	return sprintf(buf, "%d\n", kim_data->baud_rate);
+	return sprintf(buf, "%ld\n", kim_data->baud_rate);
 }
 
 static ssize_t show_flow_cntrl(struct device *dev,
@@ -663,11 +659,11 @@ static struct attribute *uim_attrs[] = {
 	NULL,
 };
 
-static const struct attribute_group uim_attr_grp = {
+static struct attribute_group uim_attr_grp = {
 	.attrs = uim_attrs,
 };
 
-/*
+/**
  * st_kim_ref - reference the core's data
  *	This references the per-ST platform device in the arch/xx/
  *	board-xx.c file.
@@ -680,20 +676,38 @@ void st_kim_ref(struct st_data_s **core_data, int id)
 	struct kim_data_s	*kim_gdata;
 	/* get kim_gdata reference from platform device */
 	pdev = st_get_plat_device(id);
-	if (!pdev)
-		goto err;
-	kim_gdata = platform_get_drvdata(pdev);
-	if (!kim_gdata)
-		goto err;
-
+	if (!pdev) {
+		*core_data = NULL;
+		return;
+	}
+	kim_gdata = dev_get_drvdata(&pdev->dev);
 	*core_data = kim_gdata->core_data;
-	return;
-err:
-	*core_data = NULL;
 }
 
-DEFINE_SHOW_ATTRIBUTE(version);
-DEFINE_SHOW_ATTRIBUTE(list);
+static int kim_version_open(struct inode *i, struct file *f)
+{
+	return single_open(f, show_version, i->i_private);
+}
+
+static int kim_list_open(struct inode *i, struct file *f)
+{
+	return single_open(f, show_list, i->i_private);
+}
+
+static const struct file_operations version_debugfs_fops = {
+	/* version info */
+	.open = kim_version_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+static const struct file_operations list_debugfs_fops = {
+	/* protocols info */
+	.open = kim_list_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
 
 /**********************************************************************/
 /* functions called from platform device driver subsystem
@@ -716,12 +730,12 @@ static int kim_probe(struct platform_device *pdev)
 		st_kim_devices[0] = pdev;
 	}
 
-	kim_gdata = kzalloc(sizeof(struct kim_data_s), GFP_KERNEL);
+	kim_gdata = kzalloc(sizeof(struct kim_data_s), GFP_ATOMIC);
 	if (!kim_gdata) {
 		pr_err("no mem to allocate");
 		return -ENOMEM;
 	}
-	platform_set_drvdata(pdev, kim_gdata);
+	dev_set_drvdata(&pdev->dev, kim_gdata);
 
 	err = st_core_init(&kim_gdata->core_data);
 	if (err != 0) {
@@ -736,17 +750,18 @@ static int kim_probe(struct platform_device *pdev)
 	kim_gdata->nshutdown = pdata->nshutdown_gpio;
 	err = gpio_request(kim_gdata->nshutdown, "kim");
 	if (unlikely(err)) {
-		pr_err(" gpio %d request failed ", kim_gdata->nshutdown);
-		goto err_sysfs_group;
+		pr_err(" gpio %ld request failed ", kim_gdata->nshutdown);
+		return err;
 	}
 
 	/* Configure nShutdown GPIO as output=0 */
 	err = gpio_direction_output(kim_gdata->nshutdown, 0);
 	if (unlikely(err)) {
-		pr_err(" unable to configure gpio %d", kim_gdata->nshutdown);
-		goto err_sysfs_group;
+		pr_err(" unable to configure gpio %ld", kim_gdata->nshutdown);
+		return err;
 	}
-	/* get reference of pdev for request_firmware */
+	/* get reference of pdev for request_firmware
+	 */
 	kim_gdata->kim_pdev = pdev;
 	init_completion(&kim_gdata->kim_rcvd);
 	init_completion(&kim_gdata->ldisc_installed);
@@ -764,12 +779,21 @@ static int kim_probe(struct platform_device *pdev)
 	pr_info("sysfs entries created\n");
 
 	kim_debugfs_dir = debugfs_create_dir("ti-st", NULL);
+	if (IS_ERR(kim_debugfs_dir)) {
+		pr_err(" debugfs entries creation failed ");
+		err = -EIO;
+		goto err_debugfs_dir;
+	}
 
 	debugfs_create_file("version", S_IRUGO, kim_debugfs_dir,
-				kim_gdata, &version_fops);
+				kim_gdata, &version_debugfs_fops);
 	debugfs_create_file("protocols", S_IRUGO, kim_debugfs_dir,
-				kim_gdata, &list_fops);
+				kim_gdata, &list_debugfs_fops);
+	pr_info(" debugfs entries created ");
 	return 0;
+
+err_debugfs_dir:
+	sysfs_remove_group(&pdev->dev.kobj, &uim_attr_grp);
 
 err_sysfs_group:
 	st_core_exit(kim_gdata->core_data);
@@ -786,10 +810,9 @@ static int kim_remove(struct platform_device *pdev)
 	struct ti_st_plat_data	*pdata = pdev->dev.platform_data;
 	struct kim_data_s	*kim_gdata;
 
-	kim_gdata = platform_get_drvdata(pdev);
+	kim_gdata = dev_get_drvdata(&pdev->dev);
 
-	/*
-	 * Free the Bluetooth/FM/GPIO
+	/* Free the Bluetooth/FM/GPIO
 	 * nShutdown gpio from the system
 	 */
 	gpio_free(pdata->nshutdown_gpio);
@@ -814,7 +837,7 @@ static int kim_suspend(struct platform_device *pdev, pm_message_t state)
 	if (pdata->suspend)
 		return pdata->suspend(pdev, state);
 
-	return 0;
+	return -EOPNOTSUPP;
 }
 
 static int kim_resume(struct platform_device *pdev)
@@ -824,7 +847,7 @@ static int kim_resume(struct platform_device *pdev)
 	if (pdata->resume)
 		return pdata->resume(pdev);
 
-	return 0;
+	return -EOPNOTSUPP;
 }
 
 /**********************************************************************/
@@ -836,6 +859,7 @@ static struct platform_driver kim_platform_driver = {
 	.resume = kim_resume,
 	.driver = {
 		.name = "kim",
+		.owner = THIS_MODULE,
 	},
 };
 

@@ -1,14 +1,6 @@
-# SPDX-License-Identifier: GPL-2.0-only
-
-config TEGRA_HOST1X_CONTEXT_BUS
-	bool
-
 config TEGRA_HOST1X
 	tristate "NVIDIA Tegra host1x driver"
-	depends on ARCH_TEGRA || COMPILE_TEST
-	select DMA_SHARED_BUFFER
-	select TEGRA_HOST1X_CONTEXT_BUS
-	select IOMMU_IOVA
+	depends on ARCH_TEGRA || ARCH_MULTIPLATFORM
 	help
 	  Driver for the NVIDIA Tegra host1x hardware.
 
@@ -26,5 +18,7 @@ config TEGRA_HOST1X_FIREWALL
 	  Say yes if kernel should protect command streams from tampering.
 
 	  If unsure, choose Y.
+
+source "drivers/gpu/host1x/drm/Kconfig"
 
 endif

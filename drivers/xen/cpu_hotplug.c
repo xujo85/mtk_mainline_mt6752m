@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
-#define pr_fmt(fmt) "xen:" KBUILD_MODNAME ": " fmt
-
 #include <linux/notifier.h>
 
 #include <xen/xen.h>
@@ -12,23 +9,17 @@
 static void enable_hotplug_cpu(int cpu)
 {
 	if (!cpu_present(cpu))
-		xen_arch_register_cpu(cpu);
+		arch_register_cpu(cpu);
 
 	set_cpu_present(cpu, true);
 }
 
 static void disable_hotplug_cpu(int cpu)
 {
-	if (!cpu_is_hotpluggable(cpu))
-		return;
-	lock_device_hotplug();
-	if (cpu_online(cpu))
-		device_offline(get_cpu_device(cpu));
-	if (!cpu_online(cpu) && cpu_present(cpu)) {
-		xen_arch_unregister_cpu(cpu);
-		set_cpu_present(cpu, false);
-	}
-	unlock_device_hotplug();
+	if (cpu_present(cpu))
+		arch_unregister_cpu(cpu);
+
+	set_cpu_present(cpu, false);
 }
 
 static int vcpu_online(unsigned int cpu)
@@ -40,7 +31,7 @@ static int vcpu_online(unsigned int cpu)
 	err = xenbus_scanf(XBT_NIL, dir, "availability", "%15s", state);
 	if (err != 1) {
 		if (!xen_initial_domain())
-			pr_err("Unable to read cpu state\n");
+			printk(KERN_ERR "XENBUS: Unable to read cpu state\n");
 		return err;
 	}
 
@@ -49,12 +40,12 @@ static int vcpu_online(unsigned int cpu)
 	else if (strcmp(state, "offline") == 0)
 		return 0;
 
-	pr_err("unknown state(%s) on CPU%d\n", state, cpu);
+	printk(KERN_ERR "XENBUS: unknown state(%s) on CPU%d\n", state, cpu);
 	return -EINVAL;
 }
 static void vcpu_hotplug(unsigned int cpu)
 {
-	if (cpu >= nr_cpu_ids || !cpu_possible(cpu))
+	if (!cpu_possible(cpu))
 		return;
 
 	switch (vcpu_online(cpu)) {
@@ -62,6 +53,7 @@ static void vcpu_hotplug(unsigned int cpu)
 		enable_hotplug_cpu(cpu);
 		break;
 	case 0:
+		(void)cpu_down(cpu);
 		disable_hotplug_cpu(cpu);
 		break;
 	default:
@@ -70,12 +62,13 @@ static void vcpu_hotplug(unsigned int cpu)
 }
 
 static void handle_vcpu_hotplug_event(struct xenbus_watch *watch,
-				      const char *path, const char *token)
+					const char **vec, unsigned int len)
 {
 	unsigned int cpu;
 	char *cpustr;
+	const char *node = vec[XS_WATCH_PATH];
 
-	cpustr = strstr(path, "cpu/");
+	cpustr = strstr(node, "cpu/");
 	if (cpustr != NULL) {
 		sscanf(cpustr, "cpu/%u", &cpu);
 		vcpu_hotplug(cpu);
@@ -93,8 +86,10 @@ static int setup_cpu_watcher(struct notifier_block *notifier,
 	(void)register_xenbus_watch(&cpu_watch);
 
 	for_each_possible_cpu(cpu) {
-		if (vcpu_online(cpu) == 0)
-			disable_hotplug_cpu(cpu);
+		if (vcpu_online(cpu) == 0) {
+			(void)cpu_down(cpu);
+			set_cpu_present(cpu, false);
+		}
 	}
 
 	return NOTIFY_DONE;
@@ -105,11 +100,7 @@ static int __init setup_vcpu_hotplug_event(void)
 	static struct notifier_block xsn_cpu = {
 		.notifier_call = setup_cpu_watcher };
 
-#ifdef CONFIG_X86
-	if (!xen_pv_domain() && !xen_pvh_domain())
-#else
-	if (!xen_domain())
-#endif
+	if (!xen_pv_domain())
 		return -ENODEV;
 
 	register_xenstore_notifier(&xsn_cpu);
@@ -117,5 +108,5 @@ static int __init setup_vcpu_hotplug_event(void)
 	return 0;
 }
 
-late_initcall(setup_vcpu_hotplug_event);
+arch_initcall(setup_vcpu_hotplug_event);
 

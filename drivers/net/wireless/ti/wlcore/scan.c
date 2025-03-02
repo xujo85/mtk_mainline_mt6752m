@@ -1,20 +1,34 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * This file is part of wl1271
  *
  * Copyright (C) 2009-2010 Nokia Corporation
  *
  * Contact: Luciano Coelho <luciano.coelho@nokia.com>
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
+ * 02110-1301 USA
+ *
  */
 
 #include <linux/ieee80211.h>
-#include <linux/pm_runtime.h>
 
 #include "wlcore.h"
 #include "debug.h"
 #include "cmd.h"
 #include "scan.h"
 #include "acx.h"
+#include "ps.h"
 #include "tx.h"
 
 void wl1271_scan_complete_work(struct work_struct *work)
@@ -22,12 +36,9 @@ void wl1271_scan_complete_work(struct work_struct *work)
 	struct delayed_work *dwork;
 	struct wl1271 *wl;
 	struct wl12xx_vif *wlvif;
-	struct cfg80211_scan_info info = {
-		.aborted = false,
-	};
 	int ret;
 
-	dwork = to_delayed_work(work);
+	dwork = container_of(work, struct delayed_work, work);
 	wl = container_of(dwork, struct wl1271, scan_complete_work);
 
 	wl1271_debug(DEBUG_SCAN, "Scanning complete");
@@ -53,7 +64,7 @@ void wl1271_scan_complete_work(struct work_struct *work)
 	wl->scan.req = NULL;
 	wl->scan_wlvif = NULL;
 
-	ret = pm_runtime_resume_and_get(wl->dev);
+	ret = wl1271_ps_elp_wakeup(wl);
 	if (ret < 0)
 		goto out;
 
@@ -62,6 +73,8 @@ void wl1271_scan_complete_work(struct work_struct *work)
 		wl1271_cmd_build_ap_probe_req(wl, wlvif, wlvif->probereq);
 	}
 
+	wl1271_ps_elp_sleep(wl);
+
 	if (wl->scan.failed) {
 		wl1271_info("Scan completed due to error.");
 		wl12xx_queue_recovery_work(wl);
@@ -69,10 +82,7 @@ void wl1271_scan_complete_work(struct work_struct *work)
 
 	wlcore_cmd_regdomain_config_locked(wl);
 
-	pm_runtime_mark_last_busy(wl->dev);
-	pm_runtime_put_autosuspend(wl->dev);
-
-	ieee80211_scan_completed(wl->hw, &info);
+	ieee80211_scan_completed(wl->hw, false);
 
 out:
 	mutex_unlock(&wl->mutex);
@@ -82,31 +92,9 @@ out:
 static void wlcore_started_vifs_iter(void *data, u8 *mac,
 				     struct ieee80211_vif *vif)
 {
-	struct wl12xx_vif *wlvif = wl12xx_vif_to_data(vif);
-	bool active = false;
 	int *count = (int *)data;
 
-	/*
-	 * count active interfaces according to interface type.
-	 * checking only bss_conf.idle is bad for some cases, e.g.
-	 * we don't want to count sta in p2p_find as active interface.
-	 */
-	switch (wlvif->bss_type) {
-	case BSS_TYPE_STA_BSS:
-		if (test_bit(WLVIF_FLAG_STA_ASSOCIATED, &wlvif->flags))
-			active = true;
-		break;
-
-	case BSS_TYPE_AP_BSS:
-		if (wlvif->wl->active_sta_count > 0)
-			active = true;
-		break;
-
-	default:
-		break;
-	}
-
-	if (active)
+	if (!vif->bss_conf.idle)
 		(*count)++;
 }
 
@@ -154,7 +142,7 @@ wlcore_scan_get_channels(struct wl1271 *wl,
 		struct conf_sched_scan_settings *c = &wl->conf.sched_scan;
 		u32 delta_per_probe;
 
-		if (band == NL80211_BAND_5GHZ)
+		if (band == IEEE80211_BAND_5GHZ)
 			delta_per_probe = c->dwell_time_delta_per_probe_5;
 		else
 			delta_per_probe = c->dwell_time_delta_per_probe;
@@ -178,14 +166,26 @@ wlcore_scan_get_channels(struct wl1271 *wl,
 		flags = req_channels[i]->flags;
 
 		if (force_passive)
-			flags |= IEEE80211_CHAN_NO_IR;
+			flags |= IEEE80211_CHAN_PASSIVE_SCAN;
 
 		if ((req_channels[i]->band == band) &&
 		    !(flags & IEEE80211_CHAN_DISABLED) &&
 		    (!!(flags & IEEE80211_CHAN_RADAR) == radar) &&
 		    /* if radar is set, we ignore the passive flag */
 		    (radar ||
-		     !!(flags & IEEE80211_CHAN_NO_IR) == passive)) {
+		     !!(flags & IEEE80211_CHAN_PASSIVE_SCAN) == passive)) {
+			wl1271_debug(DEBUG_SCAN, "band %d, center_freq %d ",
+				     req_channels[i]->band,
+				     req_channels[i]->center_freq);
+			wl1271_debug(DEBUG_SCAN, "hw_value %d, flags %X",
+				     req_channels[i]->hw_value,
+				     req_channels[i]->flags);
+			wl1271_debug(DEBUG_SCAN, "max_power %d",
+				     req_channels[i]->max_power);
+			wl1271_debug(DEBUG_SCAN, "min_dwell_time %d max dwell time %d",
+				     min_dwell_time_active,
+				     max_dwell_time_active);
+
 			if (flags & IEEE80211_CHAN_RADAR) {
 				channels[j].flags |= SCAN_CHANNEL_FLAGS_DFS;
 
@@ -205,10 +205,10 @@ wlcore_scan_get_channels(struct wl1271 *wl,
 			channels[j].channel = req_channels[i]->hw_value;
 
 			if (n_pactive_ch &&
-			    (band == NL80211_BAND_2GHZ) &&
+			    (band == IEEE80211_BAND_2GHZ) &&
 			    (channels[j].channel >= 12) &&
 			    (channels[j].channel <= 14) &&
-			    (flags & IEEE80211_CHAN_NO_IR) &&
+			    (flags & IEEE80211_CHAN_PASSIVE_SCAN) &&
 			    !force_passive) {
 				/* pactive channels treated as DFS */
 				channels[j].flags = SCAN_CHANNEL_FLAGS_DFS;
@@ -222,17 +222,6 @@ wlcore_scan_get_channels(struct wl1271 *wl,
 					     *n_pactive_ch);
 			}
 
-			wl1271_debug(DEBUG_SCAN, "freq %d, ch. %d, flags 0x%x, power %d, min/max_dwell %d/%d%s%s",
-				     req_channels[i]->center_freq,
-				     req_channels[i]->hw_value,
-				     req_channels[i]->flags,
-				     req_channels[i]->max_power,
-				     min_dwell_time_active,
-				     max_dwell_time_active,
-				     flags & IEEE80211_CHAN_RADAR ?
-					", DFS" : "",
-				     flags & IEEE80211_CHAN_NO_IR ?
-					", NO-IR" : "");
 			j++;
 		}
 	}
@@ -256,7 +245,7 @@ wlcore_set_scan_chan_params(struct wl1271 *wl,
 					 n_channels,
 					 n_ssids,
 					 cfg->channels_2,
-					 NL80211_BAND_2GHZ,
+					 IEEE80211_BAND_2GHZ,
 					 false, true, 0,
 					 MAX_CHANNELS_2GHZ,
 					 &n_pactive_ch,
@@ -267,7 +256,7 @@ wlcore_set_scan_chan_params(struct wl1271 *wl,
 					 n_channels,
 					 n_ssids,
 					 cfg->channels_2,
-					 NL80211_BAND_2GHZ,
+					 IEEE80211_BAND_2GHZ,
 					 false, false,
 					 cfg->passive[0],
 					 MAX_CHANNELS_2GHZ,
@@ -279,7 +268,7 @@ wlcore_set_scan_chan_params(struct wl1271 *wl,
 					 n_channels,
 					 n_ssids,
 					 cfg->channels_5,
-					 NL80211_BAND_5GHZ,
+					 IEEE80211_BAND_5GHZ,
 					 false, true, 0,
 					 wl->max_channels_5,
 					 &n_pactive_ch,
@@ -290,7 +279,7 @@ wlcore_set_scan_chan_params(struct wl1271 *wl,
 					 n_channels,
 					 n_ssids,
 					 cfg->channels_5,
-					 NL80211_BAND_5GHZ,
+					 IEEE80211_BAND_5GHZ,
 					 true, true,
 					 cfg->passive[1],
 					 wl->max_channels_5,
@@ -302,7 +291,7 @@ wlcore_set_scan_chan_params(struct wl1271 *wl,
 					 n_channels,
 					 n_ssids,
 					 cfg->channels_5,
-					 NL80211_BAND_5GHZ,
+					 IEEE80211_BAND_5GHZ,
 					 false, false,
 					 cfg->passive[1] + cfg->dfs,
 					 wl->max_channels_5,
@@ -375,7 +364,7 @@ wlcore_scan_sched_scan_ssid_list(struct wl1271 *wl,
 	struct cfg80211_ssid *ssids = req->ssids;
 	int ret = 0, type, i, j, n_match_ssids = 0;
 
-	wl1271_debug((DEBUG_CMD | DEBUG_SCAN), "cmd sched scan ssid list");
+	wl1271_debug(DEBUG_CMD, "cmd sched scan ssid list");
 
 	/* count the match sets that contain SSIDs */
 	for (i = 0; i < req->n_match_sets; i++)
@@ -452,6 +441,8 @@ wlcore_scan_sched_scan_ssid_list(struct wl1271 *wl,
 			}
 		}
 	}
+
+	wl1271_dump(DEBUG_SCAN, "SSID_LIST: ", cmd, sizeof(*cmd));
 
 	ret = wl1271_cmd_send(wl, CMD_CONNECTION_SCAN_SSID_CFG, cmd,
 			      sizeof(*cmd), 0);

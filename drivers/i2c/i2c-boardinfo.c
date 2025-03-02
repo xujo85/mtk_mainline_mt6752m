@@ -1,14 +1,27 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * i2c-boardinfo.c - collect pre-declarations of I2C devices
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+ * MA 02110-1301 USA.
  */
 
-#include <linux/export.h>
-#include <linux/i2c.h>
 #include <linux/kernel.h>
-#include <linux/property.h>
-#include <linux/rwsem.h>
+#include <linux/i2c.h>
 #include <linux/slab.h>
+#include <linux/export.h>
+#include <linux/rwsem.h>
 
 #include "i2c-core.h"
 
@@ -48,7 +61,9 @@ EXPORT_SYMBOL_GPL(__i2c_first_dynamic_bus_num);
  * The board info passed can safely be __initdata, but be careful of embedded
  * pointers (for platform_data, functions, etc) since that won't be copied.
  */
-int i2c_register_board_info(int busnum, struct i2c_board_info const *info, unsigned len)
+int __init
+i2c_register_board_info(int busnum,
+	struct i2c_board_info const *info, unsigned len)
 {
 	int status;
 
@@ -70,20 +85,6 @@ int i2c_register_board_info(int busnum, struct i2c_board_info const *info, unsig
 
 		devinfo->busnum = busnum;
 		devinfo->board_info = *info;
-
-		if (info->resources) {
-			devinfo->board_info.resources =
-				kmemdup(info->resources,
-					info->num_resources *
-						sizeof(*info->resources),
-					GFP_KERNEL);
-			if (!devinfo->board_info.resources) {
-				status = -ENOMEM;
-				kfree(devinfo);
-				break;
-			}
-		}
-
 		list_add_tail(&devinfo->list, &__i2c_board_list);
 	}
 

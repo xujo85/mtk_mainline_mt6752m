@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _BCACHE_STATS_H_
 #define _BCACHE_STATS_H_
 
@@ -7,6 +6,7 @@ struct cache_stat_collector {
 	atomic_t cache_misses;
 	atomic_t cache_bypass_hits;
 	atomic_t cache_bypass_misses;
+	atomic_t cache_readaheads;
 	atomic_t cache_miss_collisions;
 	atomic_t sectors_bypassed;
 };
@@ -18,10 +18,11 @@ struct cache_stats {
 	unsigned long cache_misses;
 	unsigned long cache_bypass_hits;
 	unsigned long cache_bypass_misses;
+	unsigned long cache_readaheads;
 	unsigned long cache_miss_collisions;
 	unsigned long sectors_bypassed;
 
-	unsigned int		rescale;
+	unsigned		rescale;
 };
 
 struct cache_accounting {
@@ -37,9 +38,7 @@ struct cache_accounting {
 	struct cache_stats day;
 };
 
-struct cache_set;
-struct cached_dev;
-struct bcache_device;
+struct search;
 
 void bch_cache_accounting_init(struct cache_accounting *acc,
 			       struct closure *parent);
@@ -51,12 +50,9 @@ void bch_cache_accounting_clear(struct cache_accounting *acc);
 
 void bch_cache_accounting_destroy(struct cache_accounting *acc);
 
-void bch_mark_cache_accounting(struct cache_set *c, struct bcache_device *d,
-			       bool hit, bool bypass);
-void bch_mark_cache_miss_collision(struct cache_set *c,
-				   struct bcache_device *d);
-void bch_mark_sectors_bypassed(struct cache_set *c,
-			       struct cached_dev *dc,
-			       int sectors);
+void bch_mark_cache_accounting(struct search *s, bool hit, bool bypass);
+void bch_mark_cache_readahead(struct search *s);
+void bch_mark_cache_miss_collision(struct search *s);
+void bch_mark_sectors_bypassed(struct search *s, int sectors);
 
 #endif /* _BCACHE_STATS_H_ */

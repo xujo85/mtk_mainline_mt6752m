@@ -1,8 +1,16 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Driver for CC770 and AN82527 CAN controllers on the platform bus
  *
  * Copyright (C) 2009, 2011 Wolfgang Grandegger <wg@grandegger.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the version 2 of the GNU General Public License
+ * as published by the Free Software Foundation
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
  */
 
 /*
@@ -93,20 +101,20 @@ static int cc770_get_of_node_data(struct platform_device *pdev,
 	if (priv->can.clock.freq > 8000000)
 		priv->cpu_interface |= CPUIF_DMC;
 
-	if (of_property_read_bool(np, "bosch,divide-memory-clock"))
+	if (of_get_property(np, "bosch,divide-memory-clock", NULL))
 		priv->cpu_interface |= CPUIF_DMC;
-	if (of_property_read_bool(np, "bosch,iso-low-speed-mux"))
+	if (of_get_property(np, "bosch,iso-low-speed-mux", NULL))
 		priv->cpu_interface |= CPUIF_MUX;
 
 	if (!of_get_property(np, "bosch,no-comperator-bypass", NULL))
 		priv->bus_config |= BUSCFG_CBY;
-	if (of_property_read_bool(np, "bosch,disconnect-rx0-input"))
+	if (of_get_property(np, "bosch,disconnect-rx0-input", NULL))
 		priv->bus_config |= BUSCFG_DR0;
-	if (of_property_read_bool(np, "bosch,disconnect-rx1-input"))
+	if (of_get_property(np, "bosch,disconnect-rx1-input", NULL))
 		priv->bus_config |= BUSCFG_DR1;
-	if (of_property_read_bool(np, "bosch,disconnect-tx1-output"))
+	if (of_get_property(np, "bosch,disconnect-tx1-output", NULL))
 		priv->bus_config |= BUSCFG_DT1;
-	if (of_property_read_bool(np, "bosch,polarity-dominant"))
+	if (of_get_property(np, "bosch,polarity-dominant", NULL))
 		priv->bus_config |= BUSCFG_POL;
 
 	prop = of_get_property(np, "bosch,clock-out-frequency", &prop_size);
@@ -144,7 +152,7 @@ static int cc770_get_platform_data(struct platform_device *pdev,
 				   struct cc770_priv *priv)
 {
 
-	struct cc770_platform_data *pdata = dev_get_platdata(&pdev->dev);
+	struct cc770_platform_data *pdata = pdev->dev.platform_data;
 
 	priv->can.clock.freq = pdata->osc_freq;
 	if (priv->cpu_interface & CPUIF_DSC)
@@ -195,7 +203,7 @@ static int cc770_platform_probe(struct platform_device *pdev)
 
 	if (pdev->dev.of_node)
 		err = cc770_get_of_node_data(pdev, priv);
-	else if (dev_get_platdata(&pdev->dev))
+	else if (pdev->dev.platform_data)
 		err = cc770_get_platform_data(pdev, priv);
 	else
 		err = -ENODEV;
@@ -208,7 +216,7 @@ static int cc770_platform_probe(struct platform_device *pdev)
 		 priv->reg_base, dev->irq, priv->can.clock.freq,
 		 priv->cpu_interface, priv->bus_config, priv->clkout);
 
-	platform_set_drvdata(pdev, dev);
+	dev_set_drvdata(&pdev->dev, dev);
 	SET_NETDEV_DEV(dev, &pdev->dev);
 
 	err = register_cc770dev(dev);
@@ -230,9 +238,9 @@ exit_release_mem:
 	return err;
 }
 
-static void cc770_platform_remove(struct platform_device *pdev)
+static int cc770_platform_remove(struct platform_device *pdev)
 {
-	struct net_device *dev = platform_get_drvdata(pdev);
+	struct net_device *dev = dev_get_drvdata(&pdev->dev);
 	struct cc770_priv *priv = netdev_priv(dev);
 	struct resource *mem;
 
@@ -242,9 +250,11 @@ static void cc770_platform_remove(struct platform_device *pdev)
 
 	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	release_mem_region(mem->start, resource_size(mem));
+
+	return 0;
 }
 
-static const struct of_device_id cc770_platform_table[] = {
+static struct of_device_id cc770_platform_table[] = {
 	{.compatible = "bosch,cc770"}, /* CC770 from Bosch */
 	{.compatible = "intc,82527"},  /* AN82527 from Intel CP */
 	{},
@@ -254,10 +264,11 @@ MODULE_DEVICE_TABLE(of, cc770_platform_table);
 static struct platform_driver cc770_platform_driver = {
 	.driver = {
 		.name = DRV_NAME,
+		.owner = THIS_MODULE,
 		.of_match_table = cc770_platform_table,
 	},
 	.probe = cc770_platform_probe,
-	.remove_new = cc770_platform_remove,
+	.remove = cc770_platform_remove,
 };
 
 module_platform_driver(cc770_platform_driver);

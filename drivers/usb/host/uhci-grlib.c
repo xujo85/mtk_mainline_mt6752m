@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * UHCI HCD (Host Controller Driver) for GRLIB GRUSBHC
  *
@@ -18,7 +17,6 @@
  * (C) Copyright 2004-2007 Alan Stern, stern@rowland.harvard.edu
  */
 
-#include <linux/device.h>
 #include <linux/of_irq.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
@@ -43,7 +41,7 @@ static int uhci_grlib_init(struct usb_hcd *hcd)
 
 	uhci->rh_numports = uhci_count_ports(hcd);
 
-	/* Set up pointers to generic functions */
+	/* Set up pointers to to generic functions */
 	uhci->reset_hc = uhci_generic_reset_hc;
 	uhci->check_and_reset_hc = uhci_generic_check_and_reset_hc;
 	/* No special actions need to be taken for the functions below */
@@ -63,7 +61,7 @@ static const struct hc_driver uhci_grlib_hc_driver = {
 
 	/* Generic hardware linkage */
 	.irq =			uhci_irq,
-	.flags =		HCD_MEMORY | HCD_DMA | HCD_USB11,
+	.flags =		HCD_MEMORY | HCD_USB11,
 
 	/* Basic lifecycle operations */
 	.reset =		uhci_grlib_init,
@@ -115,17 +113,24 @@ static int uhci_hcd_grlib_probe(struct platform_device *op)
 	hcd->rsrc_start = res.start;
 	hcd->rsrc_len = resource_size(&res);
 
-	irq = irq_of_parse_and_map(dn, 0);
-	if (!irq) {
-		printk(KERN_ERR "%s: irq_of_parse_and_map failed\n", __FILE__);
+	if (!request_mem_region(hcd->rsrc_start, hcd->rsrc_len, hcd_name)) {
+		printk(KERN_ERR "%s: request_mem_region failed\n", __FILE__);
 		rv = -EBUSY;
-		goto err_usb;
+		goto err_rmr;
 	}
 
-	hcd->regs = devm_ioremap_resource(&op->dev, &res);
-	if (IS_ERR(hcd->regs)) {
-		rv = PTR_ERR(hcd->regs);
+	irq = irq_of_parse_and_map(dn, 0);
+	if (irq == NO_IRQ) {
+		printk(KERN_ERR "%s: irq_of_parse_and_map failed\n", __FILE__);
+		rv = -EBUSY;
 		goto err_irq;
+	}
+
+	hcd->regs = ioremap(hcd->rsrc_start, hcd->rsrc_len);
+	if (!hcd->regs) {
+		printk(KERN_ERR "%s: ioremap failed\n", __FILE__);
+		rv = -ENOMEM;
+		goto err_ioremap;
 	}
 
 	uhci = hcd_to_uhci(hcd);
@@ -134,29 +139,39 @@ static int uhci_hcd_grlib_probe(struct platform_device *op)
 
 	rv = usb_add_hcd(hcd, irq, 0);
 	if (rv)
-		goto err_irq;
+		goto err_uhci;
 
-	device_wakeup_enable(hcd->self.controller);
 	return 0;
 
-err_irq:
+err_uhci:
+	iounmap(hcd->regs);
+err_ioremap:
 	irq_dispose_mapping(irq);
-err_usb:
+err_irq:
+	release_mem_region(hcd->rsrc_start, hcd->rsrc_len);
+err_rmr:
 	usb_put_hcd(hcd);
 
 	return rv;
 }
 
-static void uhci_hcd_grlib_remove(struct platform_device *op)
+static int uhci_hcd_grlib_remove(struct platform_device *op)
 {
-	struct usb_hcd *hcd = platform_get_drvdata(op);
+	struct usb_hcd *hcd = dev_get_drvdata(&op->dev);
+
+	dev_set_drvdata(&op->dev, NULL);
 
 	dev_dbg(&op->dev, "stopping GRLIB GRUSBHC UHCI USB Controller\n");
 
 	usb_remove_hcd(hcd);
 
+	iounmap(hcd->regs);
 	irq_dispose_mapping(hcd->irq);
+	release_mem_region(hcd->rsrc_start, hcd->rsrc_len);
+
 	usb_put_hcd(hcd);
+
+	return 0;
 }
 
 /* Make sure the controller is quiescent and that we're not using it
@@ -168,7 +183,7 @@ static void uhci_hcd_grlib_remove(struct platform_device *op)
  */
 static void uhci_hcd_grlib_shutdown(struct platform_device *op)
 {
-	struct usb_hcd *hcd = platform_get_drvdata(op);
+	struct usb_hcd *hcd = dev_get_drvdata(&op->dev);
 
 	uhci_hc_died(hcd_to_uhci(hcd));
 }
@@ -183,10 +198,11 @@ MODULE_DEVICE_TABLE(of, uhci_hcd_grlib_of_match);
 
 static struct platform_driver uhci_grlib_driver = {
 	.probe		= uhci_hcd_grlib_probe,
-	.remove_new	= uhci_hcd_grlib_remove,
+	.remove		= uhci_hcd_grlib_remove,
 	.shutdown	= uhci_hcd_grlib_shutdown,
 	.driver = {
 		.name = "grlib-uhci",
+		.owner = THIS_MODULE,
 		.of_match_table = uhci_hcd_grlib_of_match,
 	},
 };

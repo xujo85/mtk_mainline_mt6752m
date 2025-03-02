@@ -1,8 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * ADIS16080/100 Yaw Rate Gyroscope with SPI driver
  *
  * Copyright 2010 Analog Devices Inc.
+ *
+ * Licensed under the GPL-2 or later.
  */
 #include <linux/delay.h>
 #include <linux/mutex.h>
@@ -38,20 +39,19 @@ struct adis16080_chip_info {
  * @us:			actual spi_device to write data
  * @info:		chip specific parameters
  * @buf:		transmit or receive buffer
- * @lock:		lock to protect buffer during reads
  **/
 struct adis16080_state {
 	struct spi_device		*us;
 	const struct adis16080_chip_info *info;
-	struct mutex			lock;
 
-	__be16 buf __aligned(IIO_DMA_MINALIGN);
+	__be16 buf ____cacheline_aligned;
 };
 
 static int adis16080_read_sample(struct iio_dev *indio_dev,
 		u16 addr, int *val)
 {
 	struct adis16080_state *st = iio_priv(indio_dev);
+	struct spi_message m;
 	int ret;
 	struct spi_transfer	t[] = {
 		{
@@ -66,7 +66,11 @@ static int adis16080_read_sample(struct iio_dev *indio_dev,
 
 	st->buf = cpu_to_be16(addr | ADIS16080_DIN_WRITE);
 
-	ret = spi_sync_transfer(st->us, t, ARRAY_SIZE(t));
+	spi_message_init(&m);
+	spi_message_add_tail(&t[0], &m);
+	spi_message_add_tail(&t[1], &m);
+
+	ret = spi_sync(st->us, &m);
 	if (ret == 0)
 		*val = sign_extend32(be16_to_cpu(st->buf), 11);
 
@@ -84,9 +88,9 @@ static int adis16080_read_raw(struct iio_dev *indio_dev,
 
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
-		mutex_lock(&st->lock);
+		mutex_lock(&indio_dev->mlock);
 		ret = adis16080_read_sample(indio_dev, chan->address, val);
-		mutex_unlock(&st->lock);
+		mutex_unlock(&indio_dev->mlock);
 		return ret ? ret : IIO_VAL_INT;
 	case IIO_CHAN_INFO_SCALE:
 		switch (chan->type) {
@@ -164,6 +168,7 @@ static const struct iio_chan_spec adis16080_channels[] = {
 
 static const struct iio_info adis16080_info = {
 	.read_raw = &adis16080_read_raw,
+	.driver_module = THIS_MODULE,
 };
 
 enum {
@@ -187,16 +192,19 @@ static const struct adis16080_chip_info adis16080_chip_info[] = {
 static int adis16080_probe(struct spi_device *spi)
 {
 	const struct spi_device_id *id = spi_get_device_id(spi);
+	int ret;
 	struct adis16080_state *st;
 	struct iio_dev *indio_dev;
 
 	/* setup the industrialio driver allocated elements */
-	indio_dev = devm_iio_device_alloc(&spi->dev, sizeof(*st));
-	if (!indio_dev)
-		return -ENOMEM;
+	indio_dev = iio_device_alloc(sizeof(*st));
+	if (indio_dev == NULL) {
+		ret = -ENOMEM;
+		goto error_ret;
+	}
 	st = iio_priv(indio_dev);
-
-	mutex_init(&st->lock);
+	/* this is only used for removal purposes */
+	spi_set_drvdata(spi, indio_dev);
 
 	/* Allocate the comms buffers */
 	st->us = spi;
@@ -205,10 +213,27 @@ static int adis16080_probe(struct spi_device *spi)
 	indio_dev->name = spi->dev.driver->name;
 	indio_dev->channels = adis16080_channels;
 	indio_dev->num_channels = ARRAY_SIZE(adis16080_channels);
+	indio_dev->dev.parent = &spi->dev;
 	indio_dev->info = &adis16080_info;
 	indio_dev->modes = INDIO_DIRECT_MODE;
 
-	return devm_iio_device_register(&spi->dev, indio_dev);
+	ret = iio_device_register(indio_dev);
+	if (ret)
+		goto error_free_dev;
+	return 0;
+
+error_free_dev:
+	iio_device_free(indio_dev);
+error_ret:
+	return ret;
+}
+
+static int adis16080_remove(struct spi_device *spi)
+{
+	iio_device_unregister(spi_get_drvdata(spi));
+	iio_device_free(spi_get_drvdata(spi));
+
+	return 0;
 }
 
 static const struct spi_device_id adis16080_ids[] = {
@@ -221,8 +246,10 @@ MODULE_DEVICE_TABLE(spi, adis16080_ids);
 static struct spi_driver adis16080_driver = {
 	.driver = {
 		.name = "adis16080",
+		.owner = THIS_MODULE,
 	},
 	.probe = adis16080_probe,
+	.remove = adis16080_remove,
 	.id_table = adis16080_ids,
 };
 module_spi_driver(adis16080_driver);

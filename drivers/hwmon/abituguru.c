@@ -1,6 +1,19 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * abituguru.c Copyright (c) 2005-2006 Hans de Goede <hdegoede@redhat.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 /*
  * This driver supports the sensor part of the first and second revision of
@@ -151,7 +164,7 @@ static const u8 abituguru_bank2_max_threshold = 50;
 static const int abituguru_pwm_settings_multiplier[5] = { 0, 1, 1, 1000, 1000 };
 /*
  * Min / Max allowed values for pwm_settings. Note: pwm1 (CPU fan) is a
- * special case the minimum allowed pwm% setting for this is 30% (77) on
+ * special case the minium allowed pwm% setting for this is 30% (77) on
  * some MB's this special case is handled in the code!
  */
 static const u8 abituguru_pwm_min[5] = { 0, 170, 170, 25, 25 };
@@ -504,7 +517,7 @@ abituguru_detect_bank1_sensor_type(struct abituguru_data *data,
 
 	ABIT_UGURU_DEBUG(2, "testing bank1 sensor %d\n", (int)sensor_addr);
 	/*
-	 * Volt sensor test, enable volt low alarm, set min value ridiculously
+	 * Volt sensor test, enable volt low alarm, set min value ridicously
 	 * high, or vica versa if the reading is very high. If its a volt
 	 * sensor this should always give us an alarm.
 	 */
@@ -551,7 +564,7 @@ abituguru_detect_bank1_sensor_type(struct abituguru_data *data,
 
 	/*
 	 * Temp sensor test, enable sensor as a temp sensor, set beep value
-	 * ridiculously low (but not too low, otherwise uguru ignores it).
+	 * ridicously low (but not too low, otherwise uguru ignores it).
 	 * If its a temp sensor this should always give us an alarm.
 	 */
 	buf[0] = ABIT_UGURU_TEMP_HIGH_ALARM_ENABLE;
@@ -1264,7 +1277,7 @@ static int abituguru_probe(struct platform_device *pdev)
 	 * El weirdo probe order, to keep the sysfs order identical to the
 	 * BIOS and window-appliction listing order.
 	 */
-	static const u8 probe_order[ABIT_UGURU_MAX_BANK1_SENSORS] = {
+	const u8 probe_order[ABIT_UGURU_MAX_BANK1_SENSORS] = {
 		0x00, 0x01, 0x03, 0x04, 0x0A, 0x08, 0x0E, 0x02,
 		0x09, 0x06, 0x05, 0x0B, 0x0F, 0x0D, 0x07, 0x0C };
 
@@ -1504,6 +1517,7 @@ LEAVE_UPDATE:
 		return NULL;
 }
 
+#ifdef CONFIG_PM_SLEEP
 static int abituguru_suspend(struct device *dev)
 {
 	struct abituguru_data *data = dev_get_drvdata(dev);
@@ -1525,12 +1539,17 @@ static int abituguru_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(abituguru_pm, abituguru_suspend, abituguru_resume);
+static SIMPLE_DEV_PM_OPS(abituguru_pm, abituguru_suspend, abituguru_resume);
+#define ABIT_UGURU_PM	(&abituguru_pm)
+#else
+#define ABIT_UGURU_PM	NULL
+#endif /* CONFIG_PM */
 
 static struct platform_driver abituguru_driver = {
 	.driver = {
+		.owner	= THIS_MODULE,
 		.name	= ABIT_UGURU_NAME,
-		.pm	= pm_sleep_ptr(&abituguru_pm),
+		.pm	= ABIT_UGURU_PM,
 	},
 	.probe		= abituguru_probe,
 	.remove		= abituguru_remove,
