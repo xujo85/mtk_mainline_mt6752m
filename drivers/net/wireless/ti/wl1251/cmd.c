@@ -1,8 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0
 #include "cmd.h"
 
 #include <linux/module.h>
 #include <linux/slab.h>
-#include <linux/crc7.h>
+#include <linux/etherdevice.h>
 
 #include "wl1251.h"
 #include "reg.h"
@@ -11,7 +12,7 @@
 #include "acx.h"
 
 /**
- * send command to firmware
+ * wl1251_cmd_send - Send command to firmware
  *
  * @wl: wl struct
  * @id: command id
@@ -58,11 +59,11 @@ out:
 }
 
 /**
- * send test command to firmware
+ * wl1251_cmd_test - Send test command to firmware
  *
  * @wl: wl struct
  * @buf: buffer containing the command, with all headers, must work with dma
- * @len: length of the buffer
+ * @buf_len: length of the buffer
  * @answer: is answer needed
  */
 int wl1251_cmd_test(struct wl1251 *wl, void *buf, size_t buf_len, u8 answer)
@@ -99,7 +100,7 @@ int wl1251_cmd_test(struct wl1251 *wl, void *buf, size_t buf_len, u8 answer)
 }
 
 /**
- * read acx from firmware
+ * wl1251_cmd_interrogate - Read acx from firmware
  *
  * @wl: wl struct
  * @id: acx id
@@ -137,7 +138,7 @@ out:
 }
 
 /**
- * write acx value to firmware
+ * wl1251_cmd_configure - Write acx value to firmware
  *
  * @wl: wl struct
  * @id: acx id
@@ -174,10 +175,8 @@ int wl1251_cmd_vbm(struct wl1251 *wl, u8 identity,
 	wl1251_debug(DEBUG_CMD, "cmd vbm");
 
 	vbm = kzalloc(sizeof(*vbm), GFP_KERNEL);
-	if (!vbm) {
-		ret = -ENOMEM;
-		goto out;
-	}
+	if (!vbm)
+		return -ENOMEM;
 
 	/* Count and period will be filled by the target */
 	vbm->tim.bitmap_ctrl = bitmap_control;
@@ -203,29 +202,24 @@ out:
 	return ret;
 }
 
-int wl1251_cmd_data_path(struct wl1251 *wl, u8 channel, bool enable)
+int wl1251_cmd_data_path_rx(struct wl1251 *wl, u8 channel, bool enable)
 {
 	struct cmd_enabledisable_path *cmd;
 	int ret;
-	u16 cmd_rx, cmd_tx;
+	u16 cmd_rx;
 
 	wl1251_debug(DEBUG_CMD, "cmd data path");
 
 	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
-	if (!cmd) {
-		ret = -ENOMEM;
-		goto out;
-	}
+	if (!cmd)
+		return -ENOMEM;
 
 	cmd->channel = channel;
 
-	if (enable) {
+	if (enable)
 		cmd_rx = CMD_ENABLE_RX;
-		cmd_tx = CMD_ENABLE_TX;
-	} else {
+	else
 		cmd_rx = CMD_DISABLE_RX;
-		cmd_tx = CMD_DISABLE_TX;
-	}
 
 	ret = wl1251_cmd_send(wl, cmd_rx, cmd, sizeof(*cmd));
 	if (ret < 0) {
@@ -237,17 +231,38 @@ int wl1251_cmd_data_path(struct wl1251 *wl, u8 channel, bool enable)
 	wl1251_debug(DEBUG_BOOT, "rx %s cmd channel %d",
 		     enable ? "start" : "stop", channel);
 
+out:
+	kfree(cmd);
+	return ret;
+}
+
+int wl1251_cmd_data_path_tx(struct wl1251 *wl, u8 channel, bool enable)
+{
+	struct cmd_enabledisable_path *cmd;
+	int ret;
+	u16 cmd_tx;
+
+	wl1251_debug(DEBUG_CMD, "cmd data path");
+
+	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	if (!cmd)
+		return -ENOMEM;
+
+	cmd->channel = channel;
+
+	if (enable)
+		cmd_tx = CMD_ENABLE_TX;
+	else
+		cmd_tx = CMD_DISABLE_TX;
+
 	ret = wl1251_cmd_send(wl, cmd_tx, cmd, sizeof(*cmd));
-	if (ret < 0) {
+	if (ret < 0)
 		wl1251_error("tx %s cmd for channel %d failed",
 			     enable ? "start" : "stop", channel);
-		goto out;
-	}
+	else
+		wl1251_debug(DEBUG_BOOT, "tx %s cmd channel %d",
+			     enable ? "start" : "stop", channel);
 
-	wl1251_debug(DEBUG_BOOT, "tx %s cmd channel %d",
-		     enable ? "start" : "stop", channel);
-
-out:
 	kfree(cmd);
 	return ret;
 }
@@ -260,10 +275,8 @@ int wl1251_cmd_join(struct wl1251 *wl, u8 bss_type, u8 channel,
 	u8 *bssid;
 
 	join = kzalloc(sizeof(*join), GFP_KERNEL);
-	if (!join) {
-		ret = -ENOMEM;
-		goto out;
-	}
+	if (!join)
+		return -ENOMEM;
 
 	wl1251_debug(DEBUG_CMD, "cmd join%s ch %d %d/%d",
 		     bss_type == BSS_TYPE_IBSS ? " ibss" : "",
@@ -305,10 +318,8 @@ int wl1251_cmd_ps_mode(struct wl1251 *wl, u8 ps_mode)
 	wl1251_debug(DEBUG_CMD, "cmd set ps mode");
 
 	ps_params = kzalloc(sizeof(*ps_params), GFP_KERNEL);
-	if (!ps_params) {
-		ret = -ENOMEM;
-		goto out;
-	}
+	if (!ps_params)
+		return -ENOMEM;
 
 	ps_params->ps_mode = ps_mode;
 	ps_params->send_null_data = 1;
@@ -337,10 +348,8 @@ int wl1251_cmd_read_memory(struct wl1251 *wl, u32 addr, void *answer,
 	wl1251_debug(DEBUG_CMD, "cmd read memory");
 
 	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
-	if (!cmd) {
-		ret = -ENOMEM;
-		goto out;
-	}
+	if (!cmd)
+		return -ENOMEM;
 
 	WARN_ON(len > MAX_READ_SIZE);
 	len = min_t(size_t, len, MAX_READ_SIZE);
@@ -382,10 +391,8 @@ int wl1251_cmd_template_set(struct wl1251 *wl, u16 cmd_id,
 	cmd_len = ALIGN(sizeof(*cmd) + buf_len, 4);
 
 	cmd = kzalloc(cmd_len, GFP_KERNEL);
-	if (!cmd) {
-		ret = -ENOMEM;
-		goto out;
-	}
+	if (!cmd)
+		return -ENOMEM;
 
 	cmd->size = cpu_to_le16(buf_len);
 
@@ -410,7 +417,9 @@ int wl1251_cmd_scan(struct wl1251 *wl, u8 *ssid, size_t ssid_len,
 	struct wl1251_cmd_scan *cmd;
 	int i, ret = 0;
 
-	wl1251_debug(DEBUG_CMD, "cmd scan");
+	wl1251_debug(DEBUG_CMD, "cmd scan channels %d", n_channels);
+
+	WARN_ON(n_channels > SCAN_MAX_NUM_OF_CHANNELS);
 
 	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
 	if (!cmd)
@@ -421,6 +430,13 @@ int wl1251_cmd_scan(struct wl1251 *wl, u8 *ssid, size_t ssid_len,
 						    CFG_RX_MGMT_EN |
 						    CFG_RX_BCN_EN);
 	cmd->params.scan_options = 0;
+	/*
+	 * Use high priority scan when not associated to prevent fw issue
+	 * causing never-ending scans (sometimes 20+ minutes).
+	 * Note: This bug may be caused by the fw's DTIM handling.
+	 */
+	if (is_zero_ether_addr(wl->bssid))
+		cmd->params.scan_options |= cpu_to_le16(WL1251_SCAN_OPT_PRIORITY_HIGH);
 	cmd->params.num_channels = n_channels;
 	cmd->params.num_probe_requests = n_probes;
 	cmd->params.tx_rate = cpu_to_le16(1 << 1); /* 2 Mbps */
@@ -438,9 +454,12 @@ int wl1251_cmd_scan(struct wl1251 *wl, u8 *ssid, size_t ssid_len,
 		cmd->channels[i].channel = channels[i]->hw_value;
 	}
 
-	cmd->params.ssid_len = ssid_len;
-	if (ssid)
-		memcpy(cmd->params.ssid, ssid, ssid_len);
+	if (ssid) {
+		int len = clamp_val(ssid_len, 0, IEEE80211_MAX_SSID_LEN);
+
+		cmd->params.ssid_len = len;
+		memcpy(cmd->params.ssid, ssid, len);
+	}
 
 	ret = wl1251_cmd_send(wl, CMD_SCAN, cmd, sizeof(*cmd));
 	if (ret < 0) {

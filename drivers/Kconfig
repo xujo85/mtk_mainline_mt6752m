@@ -1,4 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0
 menu "Device Drivers"
+
+# Keep I/O buses first
+
+source "drivers/amba/Kconfig"
+source "drivers/eisa/Kconfig"
+source "drivers/pci/Kconfig"
+source "drivers/cxl/Kconfig"
+source "drivers/pcmcia/Kconfig"
+source "drivers/rapidio/Kconfig"
+
 
 source "drivers/base/Kconfig"
 
@@ -52,6 +63,8 @@ source "drivers/char/Kconfig"
 
 source "drivers/i2c/Kconfig"
 
+source "drivers/i3c/Kconfig"
+
 source "drivers/spi/Kconfig"
 
 source "drivers/ssbi/Kconfig"
@@ -90,6 +103,8 @@ source "drivers/media/Kconfig"
 
 source "drivers/video/Kconfig"
 
+source "drivers/accel/Kconfig"
+
 source "sound/Kconfig"
 
 source "drivers/hid/Kconfig"
@@ -99,6 +114,8 @@ source "drivers/usb/Kconfig"
 source "drivers/uwb/Kconfig"
 
 source "drivers/mmc/Kconfig"
+
+source "drivers/ufs/Kconfig"
 
 source "drivers/memstick/Kconfig"
 
@@ -116,6 +133,8 @@ source "drivers/rtc/Kconfig"
 
 source "drivers/dma/Kconfig"
 
+source "drivers/dma-buf/Kconfig"
+
 source "drivers/dca/Kconfig"
 
 source "drivers/auxdisplay/Kconfig"
@@ -130,9 +149,17 @@ source "drivers/virt/Kconfig"
 
 source "drivers/virtio/Kconfig"
 
+source "drivers/vdpa/Kconfig"
+
+source "drivers/vhost/Kconfig"
+
 source "drivers/hv/Kconfig"
 
 source "drivers/xen/Kconfig"
+
+source "drivers/greybus/Kconfig"
+
+source "drivers/comedi/Kconfig"
 
 source "drivers/staging/Kconfig"
 
@@ -152,6 +179,10 @@ source "drivers/remoteproc/Kconfig"
 
 source "drivers/rpmsg/Kconfig"
 
+source "drivers/soundwire/Kconfig"
+
+source "drivers/soc/Kconfig"
+
 source "drivers/devfreq/Kconfig"
 
 source "drivers/extcon/Kconfig"
@@ -162,8 +193,6 @@ source "drivers/iio/Kconfig"
 
 source "drivers/ntb/Kconfig"
 
-source "drivers/vme/Kconfig"
-
 source "drivers/pwm/Kconfig"
 
 source "drivers/irqchip/Kconfig"
@@ -172,6 +201,54 @@ source "drivers/ipack/Kconfig"
 
 source "drivers/reset/Kconfig"
 
+source "drivers/phy/Kconfig"
+
+source "drivers/powercap/Kconfig"
+
+source "drivers/mcb/Kconfig"
+
+source "drivers/perf/Kconfig"
+
+source "drivers/ras/Kconfig"
+
+source "drivers/thunderbolt/Kconfig"
+
 source "drivers/android/Kconfig"
+
+source "drivers/gpu/trace/Kconfig"
+
+source "drivers/nvdimm/Kconfig"
+
+source "drivers/dax/Kconfig"
+
+source "drivers/nvmem/Kconfig"
+
+source "drivers/hwtracing/Kconfig"
+
+source "drivers/fpga/Kconfig"
+
+source "drivers/fsi/Kconfig"
+
+source "drivers/tee/Kconfig"
+
+source "drivers/mux/Kconfig"
+
+source "drivers/opp/Kconfig"
+
+source "drivers/siox/Kconfig"
+
+source "drivers/slimbus/Kconfig"
+
+source "drivers/interconnect/Kconfig"
+
+source "drivers/counter/Kconfig"
+
+source "drivers/most/Kconfig"
+
+source "drivers/peci/Kconfig"
+
+source "drivers/hte/Kconfig"
+
+source "drivers/cdx/Kconfig"
 
 endmenu

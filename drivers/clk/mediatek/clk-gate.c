@@ -1,191 +1,285 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2014 MediaTek Inc.
  * Author: James Liao <jamesjj.liao@mediatek.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
-#include <linux/of.h>
-#include <linux/of_address.h>
-
-#include <linux/io.h>
+#include <linux/clk-provider.h>
+#include <linux/mfd/syscon.h>
+#include <linux/module.h>
+#include <linux/printk.h>
+#include <linux/regmap.h>
 #include <linux/slab.h>
-#include <linux/delay.h>
-#include <linux/clkdev.h>
+#include <linux/types.h>
 
-#include "clk-mtk.h"
 #include "clk-gate.h"
 
-#if !defined(MT_CCF_DEBUG) || !defined(MT_CCF_BRINGUP)
-#define MT_CCF_DEBUG	0
-#define MT_CCF_BRINGUP	0
-#endif
-
-/*
- * clk_gate
- */
-
-static void cg_set_mask(struct mtk_clk_gate *cg, u32 mask)
-{
-	u32 r;
-
-#if MT_CCF_DEBUG
-	if (printk_ratelimit())
-	/*if (!strcmp(__clk_get_name(cg->hw.clk), "vdec0_vdec") ||
-	    !strcmp(__clk_get_name(cg->hw.clk), "vdec1_larb")) {*/
-		pr_debug("[CCF] %s: %s, mask=%u, bit=%u, flags=%u\n",
-			  __func__, __clk_get_name(cg->hw.clk), mask,
-			  cg->bit, cg->flags);
-#endif /* MT_CCF_DEBUG */
-	if (cg->flags & CLK_GATE_NO_SETCLR_REG) {
-		r = readl_relaxed(cg->sta_addr) | mask;
-		writel_relaxed(r, cg->sta_addr);
-	} else
-		writel_relaxed(mask, cg->set_addr);
-}
-
-static void cg_clr_mask(struct mtk_clk_gate *cg, u32 mask)
-{
-	u32 r;
-
-#if MT_CCF_DEBUG
-	if (printk_ratelimit())
-/*	if (!strcmp(__clk_get_name(cg->hw.clk), "vdec0_vdec") ||
-	    !strcmp(__clk_get_name(cg->hw.clk), "vdec1_larb"))*/
-		pr_debug("[CCF] %s: %s, mask=%u, bit=%u, flags=%u\n",
-			  __func__, __clk_get_name(cg->hw.clk), mask,
-			  cg->bit, cg->flags);
-#endif /* MT_CCF_DEBUG */
-	if (cg->flags & CLK_GATE_NO_SETCLR_REG) {
-		r = readl_relaxed(cg->sta_addr) & ~mask;
-		writel_relaxed(r, cg->sta_addr);
-	} else
-		writel_relaxed(mask, cg->clr_addr);
-}
-
-static int cg_enable(struct clk_hw *hw)
-{
-	unsigned long flags = 0;
-	struct mtk_clk_gate *cg = to_clk_gate(hw);
-	u32 mask = BIT(cg->bit);
-
-#if MT_CCF_BRINGUP
-	if (printk_ratelimit())
-		pr_debug("[CCF] %s: %s, bit: %u\n", __func__,
-			  __clk_get_name(hw->clk), cg->bit);
-	return 0;
-#endif /* MT_CCF_BRINGUP */
-
-	mtk_clk_lock(flags);
-
-	if (cg->flags & CLK_GATE_INVERSE)
-		cg_set_mask(cg, mask);
-	else
-		cg_clr_mask(cg, mask);
-
-	mtk_clk_unlock(flags);
-
-	return 0;
-}
-
-static void cg_disable(struct clk_hw *hw)
-{
-	unsigned long flags = 0;
-	struct mtk_clk_gate *cg = to_clk_gate(hw);
-	u32 mask = BIT(cg->bit);
-
-#if MT_CCF_BRINGUP
-	if (printk_ratelimit())
-		pr_debug("[CCF] %s: %s, bit: %u\n", __func__,
-			  __clk_get_name(hw->clk), cg->bit);
-	return;
-#endif /* MT_CCF_BRINGUP */
-
-	mtk_clk_lock(flags);
-
-	if (cg->flags & CLK_GATE_INVERSE)
-		cg_clr_mask(cg, mask);
-	else
-		cg_set_mask(cg, mask);
-
-	mtk_clk_unlock(flags);
-}
-
-static int cg_is_enabled(struct clk_hw *hw)
-{
-	struct mtk_clk_gate *cg = to_clk_gate(hw);
-	u32 mask;
-	u32 val;
-	int r;
-
-#if MT_CCF_BRINGUP
-	if (printk_ratelimit())
-		pr_debug("[CCF] %s: %s\n", __func__, __clk_get_name(hw->clk));
-	return 1;
-#endif /* MT_CCF_BRINGUP */
-
-	mask = BIT(cg->bit);
-	val = mask & readl(cg->sta_addr);
-
-	r = (cg->flags & CLK_GATE_INVERSE) ? (val != 0) : (val == 0);
-
-	pr_debug("[CCF] %s: %d, %s, bit[%d]\n", __func__, r,
-		 __clk_get_name(hw->clk), (int)cg->bit);
-
-	return r;
-}
-
-static const struct clk_ops mtk_clk_gate_ops = {
-	.is_enabled	= cg_is_enabled,
-	.enable		= cg_enable,
-	.disable	= cg_disable,
+struct mtk_clk_gate {
+	struct clk_hw	hw;
+	struct regmap	*regmap;
+	int		set_ofs;
+	int		clr_ofs;
+	int		sta_ofs;
+	u8		bit;
 };
 
-struct clk *mtk_clk_register_gate(
-		const char *name,
-		const char *parent_name,
-		void __iomem *set_addr,
-		void __iomem *clr_addr,
-		void __iomem *sta_addr,
-		u8 bit,
-		u32 flags)
+static inline struct mtk_clk_gate *to_mtk_clk_gate(struct clk_hw *hw)
+{
+	return container_of(hw, struct mtk_clk_gate, hw);
+}
+
+static u32 mtk_get_clockgating(struct clk_hw *hw)
+{
+	struct mtk_clk_gate *cg = to_mtk_clk_gate(hw);
+	u32 val;
+
+	regmap_read(cg->regmap, cg->sta_ofs, &val);
+
+	return val & BIT(cg->bit);
+}
+
+static int mtk_cg_bit_is_cleared(struct clk_hw *hw)
+{
+	return mtk_get_clockgating(hw) == 0;
+}
+
+static int mtk_cg_bit_is_set(struct clk_hw *hw)
+{
+	return mtk_get_clockgating(hw) != 0;
+}
+
+static void mtk_cg_set_bit(struct clk_hw *hw)
+{
+	struct mtk_clk_gate *cg = to_mtk_clk_gate(hw);
+
+	regmap_write(cg->regmap, cg->set_ofs, BIT(cg->bit));
+}
+
+static void mtk_cg_clr_bit(struct clk_hw *hw)
+{
+	struct mtk_clk_gate *cg = to_mtk_clk_gate(hw);
+
+	regmap_write(cg->regmap, cg->clr_ofs, BIT(cg->bit));
+}
+
+static void mtk_cg_set_bit_no_setclr(struct clk_hw *hw)
+{
+	struct mtk_clk_gate *cg = to_mtk_clk_gate(hw);
+
+	regmap_set_bits(cg->regmap, cg->sta_ofs, BIT(cg->bit));
+}
+
+static void mtk_cg_clr_bit_no_setclr(struct clk_hw *hw)
+{
+	struct mtk_clk_gate *cg = to_mtk_clk_gate(hw);
+
+	regmap_clear_bits(cg->regmap, cg->sta_ofs, BIT(cg->bit));
+}
+
+static int mtk_cg_enable(struct clk_hw *hw)
+{
+	mtk_cg_clr_bit(hw);
+
+	return 0;
+}
+
+static void mtk_cg_disable(struct clk_hw *hw)
+{
+	mtk_cg_set_bit(hw);
+}
+
+static int mtk_cg_enable_inv(struct clk_hw *hw)
+{
+	mtk_cg_set_bit(hw);
+
+	return 0;
+}
+
+static void mtk_cg_disable_inv(struct clk_hw *hw)
+{
+	mtk_cg_clr_bit(hw);
+}
+
+static int mtk_cg_enable_no_setclr(struct clk_hw *hw)
+{
+	mtk_cg_clr_bit_no_setclr(hw);
+
+	return 0;
+}
+
+static void mtk_cg_disable_no_setclr(struct clk_hw *hw)
+{
+	mtk_cg_set_bit_no_setclr(hw);
+}
+
+static int mtk_cg_enable_inv_no_setclr(struct clk_hw *hw)
+{
+	mtk_cg_set_bit_no_setclr(hw);
+
+	return 0;
+}
+
+static void mtk_cg_disable_inv_no_setclr(struct clk_hw *hw)
+{
+	mtk_cg_clr_bit_no_setclr(hw);
+}
+
+const struct clk_ops mtk_clk_gate_ops_setclr = {
+	.is_enabled	= mtk_cg_bit_is_cleared,
+	.enable		= mtk_cg_enable,
+	.disable	= mtk_cg_disable,
+};
+EXPORT_SYMBOL_GPL(mtk_clk_gate_ops_setclr);
+
+const struct clk_ops mtk_clk_gate_ops_setclr_inv = {
+	.is_enabled	= mtk_cg_bit_is_set,
+	.enable		= mtk_cg_enable_inv,
+	.disable	= mtk_cg_disable_inv,
+};
+EXPORT_SYMBOL_GPL(mtk_clk_gate_ops_setclr_inv);
+
+const struct clk_ops mtk_clk_gate_ops_no_setclr = {
+	.is_enabled	= mtk_cg_bit_is_cleared,
+	.enable		= mtk_cg_enable_no_setclr,
+	.disable	= mtk_cg_disable_no_setclr,
+};
+EXPORT_SYMBOL_GPL(mtk_clk_gate_ops_no_setclr);
+
+const struct clk_ops mtk_clk_gate_ops_no_setclr_inv = {
+	.is_enabled	= mtk_cg_bit_is_set,
+	.enable		= mtk_cg_enable_inv_no_setclr,
+	.disable	= mtk_cg_disable_inv_no_setclr,
+};
+EXPORT_SYMBOL_GPL(mtk_clk_gate_ops_no_setclr_inv);
+
+static struct clk_hw *mtk_clk_register_gate(struct device *dev, const char *name,
+					 const char *parent_name,
+					 struct regmap *regmap, int set_ofs,
+					 int clr_ofs, int sta_ofs, u8 bit,
+					 const struct clk_ops *ops,
+					 unsigned long flags)
 {
 	struct mtk_clk_gate *cg;
-	struct clk *clk;
-	struct clk_init_data init;
-
-#if MT_CCF_DEBUG
-	pr_debug("[CCF] name: %s, bit: %d\n", name, (int)bit);
-#endif /* MT_CCF_DEBUG */
+	int ret;
+	struct clk_init_data init = {};
 
 	cg = kzalloc(sizeof(*cg), GFP_KERNEL);
 	if (!cg)
 		return ERR_PTR(-ENOMEM);
 
 	init.name = name;
-	init.flags = CLK_IGNORE_UNUSED;
+	init.flags = flags | CLK_SET_RATE_PARENT;
 	init.parent_names = parent_name ? &parent_name : NULL;
 	init.num_parents = parent_name ? 1 : 0;
-	init.ops = &mtk_clk_gate_ops;
+	init.ops = ops;
 
-	cg->set_addr = set_addr;
-	cg->clr_addr = clr_addr;
-	cg->sta_addr = sta_addr;
+	cg->regmap = regmap;
+	cg->set_ofs = set_ofs;
+	cg->clr_ofs = clr_ofs;
+	cg->sta_ofs = sta_ofs;
 	cg->bit = bit;
-	cg->flags = flags;
 
 	cg->hw.init = &init;
 
-	clk = clk_register(NULL, &cg->hw);
-	if (IS_ERR(clk))
+	ret = clk_hw_register(dev, &cg->hw);
+	if (ret) {
 		kfree(cg);
+		return ERR_PTR(ret);
+	}
 
-	return clk;
+	return &cg->hw;
 }
+
+static void mtk_clk_unregister_gate(struct clk_hw *hw)
+{
+	struct mtk_clk_gate *cg;
+	if (!hw)
+		return;
+
+	cg = to_mtk_clk_gate(hw);
+
+	clk_hw_unregister(hw);
+	kfree(cg);
+}
+
+int mtk_clk_register_gates(struct device *dev, struct device_node *node,
+			   const struct mtk_gate *clks, int num,
+			   struct clk_hw_onecell_data *clk_data)
+{
+	int i;
+	struct clk_hw *hw;
+	struct regmap *regmap;
+
+	if (!clk_data)
+		return -ENOMEM;
+
+	regmap = device_node_to_regmap(node);
+	if (IS_ERR(regmap)) {
+		pr_err("Cannot find regmap for %pOF: %pe\n", node, regmap);
+		return PTR_ERR(regmap);
+	}
+
+	for (i = 0; i < num; i++) {
+		const struct mtk_gate *gate = &clks[i];
+
+		if (!IS_ERR_OR_NULL(clk_data->hws[gate->id])) {
+			pr_warn("%pOF: Trying to register duplicate clock ID: %d\n",
+				node, gate->id);
+			continue;
+		}
+
+		hw = mtk_clk_register_gate(dev, gate->name, gate->parent_name,
+					    regmap,
+					    gate->regs->set_ofs,
+					    gate->regs->clr_ofs,
+					    gate->regs->sta_ofs,
+					    gate->shift, gate->ops,
+					    gate->flags);
+
+		if (IS_ERR(hw)) {
+			pr_err("Failed to register clk %s: %pe\n", gate->name,
+			       hw);
+			goto err;
+		}
+
+		clk_data->hws[gate->id] = hw;
+	}
+
+	return 0;
+
+err:
+	while (--i >= 0) {
+		const struct mtk_gate *gate = &clks[i];
+
+		if (IS_ERR_OR_NULL(clk_data->hws[gate->id]))
+			continue;
+
+		mtk_clk_unregister_gate(clk_data->hws[gate->id]);
+		clk_data->hws[gate->id] = ERR_PTR(-ENOENT);
+	}
+
+	return PTR_ERR(hw);
+}
+EXPORT_SYMBOL_GPL(mtk_clk_register_gates);
+
+void mtk_clk_unregister_gates(const struct mtk_gate *clks, int num,
+			      struct clk_hw_onecell_data *clk_data)
+{
+	int i;
+
+	if (!clk_data)
+		return;
+
+	for (i = num; i > 0; i--) {
+		const struct mtk_gate *gate = &clks[i - 1];
+
+		if (IS_ERR_OR_NULL(clk_data->hws[gate->id]))
+			continue;
+
+		mtk_clk_unregister_gate(clk_data->hws[gate->id]);
+		clk_data->hws[gate->id] = ERR_PTR(-ENOENT);
+	}
+}
+EXPORT_SYMBOL_GPL(mtk_clk_unregister_gates);
+
+MODULE_LICENSE("GPL");

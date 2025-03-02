@@ -1,19 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * LM8333 keypad driver
- * Copyright (C) 2012 Wolfram Sang, Pengutronix <w.sang@pengutronix.de>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License.
+ * Copyright (C) 2012 Wolfram Sang, Pengutronix <kernel@pengutronix.de>
  */
 
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/irq.h>
 #include <linux/i2c.h>
-#include <linux/interrupt.h>
+#include <linux/input.h>
 #include <linux/input/matrix_keypad.h>
 #include <linux/input/lm8333.h>
+#include <linux/interrupt.h>
+#include <linux/module.h>
+#include <linux/slab.h>
 
 #define LM8333_FIFO_READ		0x20
 #define LM8333_DEBOUNCE			0x22
@@ -128,10 +125,10 @@ static irqreturn_t lm8333_irq_thread(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-static int lm8333_probe(struct i2c_client *client,
-				  const struct i2c_device_id *id)
+static int lm8333_probe(struct i2c_client *client)
 {
-	const struct lm8333_platform_data *pdata = client->dev.platform_data;
+	const struct lm8333_platform_data *pdata =
+			dev_get_platdata(&client->dev);
 	struct lm8333 *lm8333;
 	struct input_dev *input;
 	int err, active_time;
@@ -202,15 +199,13 @@ static int lm8333_probe(struct i2c_client *client,
 	return err;
 }
 
-static int lm8333_remove(struct i2c_client *client)
+static void lm8333_remove(struct i2c_client *client)
 {
 	struct lm8333 *lm8333 = i2c_get_clientdata(client);
 
 	free_irq(client->irq, lm8333);
 	input_unregister_device(lm8333->input);
 	kfree(lm8333);
-
-	return 0;
 }
 
 static const struct i2c_device_id lm8333_id[] = {
@@ -222,7 +217,6 @@ MODULE_DEVICE_TABLE(i2c, lm8333_id);
 static struct i2c_driver lm8333_driver = {
 	.driver = {
 		.name		= "lm8333",
-		.owner		= THIS_MODULE,
 	},
 	.probe		= lm8333_probe,
 	.remove		= lm8333_remove,
@@ -230,6 +224,6 @@ static struct i2c_driver lm8333_driver = {
 };
 module_i2c_driver(lm8333_driver);
 
-MODULE_AUTHOR("Wolfram Sang <w.sang@pengutronix.de>");
+MODULE_AUTHOR("Wolfram Sang <kernel@pengutronix.de>");
 MODULE_DESCRIPTION("LM8333 keyboard driver");
 MODULE_LICENSE("GPL v2");

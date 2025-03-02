@@ -1,38 +1,18 @@
+/* SPDX-License-Identifier: (GPL-2.0+ OR BSD-3-Clause) */
 /*
- * Copyright (c) International Business Machines Corp., 2006
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
- * the GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
- *
+ * Copyright (C) International Business Machines Corp., 2006
  * Authors: Artem Bityutskiy (Битюцкий Артём)
  *          Thomas Gleixner
  *          Frank Haverkamp
  *          Oliver Lohmann
  *          Andreas Arnez
- */
-
-/*
+ *
  * This file defines the layout of UBI headers and all the other UBI on-flash
  * data structures.
  */
 
 #ifndef __UBI_MEDIA_H__
 #define __UBI_MEDIA_H__
-
-#ifdef CONFIG_MTK_MLC_NAND_SUPPORT
-#define CONFIG_BLB 1
-#endif
 
 #include <asm/byteorder.h>
 
@@ -65,6 +45,11 @@ enum {
  * Volume flags used in the volume table record.
  *
  * @UBI_VTBL_AUTORESIZE_FLG: auto-resize this volume
+ * @UBI_VTBL_SKIP_CRC_CHECK_FLG: skip the CRC check done on a static volume at
+ *				 open time. Should only be set on volumes that
+ *				 are used by upper layers doing this kind of
+ *				 check. Main use-case for this flag is
+ *				 boot-time reduction
  *
  * %UBI_VTBL_AUTORESIZE_FLG flag can be set only for one volume in the volume
  * table. UBI automatically re-sizes the volume which has this flag and makes
@@ -96,6 +81,7 @@ enum {
  */
 enum {
 	UBI_VTBL_AUTORESIZE_FLG = 0x01,
+	UBI_VTBL_SKIP_CRC_CHECK_FLG = 0x02,
 };
 
 /*
@@ -145,7 +131,7 @@ enum {
  * is changed radically. This field is duplicated in the volume identifier
  * header.
  *
- * The @vid_hdr_offset and @data_offset fields contain the offset of the the
+ * The @vid_hdr_offset and @data_offset fields contain the offset of the
  * volume identifier header and user data, relative to the beginning of the
  * physical eraseblock. These values have to be the same for all physical
  * eraseblocks.
@@ -233,7 +219,7 @@ struct ubi_ec_hdr {
  * copy. UBI also calculates data CRC when the data is moved and stores it at
  * the @data_crc field of the copy (P1). So when UBI needs to pick one physical
  * eraseblock of two (P or P1), the @copy_flag of the newer one (P1) is
- * examined. If it is cleared, the situation* is simple and the newer one is
+ * examined. If it is cleared, the situation is simple and the newer one is
  * picked. If it is set, the data CRC of the copy (P1) is examined. If the CRC
  * checksum is correct, this physical eraseblock is selected (P1). Otherwise
  * the older one (P) is selected.
@@ -299,11 +285,7 @@ struct ubi_vid_hdr {
 } __packed;
 
 /* Internal UBI volumes count */
-#ifdef CONFIG_BLB
-#define UBI_INT_VOL_COUNT 2
-#else
 #define UBI_INT_VOL_COUNT 1
-#endif
 
 /*
  * Starting ID of internal volumes: 0x7fffefff.
@@ -319,16 +301,6 @@ struct ubi_vid_hdr {
 #define UBI_LAYOUT_VOLUME_EBS    2
 #define UBI_LAYOUT_VOLUME_NAME   "layout volume"
 #define UBI_LAYOUT_VOLUME_COMPAT UBI_COMPAT_REJECT
-
-/* The backup volume contains LSB page backup */
-#ifdef CONFIG_BLB
-#define UBI_BACKUP_VOLUME_ID     (UBI_LAYOUT_VOLUME_ID+1)
-#define UBI_BACKUP_VOLUME_TYPE   UBI_VID_DYNAMIC
-#define UBI_BACKUP_VOLUME_ALIGN  1
-#define UBI_BACKUP_VOLUME_EBS    2
-#define UBI_BACKUP_VOLUME_NAME   "backup volume"
-#define UBI_BACKUP_VOLUME_COMPAT 0//UBI_COMPAT_REJECT
-#endif
 
 /* The maximum number of volumes per one UBI device */
 #define UBI_MAX_VOLUMES 128
@@ -393,22 +365,10 @@ struct ubi_vtbl_record {
 	__be32  crc;
 } __packed;
 
-#ifdef CONFIG_BLB
-struct ubi_blb_spare {
-	__be16  pnum;
-	__be16  lnum;
-	__be16  num;
-	__be16  page;
-	__be32  vol_id;
-	__be64  sqnum;
-	__be32  crc;
-} __attribute__ ((packed));
-#endif
-
 /* UBI fastmap on-flash data structures */
 
-#define UBI_FM_SB_VOLUME_ID	(UBI_LAYOUT_VOLUME_ID + 2)
-#define UBI_FM_DATA_VOLUME_ID	(UBI_LAYOUT_VOLUME_ID + 3)
+#define UBI_FM_SB_VOLUME_ID	(UBI_LAYOUT_VOLUME_ID + 1)
+#define UBI_FM_DATA_VOLUME_ID	(UBI_LAYOUT_VOLUME_ID + 2)
 
 /* fastmap on-flash data structure format version */
 #define UBI_FM_FMT_VERSION	1
@@ -419,7 +379,7 @@ struct ubi_blb_spare {
 #define UBI_FM_POOL_MAGIC	0x67AF4D08
 #define UBI_FM_EBA_MAGIC	0xf0c040a8
 
-/* A fastmap supber block can be located between PEB 0 and
+/* A fastmap super block can be located between PEB 0 and
  * UBI_FM_MAX_START */
 #define UBI_FM_MAX_START	64
 
@@ -432,8 +392,6 @@ struct ubi_blb_spare {
  * UBI_FM_MAX_POOL_SIZE */
 #define UBI_FM_MIN_POOL_SIZE	8
 #define UBI_FM_MAX_POOL_SIZE	256
-
-#define UBI_FM_WL_POOL_SIZE	25
 
 /**
  * struct ubi_fm_sb - UBI fastmap super block
@@ -532,7 +490,7 @@ struct ubi_fm_volhdr {
 /* struct ubi_fm_volhdr is followed by one struct ubi_fm_eba records */
 
 /**
- * struct ubi_fm_eba - denotes an association beween a PEB and LEB
+ * struct ubi_fm_eba - denotes an association between a PEB and LEB
  * @magic: EBA table magic number
  * @reserved_pebs: number of table entries
  * @pnum: PEB number of LEB (LEB is the index)
@@ -540,6 +498,6 @@ struct ubi_fm_volhdr {
 struct ubi_fm_eba {
 	__be32 magic;
 	__be32 reserved_pebs;
-	__be32 pnum[0];
+	__be32 pnum[];
 } __packed;
 #endif /* !__UBI_MEDIA_H__ */

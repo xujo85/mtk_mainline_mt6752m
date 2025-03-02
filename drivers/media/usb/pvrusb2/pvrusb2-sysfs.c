@@ -1,21 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  *
- *
  *  Copyright (C) 2005 Mike Isely <isely@pobox.com>
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
- *
  */
 
 #include <linux/string.h>
@@ -80,10 +66,6 @@ struct pvr2_sysfs_ctl_item {
 	char name[80];
 };
 
-struct pvr2_sysfs_class {
-	struct class class;
-};
-
 static ssize_t show_name(struct device *class_dev,
 			 struct device_attribute *attr,
 			 char *buf)
@@ -116,7 +98,6 @@ static ssize_t show_type(struct device *class_dev,
 	}
 	pvr2_sysfs_trace("pvr2_sysfs(%p) show_type(cid=%d) is %s",
 			 cip->chptr, cip->ctl_id, name);
-	if (!name) return -EINVAL;
 	return scnprintf(buf, PAGE_SIZE, "%s\n", name);
 }
 
@@ -502,20 +483,17 @@ static void pvr2_sysfs_tear_down_controls(struct pvr2_sysfs *sfp)
 }
 
 
-static void pvr2_sysfs_class_release(struct class *class)
-{
-	struct pvr2_sysfs_class *clp;
-	clp = container_of(class,struct pvr2_sysfs_class,class);
-	pvr2_sysfs_trace("Destroying pvr2_sysfs_class id=%p",clp);
-	kfree(clp);
-}
-
-
 static void pvr2_sysfs_release(struct device *class_dev)
 {
 	pvr2_sysfs_trace("Releasing class_dev id=%p",class_dev);
 	kfree(class_dev);
 }
+
+
+static struct class pvr2_class = {
+	.name		= "pvrusb2",
+	.dev_release	= pvr2_sysfs_release,
+};
 
 
 static void class_dev_destroy(struct pvr2_sysfs *sfp)
@@ -629,8 +607,7 @@ static ssize_t unit_number_show(struct device *class_dev,
 }
 
 
-static void class_dev_create(struct pvr2_sysfs *sfp,
-			     struct pvr2_sysfs_class *class_ptr)
+static void class_dev_create(struct pvr2_sysfs *sfp)
 {
 	struct usb_device *usb_dev;
 	struct device *class_dev;
@@ -643,7 +620,7 @@ static void class_dev_create(struct pvr2_sysfs *sfp,
 
 	pvr2_sysfs_trace("Creating class_dev id=%p",class_dev);
 
-	class_dev->class = &class_ptr->class;
+	class_dev->class = &pvr2_class;
 
 	dev_set_name(class_dev, "%s",
 		     pvr2_hdw_get_device_identifier(sfp->channel.hdw));
@@ -768,46 +745,30 @@ static void pvr2_sysfs_internal_check(struct pvr2_channel *chp)
 }
 
 
-struct pvr2_sysfs *pvr2_sysfs_create(struct pvr2_context *mp,
-				     struct pvr2_sysfs_class *class_ptr)
+void pvr2_sysfs_create(struct pvr2_context *mp)
 {
 	struct pvr2_sysfs *sfp;
 	sfp = kzalloc(sizeof(*sfp),GFP_KERNEL);
-	if (!sfp) return sfp;
+	if (!sfp)
+		return;
 	pvr2_trace(PVR2_TRACE_STRUCT,"Creating pvr2_sysfs id=%p",sfp);
 	pvr2_channel_init(&sfp->channel,mp);
 	sfp->channel.check_func = pvr2_sysfs_internal_check;
 
-	class_dev_create(sfp,class_ptr);
-	return sfp;
+	class_dev_create(sfp);
 }
 
 
-
-struct pvr2_sysfs_class *pvr2_sysfs_class_create(void)
+void pvr2_sysfs_class_create(void)
 {
-	struct pvr2_sysfs_class *clp;
-	clp = kzalloc(sizeof(*clp),GFP_KERNEL);
-	if (!clp) return clp;
-	pvr2_sysfs_trace("Creating and registering pvr2_sysfs_class id=%p",
-			 clp);
-	clp->class.name = "pvrusb2";
-	clp->class.class_release = pvr2_sysfs_class_release;
-	clp->class.dev_release = pvr2_sysfs_release;
-	if (class_register(&clp->class)) {
-		pvr2_sysfs_trace(
-			"Registration failed for pvr2_sysfs_class id=%p",clp);
-		kfree(clp);
-		clp = NULL;
-	}
-	return clp;
+	if (class_register(&pvr2_class))
+		pvr2_sysfs_trace("Registration failed for pvr2_sysfs_class");
 }
 
 
-void pvr2_sysfs_class_destroy(struct pvr2_sysfs_class *clp)
+void pvr2_sysfs_class_destroy(void)
 {
-	pvr2_sysfs_trace("Unregistering pvr2_sysfs_class id=%p", clp);
-	class_unregister(&clp->class);
+	class_unregister(&pvr2_class);
 }
 
 
@@ -848,14 +809,3 @@ static ssize_t debugcmd_store(struct device *class_dev,
 	return count;
 }
 #endif /* CONFIG_VIDEO_PVRUSB2_DEBUGIFC */
-
-
-/*
-  Stuff for Emacs to see, in order to encourage consistent editing style:
-  *** Local Variables: ***
-  *** mode: c ***
-  *** fill-column: 75 ***
-  *** tab-width: 8 ***
-  *** c-basic-offset: 8 ***
-  *** End: ***
-  */

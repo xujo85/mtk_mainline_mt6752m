@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
 
     bttv-risc.c  --  interfaces to other kernel modules
@@ -8,19 +9,6 @@
 
     (c) 2000-2003 Gerd Knorr <kraxel@bytesex.org>
 
-    This program is free software; you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 
 */
 
@@ -32,8 +20,8 @@
 #include <linux/pci.h>
 #include <linux/vmalloc.h>
 #include <linux/interrupt.h>
+#include <linux/pgtable.h>
 #include <asm/page.h>
-#include <asm/pgtable.h>
 #include <media/v4l2-ioctl.h>
 
 #include "bttvp.h"
@@ -84,7 +72,7 @@ bttv_risc_packed(struct bttv *btv, struct btcx_riscmem *risc,
 			continue;
 		while (offset && offset >= sg_dma_len(sg)) {
 			offset -= sg_dma_len(sg);
-			sg++;
+			sg = sg_next(sg);
 		}
 		if (bpl <= sg_dma_len(sg)-offset) {
 			/* fits into current chunk */
@@ -93,20 +81,20 @@ bttv_risc_packed(struct bttv *btv, struct btcx_riscmem *risc,
 			*(rp++)=cpu_to_le32(sg_dma_address(sg)+offset);
 			offset+=bpl;
 		} else {
-			/* scanline needs to be splitted */
+			/* scanline needs to be split */
 			todo = bpl;
 			*(rp++)=cpu_to_le32(BT848_RISC_WRITE|BT848_RISC_SOL|
 					    (sg_dma_len(sg)-offset));
 			*(rp++)=cpu_to_le32(sg_dma_address(sg)+offset);
 			todo -= (sg_dma_len(sg)-offset);
 			offset = 0;
-			sg++;
+			sg = sg_next(sg);
 			while (todo > sg_dma_len(sg)) {
 				*(rp++)=cpu_to_le32(BT848_RISC_WRITE|
 						    sg_dma_len(sg));
 				*(rp++)=cpu_to_le32(sg_dma_address(sg));
 				todo -= sg_dma_len(sg);
-				sg++;
+				sg = sg_next(sg);
 			}
 			*(rp++)=cpu_to_le32(BT848_RISC_WRITE|BT848_RISC_EOL|
 					    todo);
@@ -187,15 +175,7 @@ bttv_risc_planar(struct bttv *btv, struct btcx_riscmem *risc,
 			/* go to next sg entry if needed */
 			while (yoffset && yoffset >= sg_dma_len(ysg)) {
 				yoffset -= sg_dma_len(ysg);
-				ysg++;
-			}
-			while (uoffset && uoffset >= sg_dma_len(usg)) {
-				uoffset -= sg_dma_len(usg);
-				usg++;
-			}
-			while (voffset && voffset >= sg_dma_len(vsg)) {
-				voffset -= sg_dma_len(vsg);
-				vsg++;
+				ysg = sg_next(ysg);
 			}
 
 			/* calculate max number of bytes we can write */
@@ -203,6 +183,15 @@ bttv_risc_planar(struct bttv *btv, struct btcx_riscmem *risc,
 			if (yoffset + ylen > sg_dma_len(ysg))
 				ylen = sg_dma_len(ysg) - yoffset;
 			if (chroma) {
+				while (uoffset && uoffset >= sg_dma_len(usg)) {
+					uoffset -= sg_dma_len(usg);
+					usg = sg_next(usg);
+				}
+				while (voffset && voffset >= sg_dma_len(vsg)) {
+					voffset -= sg_dma_len(vsg);
+					vsg = sg_next(vsg);
+				}
+
 				if (uoffset + (ylen>>hshift) > sg_dma_len(usg))
 					ylen = (sg_dma_len(usg) - uoffset) << hshift;
 				if (voffset + (ylen>>hshift) > sg_dma_len(vsg))
@@ -239,94 +228,6 @@ bttv_risc_planar(struct bttv *btv, struct btcx_riscmem *risc,
 	/* save pointer to jmp instruction address */
 	risc->jmp = rp;
 	BUG_ON((risc->jmp - risc->cpu + 2) * sizeof(*risc->cpu) > risc->size);
-	return 0;
-}
-
-static int
-bttv_risc_overlay(struct bttv *btv, struct btcx_riscmem *risc,
-		  const struct bttv_format *fmt, struct bttv_overlay *ov,
-		  int skip_even, int skip_odd)
-{
-	int dwords, rc, line, maxy, start, end;
-	unsigned skip, nskips;
-	struct btcx_skiplist *skips;
-	__le32 *rp;
-	u32 ri,ra;
-	u32 addr;
-
-	/* skip list for window clipping */
-	if (NULL == (skips = kmalloc(sizeof(*skips) * ov->nclips,GFP_KERNEL)))
-		return -ENOMEM;
-
-	/* estimate risc mem: worst case is (1.5*clip+1) * lines instructions
-	   + sync + jump (all 2 dwords) */
-	dwords  = (3 * ov->nclips + 2) *
-		((skip_even || skip_odd) ? (ov->w.height+1)>>1 :  ov->w.height);
-	dwords += 4;
-	if ((rc = btcx_riscmem_alloc(btv->c.pci,risc,dwords*4)) < 0) {
-		kfree(skips);
-		return rc;
-	}
-
-	/* sync instruction */
-	rp = risc->cpu;
-	*(rp++) = cpu_to_le32(BT848_RISC_SYNC|BT848_FIFO_STATUS_FM1);
-	*(rp++) = cpu_to_le32(0);
-
-	addr  = (unsigned long)btv->fbuf.base;
-	addr += btv->fbuf.fmt.bytesperline * ov->w.top;
-	addr += (fmt->depth >> 3)          * ov->w.left;
-
-	/* scan lines */
-	for (maxy = -1, line = 0; line < ov->w.height;
-	     line++, addr += btv->fbuf.fmt.bytesperline) {
-		if ((btv->opt_vcr_hack) &&
-		     (line >= (ov->w.height - VCR_HACK_LINES)))
-			continue;
-		if ((line%2) == 0  &&  skip_even)
-			continue;
-		if ((line%2) == 1  &&  skip_odd)
-			continue;
-
-		/* calculate clipping */
-		if (line > maxy)
-			btcx_calc_skips(line, ov->w.width, &maxy,
-					skips, &nskips, ov->clips, ov->nclips);
-
-		/* write out risc code */
-		for (start = 0, skip = 0; start < ov->w.width; start = end) {
-			if (skip >= nskips) {
-				ri  = BT848_RISC_WRITE;
-				end = ov->w.width;
-			} else if (start < skips[skip].start) {
-				ri  = BT848_RISC_WRITE;
-				end = skips[skip].start;
-			} else {
-				ri  = BT848_RISC_SKIP;
-				end = skips[skip].end;
-				skip++;
-			}
-			if (BT848_RISC_WRITE == ri)
-				ra = addr + (fmt->depth>>3)*start;
-			else
-				ra = 0;
-
-			if (0 == start)
-				ri |= BT848_RISC_SOL;
-			if (ov->w.width == end)
-				ri |= BT848_RISC_EOL;
-			ri |= (fmt->depth>>3) * (end-start);
-
-			*(rp++)=cpu_to_le32(ri);
-			if (0 != ra)
-				*(rp++)=cpu_to_le32(ra);
-		}
-	}
-
-	/* save pointer to jmp instruction address */
-	risc->jmp = rp;
-	BUG_ON((risc->jmp - risc->cpu + 2) * sizeof(*risc->cpu) > risc->size);
-	kfree(skips);
 	return 0;
 }
 
@@ -582,7 +483,6 @@ bttv_dma_free(struct videobuf_queue *q,struct bttv *btv, struct bttv_buffer *buf
 {
 	struct videobuf_dmabuf *dma=videobuf_to_dma(&buf->vb);
 
-	BUG_ON(in_interrupt());
 	videobuf_waiton(q, &buf->vb, 0, 0);
 	videobuf_dma_unmap(q->dev, dma);
 	videobuf_dma_free(dma);
@@ -709,9 +609,9 @@ bttv_buffer_risc(struct bttv *btv, struct bttv_buffer *buf)
 	const struct bttv_tvnorm *tvnorm = bttv_tvnorms + buf->tvnorm;
 	struct videobuf_dmabuf *dma=videobuf_to_dma(&buf->vb);
 
-	dprintk("%d: buffer field: %s  format: %s  size: %dx%d\n",
+	dprintk("%d: buffer field: %s  format: 0x%08x  size: %dx%d\n",
 		btv->c.nr, v4l2_field_names[buf->vb.field],
-		buf->fmt->name, buf->vb.width, buf->vb.height);
+		buf->fmt->fourcc, buf->vb.width, buf->vb.height);
 
 	/* packed pixel modes */
 	if (buf->fmt->flags & FORMAT_FLAGS_PACKED) {
@@ -859,51 +759,3 @@ bttv_buffer_risc(struct bttv *btv, struct bttv_buffer *buf)
 	buf->btswap   = buf->fmt->btswap;
 	return 0;
 }
-
-/* ---------------------------------------------------------- */
-
-/* calculate geometry, build risc code */
-int
-bttv_overlay_risc(struct bttv *btv,
-		  struct bttv_overlay *ov,
-		  const struct bttv_format *fmt,
-		  struct bttv_buffer *buf)
-{
-	/* check interleave, bottom+top fields */
-	dprintk("%d: overlay fields: %s format: %s  size: %dx%d\n",
-		btv->c.nr, v4l2_field_names[buf->vb.field],
-		fmt->name, ov->w.width, ov->w.height);
-
-	/* calculate geometry */
-	bttv_calc_geo(btv,&buf->geo,ov->w.width,ov->w.height,
-		      V4L2_FIELD_HAS_BOTH(ov->field),
-		      &bttv_tvnorms[ov->tvnorm],&buf->crop);
-
-	/* build risc code */
-	switch (ov->field) {
-	case V4L2_FIELD_TOP:
-		bttv_risc_overlay(btv, &buf->top,    fmt, ov, 0, 0);
-		break;
-	case V4L2_FIELD_BOTTOM:
-		bttv_risc_overlay(btv, &buf->bottom, fmt, ov, 0, 0);
-		break;
-	case V4L2_FIELD_INTERLACED:
-		bttv_risc_overlay(btv, &buf->top,    fmt, ov, 0, 1);
-		bttv_risc_overlay(btv, &buf->bottom, fmt, ov, 1, 0);
-		break;
-	default:
-		BUG();
-	}
-
-	/* copy format info */
-	buf->btformat = fmt->btformat;
-	buf->btswap   = fmt->btswap;
-	buf->vb.field = ov->field;
-	return 0;
-}
-
-/*
- * Local variables:
- * c-basic-offset: 8
- * End:
- */
